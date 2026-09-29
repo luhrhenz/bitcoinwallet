@@ -17,7 +17,7 @@ bdk_bitcoind_rpc = "0.22"
 bip39 = { version = "2.2", features = ["rand", "zeroize"] }
 
 # Secrets / crypto
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["zeroize"] }
 chacha20poly1305 = "0.10"
 getrandom = "0.3"
 secrecy = "0.10"
@@ -54,14 +54,10 @@ unsafe_code = "forbid"
 unwrap_used = "warn"
 expect_used = "warn"
 
-# Crypto is painfully slow unoptimized (Argon2 64 MiB, PBKDF2 2048 rounds); optimize just these in dev/test.
+# Crypto is painfully slow unoptimized (Argon2 64 MiB; BIP39 PBKDF2 runs on bitcoin_hashes); optimize just these in dev/test.
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]
-opt-level = 3
-[profile.dev.package.pbkdf2]
-opt-level = 3
-[profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.bitcoin_hashes]
 opt-level = 3
