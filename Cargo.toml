@@ -53,3 +53,17 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+
+# Crypto is painfully slow unoptimized (Argon2 64 MiB, PBKDF2 2048 rounds); optimize just these in dev/test.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.bitcoin_hashes]
+opt-level = 3
+[profile.dev.package.secp256k1-sys]
+opt-level = 3
