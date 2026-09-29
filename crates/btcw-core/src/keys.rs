@@ -12,20 +12,41 @@
 //! `coin` comes from [`crate::config::coin_type`] (0 mainnet, 1 test networks).
 //! The key origin `[fingerprint/path]` must be included so PSBTs carry BIP32 derivation info,
 //! which is how [`Signer`] finds the right child key.
-#![allow(unused_variables, dead_code)] // remove once implemented
 
 use std::fmt;
 
+use bdk_wallet::miniscript::descriptor::{
+    Descriptor, DescriptorPublicKey, DescriptorXKey, Wildcard,
+};
 use zeroize::Zeroizing;
 
+use crate::bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint, Xpriv, Xpub};
+use crate::bitcoin::psbt::SigningKeys;
+use crate::bitcoin::secp256k1::Secp256k1;
 use crate::bitcoin::{self, Network};
-use crate::error::Result;
+use crate::error::{Result, WalletError};
+
+/// BIP84 purpose field: native SegWit v0 single-key (P2WPKH) accounts.
+const BIP84_PURPOSE: u32 = 84;
+/// Last path step before the address index: 0 = receive (external), 1 = change (internal).
+const EXTERNAL_CHAIN: u32 = 0;
+const INTERNAL_CHAIN: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WordCount {
     #[default]
     Words12,
     Words24,
+}
+
+impl WordCount {
+    /// BIP39: 12 words encode 128 bits of entropy, 24 words encode 256 bits.
+    fn entropy_bytes(self) -> usize {
+        match self {
+            Self::Words12 => 16,
+            Self::Words24 => 32,
+        }
+    }
 }
 
 /// A validated BIP39 mnemonic (English wordlist). Wiped from memory on drop.
@@ -51,13 +72,64 @@ impl fmt::Debug for Mnemonic {
 
 /// Generate a fresh mnemonic from the OS CSPRNG.
 pub fn generate_mnemonic(words: WordCount) -> Result<Mnemonic> {
-    todo!("Agent A: 128 bits of entropy for 12 words, 256 for 24")
+    // Entropy comes straight from the OS (getrandom) instead of a userspace PRNG, and the
+    // buffer is wiped once the words have been computed from it.
+    let mut entropy = Zeroizing::new([0u8; 32]);
+    let entropy = &mut entropy[..words.entropy_bytes()];
+    getrandom::fill(entropy).map_err(|e| {
+        WalletError::Io(std::io::Error::other(format!(
+            "OS random number generator failed: {e}"
+        )))
+    })?;
+    // Only fails for entropy lengths other than 128..=256 bits in 32-bit steps, which
+    // `WordCount` rules out; the message is generic because entropy is secret anyway.
+    let mnemonic = bip39::Mnemonic::from_entropy(entropy)
+        .map_err(|_| WalletError::InvalidMnemonic("could not encode entropy".into()))?;
+    Ok(Mnemonic(mnemonic))
 }
 
 /// Parse and validate a user-entered phrase: normalise whitespace and case, then check the
 /// wordlist and checksum. Errors map to `WalletError::InvalidMnemonic` *without echoing the words*.
 pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic> {
-    todo!("Agent A")
+    let normalized = normalize_phrase(phrase);
+    let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &normalized)
+        .map_err(|e| WalletError::InvalidMnemonic(describe_bip39_error(e)))?;
+    Ok(Mnemonic(mnemonic))
+}
+
+/// Trim, collapse any run of whitespace to one space and lowercase, into a buffer that is
+/// wiped on drop.
+///
+/// ASCII lowercasing is enough: every word in the English list is ASCII, so a word with any
+/// non-ASCII letter is rejected by the wordlist check anyway. It also means the output is never
+/// longer than the input, so the pre-sized buffer never reallocates and leaves no unwiped copy.
+fn normalize_phrase(phrase: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(phrase.len()));
+    for word in phrase.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.extend(word.chars().map(|c| c.to_ascii_lowercase()));
+    }
+    out
+}
+
+/// A user-facing message that names positions and counts, never the words themselves.
+fn describe_bip39_error(e: bip39::Error) -> String {
+    match e {
+        bip39::Error::BadWordCount(n) => {
+            format!("expected 12, 15, 18, 21 or 24 words, got {n}")
+        }
+        // bip39 reports a 0-based index; people count words from 1.
+        bip39::Error::UnknownWord(i) => {
+            format!("word {} is not in the BIP39 English word list", i + 1)
+        }
+        bip39::Error::InvalidChecksum => {
+            "checksum mismatch (a word is probably mistyped or out of order)".into()
+        }
+        // Entropy-length and language-ambiguity errors can't come from an English-only parse.
+        _ => "not a valid BIP39 phrase".into(),
+    }
 }
 
 /// *Public* external + internal descriptors for one BIP84 account, with key origin, e.g.
@@ -101,14 +173,34 @@ impl Signer {
     /// Sign every input this key can sign. Returns how many inputs were signed.
     /// Finalizing (building the witness) is done afterwards by `tx::sign_psbt` via BDK.
     pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) -> Result<usize> {
-        todo!(
-            "Agent A: psbt.sign(&self.master, &Secp256k1::new()); map SignError without leaking keys"
-        )
+        let secp = Secp256k1::new();
+        match psbt.sign(&self.master, &secp) {
+            // `Psbt::sign` records every input it looked at, with an empty key list when none of
+            // the input's derivation paths belong to this master, so count non-empty entries.
+            Ok(used) => Ok(used.values().filter(|keys| signed_any(keys)).count()),
+            // `SignError` only describes the input (missing UTXO, bad sighash type, ...), never
+            // key material, so it is safe to surface.
+            Err((_, errors)) => {
+                let detail = errors
+                    .iter()
+                    .map(|(input, e)| format!("input {input}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Err(WalletError::Sign(detail))
+            }
+        }
     }
 
     /// Master key fingerprint (first 4 bytes of hash160 of the master pubkey). Not secret.
     pub fn fingerprint(&self) -> bitcoin::bip32::Fingerprint {
-        todo!("Agent A")
+        self.master.fingerprint(&Secp256k1::signing_only())
+    }
+}
+
+fn signed_any(keys: &SigningKeys) -> bool {
+    match keys {
+        SigningKeys::Ecdsa(pks) => !pks.is_empty(),
+        SigningKeys::Schnorr(pks) => !pks.is_empty(),
     }
 }
 
@@ -132,5 +224,69 @@ pub fn derive_account(
     network: Network,
     account: u32,
 ) -> Result<(Descriptors, Signer)> {
-    todo!("Agent A")
+    let secp = Secp256k1::new();
+
+    // BIP39: PBKDF2-HMAC-SHA512(words, "mnemonic" + passphrase), 2048 rounds → 64-byte seed.
+    let seed = Zeroizing::new(mnemonic.0.to_seed(passphrase));
+    // Hand the master to `Signer` straight away so its `Drop` wipes it on every error path below.
+    let signer = Signer {
+        master: Xpriv::new_master(network, seed.as_slice()).map_err(derivation_error)?,
+    };
+    let master_fingerprint = signer.master.fingerprint(&secp);
+
+    // m/84'/coin'/account', every step hardened (BIP44 convention). With non-hardened steps a
+    // single leaked child private key plus the parent xpub reveals the parent private key;
+    // hardening stops such a leak at the account, so the master and other accounts stay safe.
+    let account_path = DerivationPath::from(vec![
+        hardened(BIP84_PURPOSE)?,
+        hardened(crate::config::coin_type(network))?,
+        hardened(account)?,
+    ]);
+    let mut account_xprv = signer
+        .master
+        .derive_priv(&secp, &account_path)
+        .map_err(derivation_error)?;
+    let account_xpub = Xpub::from_priv(&secp, &account_xprv);
+    // Best effort: `Xpriv` is `Copy`, so this only wipes our copy of the account key.
+    account_xprv.private_key.non_secure_erase();
+
+    let origin = (master_fingerprint, account_path);
+    let descriptors = Descriptors {
+        external: wpkh_descriptor(&origin, account_xpub, EXTERNAL_CHAIN)?,
+        internal: wpkh_descriptor(&origin, account_xpub, INTERNAL_CHAIN)?,
+    };
+    Ok((descriptors, signer))
+}
+
+/// `wpkh([fp/84'/coin'/account']xpub/<chain>/*)#checksum`, built from typed miniscript keys so
+/// the origin syntax and the checksum come from the library rather than string formatting.
+fn wpkh_descriptor(
+    origin: &(Fingerprint, DerivationPath),
+    account_xpub: Xpub,
+    chain: u32,
+) -> Result<String> {
+    let key = DescriptorPublicKey::XPub(DescriptorXKey {
+        origin: Some(origin.clone()),
+        xkey: account_xpub,
+        derivation_path: DerivationPath::from(vec![ChildNumber::Normal { index: chain }]),
+        wildcard: Wildcard::Unhardened,
+    });
+    let descriptor = Descriptor::new_wpkh(key)
+        .map_err(|e| WalletError::Config(format!("could not build descriptor: {e}")))?;
+    // `Display` for a descriptor appends `#checksum` (BIP380).
+    Ok(descriptor.to_string())
+}
+
+fn hardened(index: u32) -> Result<ChildNumber> {
+    ChildNumber::from_hardened_idx(index).map_err(|_| {
+        WalletError::Config(format!(
+            "derivation index {index} is out of range (must be below 2^31)"
+        ))
+    })
+}
+
+/// BIP32 errors describe the failing step (invalid child number, secp256k1 range check),
+/// never key bytes. Reaching this for a valid seed has a probability of about 2^-127.
+fn derivation_error(e: bitcoin::bip32::Error) -> WalletError {
+    WalletError::Config(format!("key derivation failed: {e}"))
 }
