@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/btcw-core", "crates/btcw-cli"]
+# apps/desktop/src-tauri joins the workspace once the Tauri system deps are installed.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/luhrhenz/bitcoinwallet"
+
+[workspace.dependencies]
+# Bitcoin. Always import `bitcoin` through `bdk_wallet::bitcoin` so there is exactly one version (0.32).
+bdk_wallet = { version = "3.2", features = ["rusqlite"] }
+bdk_bitcoind_rpc = "0.22"
+bip39 = { version = "2.2", features = ["rand", "zeroize"] }
+
+# Secrets / crypto
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
+secrecy = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Errors, serialization, config
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dotenvy = "0.15"
+dirs = "6"
+base64 = "0.22"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+comfy-table = "7"
+indicatif = "0.17"
+owo-colors = "4"
+rpassword = "7"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Tests
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

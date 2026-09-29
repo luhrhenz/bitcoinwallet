@@ -1,0 +1,14 @@
+/target
+node_modules/
+dist/
+.env
+*.sqlite
+*.sqlite-journal
+seed.enc
+/regtest-data/
+
+# local AI-tool configs (not part of the project)
+.autoclaw/
+.clinerules/
+.kilocodemodes
+.kiro/
