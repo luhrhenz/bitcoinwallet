@@ -5,19 +5,50 @@
 //! tests use them). Human-readable output by default, `--json` prints `btcw_core::types`
 //! values (errors as `{"error": {"code", "message"}}` with a non-zero exit).
 //!
+//! This crate holds no wallet logic. Each command opens the wallet through `btcw_core::api`,
+//! calls one or two core functions and renders the result:
+//! - [`commands`]: one module per command family.
+//! - [`output`]: the network badge, colors, amounts, tables, JSON and error rendering.
+//! - [`prompt`]: passwords and the recovery phrase (hidden TTY prompts, stdin, `BTCW_PASSWORD`).
+//!
 //! Passwords: prompted with `rpassword`. `BTCW_PASSWORD` is honoured for scripted demos and
 //! tests only (documented as insecure).
 
+mod commands;
+mod output;
+mod prompt;
+
+use std::convert::Infallible;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{Result, bail};
+use btcw_core::config::{Config, Overrides};
+use btcw_core::keys::WordCount;
 use clap::{Args, Parser, Subcommand};
+use secrecy::SecretString;
+
+use crate::output::Ui;
+
+const AFTER_HELP: &str = "\
+Environment:
+  BTCW_NETWORK, BTCW_DATADIR, BTCW_RPC_URL, BTCW_RPC_COOKIE, BTCW_RPC_USER, BTCW_RPC_PASS
+                   same as the flags; a flag beats its variable, which beats <datadir>/btcw.toml
+  BTCW_PASSWORD    wallet password for scripts and tests. INSECURE: the environment leaks
+                   (shell history, child processes, /proc, crash reports); people should
+                   type the password at the prompt instead
+  NO_COLOR         disable colors
+  RUST_LOG         log level on stderr (default: warn)
+
+Exit status: 0 success, 1 error, 2 invalid command line.
+With --json, stdout holds exactly one JSON value; errors are {\"error\":{\"code\",\"message\"}}.";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "btcw",
     version,
-    about = "A non-custodial Bitcoin wallet (testnet4 / signet / regtest)"
+    about = "A non-custodial Bitcoin wallet (testnet4 / signet / regtest)",
+    after_help = AFTER_HELP
 )]
 struct Cli {
     #[command(flatten)]
@@ -45,6 +76,15 @@ struct GlobalArgs {
     #[arg(long, global = true)]
     rpc_cookie: Option<PathBuf>,
 
+    /// Bitcoin Core RPC user (with --rpc-pass; instead of the cookie file)
+    #[arg(long, global = true)]
+    rpc_user: Option<String>,
+
+    /// Bitcoin Core RPC password. Other local users can see it in `ps`; prefer the cookie
+    /// file or BTCW_RPC_PASS
+    #[arg(long, global = true, value_parser = parse_secret)]
+    rpc_pass: Option<SecretString>,
+
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     json: bool,
@@ -52,6 +92,25 @@ struct GlobalArgs {
     /// Opt in to mainnet (only has an effect in builds with `--features mainnet`)
     #[arg(long, global = true, hide = !cfg!(feature = "mainnet"))]
     i_understand_mainnet_risk: bool,
+}
+
+impl GlobalArgs {
+    fn into_overrides(self) -> Overrides {
+        Overrides {
+            network: self.network,
+            datadir: self.datadir,
+            rpc_url: self.rpc_url,
+            rpc_user: self.rpc_user,
+            rpc_pass: self.rpc_pass,
+            rpc_cookie: self.rpc_cookie,
+            mainnet_opt_in: self.i_understand_mainnet_risk,
+        }
+    }
+}
+
+/// `SecretString` redacts itself in `Debug`, so the derived `Debug` above can't leak it.
+fn parse_secret(s: &str) -> Result<SecretString, Infallible> {
+    Ok(SecretString::from(s))
 }
 
 #[derive(Debug, Subcommand)]
@@ -62,7 +121,7 @@ enum Command {
         #[arg(long, default_value = "12", value_parser = ["12", "24"])]
         words: String,
     },
-    /// Restore a wallet from a recovery phrase (prompted, hidden)
+    /// Restore a wallet from a recovery phrase (prompted, hidden; or the first line of stdin)
     Restore {
         /// Block height to start scanning from; omit to scan from genesis
         #[arg(long)]
@@ -73,11 +132,11 @@ enum Command {
     Address(AddressCmd),
     /// Pull new blocks and mempool transactions from the node
     Sync,
-    /// Confirmed / unconfirmed / immature balance
+    /// Confirmed / unconfirmed / immature balance (offline, as of the last sync)
     Balance,
-    /// Transaction history with status and confirmations
+    /// Transaction history with status and confirmations (offline, as of the last sync)
     History,
-    /// Spendable outputs
+    /// Spendable outputs (offline, as of the last sync)
     Utxos,
     /// Build, sign and broadcast a payment
     Send {
@@ -111,7 +170,10 @@ enum Command {
     },
     /// Regtest only: mine blocks (to --to, or to a fresh wallet address)
     Mine {
+        /// Number of blocks to mine
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         blocks: u64,
+        /// Address that receives the block rewards [default: the wallet's next receive address]
         #[arg(long)]
         to: Option<String>,
     },
@@ -125,18 +187,60 @@ enum AddressCmd {
     List,
 }
 
-fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return output::usage_error(&e),
+    };
+    let ui = Ui::new(cli.global.json);
+    init_logging(&ui);
+    match run(cli, &ui) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
-            std::process::ExitCode::FAILURE
+            ui.report_error(&e);
+            ExitCode::FAILURE
         }
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
-    let _ = (&cli.global, &cli.command);
-    bail!("not implemented yet (Agent D)")
+/// Core warnings (fee fallback, node still syncing, shortened chain) go to stderr at `warn`, so
+/// they are visible but never mix with stdout or `--json`. `RUST_LOG` overrides the level.
+fn init_logging(ui: &Ui) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    // `try_init` only fails if a subscriber is already installed, which can't happen here.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(ui.err.enabled())
+        .with_target(false)
+        .without_time()
+        .try_init();
+}
+
+fn run(cli: Cli, ui: &Ui) -> Result<()> {
+    let Cli { global, command } = cli;
+    let cfg = Config::load(global.into_overrides())?;
+    match command {
+        Command::Create { words } => commands::create::run(&cfg, ui, word_count(&words)?),
+        Command::Restore { birthday } => commands::restore::run(&cfg, ui, birthday),
+        Command::Address(AddressCmd::New) => commands::address::new(&cfg, ui),
+        Command::Address(AddressCmd::List) => commands::address::list(&cfg, ui),
+        Command::Sync => commands::sync::run(&cfg, ui),
+        Command::Balance => commands::view::balance(&cfg, ui),
+        Command::History => commands::view::history(&cfg, ui),
+        Command::Utxos => commands::view::utxos(&cfg, ui),
+        Command::Mine { blocks, to } => commands::mine::run(&cfg, ui, blocks, to.as_deref()),
+        Command::Send { .. } => bail!("`btcw send` is not implemented yet (Phase 2)"),
+        Command::Status { .. } => bail!("`btcw status` is not implemented yet (Phase 2)"),
+    }
+}
+
+/// clap already restricts `--words` to "12" or "24".
+fn word_count(words: &str) -> Result<WordCount> {
+    match words {
+        "12" => Ok(WordCount::Words12),
+        "24" => Ok(WordCount::Words24),
+        other => bail!("--words must be 12 or 24, not {other}"),
+    }
 }

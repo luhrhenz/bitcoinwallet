@@ -580,7 +580,304 @@ cargo test -p btcw-core --lib wallet           # receive offline + persist/reope
                                                # (the node test skips without bitcoind; set BITCOIND_EXE)
 ```
 
-## 5. Terminal app (CLI), Phase 1 / Agent D — _pending_
+## 5. Terminal app (CLI), Phase 1 / Agent D
+
+**What we built:** `btcw`, the terminal frontend. It has no wallet logic of its own: every command
+opens the wallet through `btcw_core::api`, makes one or two core calls and prints the result, either
+as text for a person or as JSON for a script. All the Bitcoin work (keys, sync, balances) is in
+§2–§4; this layer is about input, output and not leaking secrets on the way.
+
+```text
+crates/btcw-cli/src/
+├── main.rs        clap definitions (the contract from PLAN §4), logging, dispatch
+├── output.rs      network badge, colors, amounts, dates, tables, JSON and error rendering
+├── prompt.rs      passwords and the recovery phrase
+└── commands/      create, restore, address, sync, view (balance/history/utxos), mine
+```
+
+### Thin over the core
+Every command has the same shape: open → call → drop the wallet (which releases its lock, §4) →
+render. `balance` in full:
+
+```rust
+pub fn balance(cfg: &Config, ui: &Ui) -> Result<()> {
+    let wallet = api::open_watch_only(cfg)?;       // no password
+    let balance = wallet.balance();                // BalanceView, computed by BDK
+    let synced_height = wallet.synced_height();
+    drop(wallet);                                  // release wallet.lock before printing
+    if ui.json() {
+        return ui.print_json(&BalanceJson { network: cfg.network.to_string(), synced_height, balance });
+    }
+    ui.println(&format!("{} Balance {}\n{}", ui.out.badge(cfg.network), as_of(synced_height),
+                        balance_lines(&balance, ui.out)))
+}
+```
+
+| Command | Wallet access | Node needed | Core calls |
+|---|---|---|---|
+| `create` | creates it (new password) | optional, for the birthday | `api::create_wallet`, `Node::tip_height` |
+| `restore` | creates it (new password) | optional, for the first sync | `api::restore_wallet`, `Node::sync` |
+| `address new` / `list` | watch-only | no | `new_address` / `addresses` |
+| `sync` | watch-only | yes | `Node::connect`, `Node::sync` |
+| `balance`, `history`, `utxos` | watch-only | **no** | `balance` / `history` / `utxos` |
+| `mine N [--to]` | watch-only, only without `--to` | yes, regtest | `new_address`, `Node::mine` |
+| `send`, `status` | (Phase 2) | | |
+
+Errors are never rewritten. The core's messages were written for people (§3, §4), so "wallet is open
+in another btcw process", "no wallet found in …; create or restore one first" and "mainnet is
+disabled; …" reach the terminal unchanged.
+
+### Watch-only vs unlocked: why `balance` needs no password but `send` will
+The wallet database holds only *public* descriptors (`wpkh([73c5da0a/84'/1'/0']tpub…/0/*)`, §2).
+From those BDK can derive every address and recognise every payment, so balance, history, UTXOs and
+new receive addresses need nothing secret. That's **watch-only** mode, `api::open_watch_only`.
+
+Spending is different: a transaction must be signed with private keys, and those come only from the
+recovery phrase, which lives encrypted in `seed.enc` (Argon2id + XChaCha20-Poly1305, §2). Decrypting
+it takes the password. So `send` (Phase 2) will call `api::unlock_wallet(cfg, &password)`, get a
+`Signer`, sign, and drop the signer as soon as the transaction is out. Day-to-day commands never ask
+for a password, which also means they never have the keys in memory.
+
+### Reading secrets
+| Secret | Interactive | Scripts and tests |
+|---|---|---|
+| wallet password | hidden prompt on the terminal (`rpassword` opens `/dev/tty`) | `BTCW_PASSWORD` |
+| recovery phrase (`restore`) | hidden prompt when stdin is a terminal | the first line of stdin: `echo "<words>" \| btcw restore` |
+
+- Prompts are written to the terminal device, not to stdout, so they never end up in `--json` output
+  or a redirected file.
+- A **new** password is typed twice, must match, and must pass `api::check_new_password` (at least
+  `MIN_PASSWORD_LEN` = 8 characters, the same rule the desktop app gets from the core). A short or
+  mismatched entry gets a warning and another try, three in total.
+- `BTCW_PASSWORD` exists for demos and tests and says so every time it's used
+  (`note: using the wallet password from BTCW_PASSWORD (insecure; …)`). Environment variables leak
+  through shell history, child processes, `/proc/<pid>/environ` and crash reports. An empty value
+  counts as unset, so you get the prompt.
+- Without a terminal and without `BTCW_PASSWORD` (cron, CI), the error says so instead of hanging:
+  `cannot prompt for a password (No such device or address (os error 6)); for non-interactive use set BTCW_PASSWORD …`.
+- `restore` checks the phrase (`keys::parse_mnemonic`: word list + checksum) *before* asking for a
+  password, so a typo doesn't cost two password prompts. The error names a position, never a word.
+- Every secret goes straight into a `SecretString` or `Zeroizing<String>`, which wipes its memory on
+  drop. Those buffers are allocated at their final size up front, because a `String` that grows
+  copies itself into a new allocation and frees the old one *without* wiping it.
+
+### Why the phrase is shown exactly once
+`create` prints the phrase in a numbered grid, then never again. The core never stores it
+unencrypted, and showing it again would just put another copy on a screen, in a scrollback buffer or in
+a screenshot. The warning says what matters:
+
+```text
+Recovery phrase (12 words). Write them down on paper, in this order:
+
+     1. stomach     2. heavy       3. twin        4. puzzle
+     5. bag         6. congress    7. track       8. wreck
+     9. poverty    10. misery     11. struggle   12. snap
+
+WARNING: Anyone with these words can take your coins. Keep them offline and private;
+         never type them into a website. btcw will never show them again.
+         They are the only backup: lose them and this computer, and the coins are gone.
+```
+
+The grid is written straight into one `Zeroizing<String>` (word slices, `write!`, no intermediate
+copies) and printed *before* anything else that could fail: once `create_wallet` returns, the wallet
+exists, and an error that skipped the phrase would leave a wallet nobody can back up. With `--json`,
+the grid and warning go to **stderr** and stdout gets `{network, birthday_height, first_address}`, so
+a script that logs its JSON never logs the phrase. In human mode, if stdout isn't a terminal
+(`btcw create > file`), a warning says the phrase went into that file.
+
+The **birthday** comes from the node: `create` asks for the tip height, and the first sync starts
+there (§3). If the node is down, the wallet is still created, with a warning that the first sync will
+scan from genesis.
+
+### The network badge
+Every human-readable result starts with `[testnet4]` (yellow), `[signet]` (magenta), `[regtest]`
+(cyan) or `[mainnet]` (red), so test coins are never mistaken for real ones. Colors are on only when
+the stream is a terminal and `NO_COLOR` is unset (no-color.org); stdout and stderr are decided
+separately, so `btcw balance | less` gets plain text while warnings on stderr keep their color.
+
+### `--json` and exit codes
+With `--json`, stdout carries **exactly one JSON value** per run: the `btcw_core::types` views from
+§4, inside a small wrapper that always names the network:
+
+```console
+$ btcw --json balance
+{
+  "network": "regtest",
+  "synced_height": 0,
+  "balance": {
+    "confirmed_sat": 0,
+    "unconfirmed_sat": 0,
+    "immature_sat": 0,
+    "total_sat": 0
+  }
+}
+$ btcw --json address new | jq -r .address
+bcrt1qz0muuvy3tku2unzd2zpqyla5u4k476mnhnskxz
+```
+
+| Command | JSON (besides `network`) |
+|---|---|
+| `create` | `birthday_height`, `first_address` (never the phrase) |
+| `restore` | `birthday_height`, `synced_height`, `sync` (`SyncReport` or `null`), `sync_error`, `balance` |
+| `address new` | the `AddressRow` fields |
+| `address list` | `synced_height`, `addresses: [AddressRow]` |
+| `sync` | the `SyncReport` fields: `tip_height`, `blocks_scanned`, `mempool_txs` |
+| `balance` / `history` / `utxos` | `synced_height` + `balance` / `transactions: [TxRow]` / `utxos: [UtxoRow]` |
+| `mine` | `to`, `wallet_address_index`, `block_hashes`, `tip_height` |
+
+Amounts are integer satoshis, as everywhere in the core. Errors are JSON too, on stdout, with the
+core's stable code (`WalletError::code()`, found by walking the `anyhow` error chain) or `cli` for
+errors from the terminal layer itself:
+
+```console
+$ btcw --json send --to bcrt1q… --amount 1000; echo "exit=$?"
+{
+  "error": {
+    "code": "cli",
+    "message": "`btcw send` is not implemented yet (Phase 2)"
+  }
+}
+exit=1
+```
+
+| Exit | Meaning | Human mode | JSON mode |
+|---|---|---|---|
+| 0 | success | result on stdout | one JSON value on stdout |
+| 1 | error | `error: <message>` on stderr | `{"error":{"code","message"}}` on stdout |
+| 2 | invalid command line | clap's usage message on stderr | `{"error":{"code":"cli",…}}` on stdout |
+
+Everything that isn't the result goes to stderr: prompts (via the TTY), warnings, the progress bar
+and logs. Logging is `tracing-subscriber` on stderr at level `warn` (`RUST_LOG` overrides it), so the
+core's warnings, like "the node's chain is shorter than the wallet's" or the fee-rate fallback, are
+visible without ever touching stdout.
+
+### Progress and freshness
+`sync` (and the scan at the end of `restore`) passes a callback to `Node::sync`, which calls it once
+per block. The CLI turns that into an `indicatif` bar on stderr:
+
+```text
+⠙ Syncing [=========>                    ] block 31 of 102 (0s)
+```
+
+The bar counts only the blocks *this* sync downloads, from the block after the wallet's checkpoint
+(or the birthday, on a first sync) to the tip, while the message shows absolute heights. In `--json`
+mode, or when stderr isn't a terminal, the bar is hidden entirely, so logs and CI output don't fill up
+with redraws.
+
+`balance`, `history`, `utxos` and `address list` work offline, from the SQLite file. They say how
+fresh their numbers are: `as of block 102 (run `btcw sync` to update)`, or `not synced yet` before the
+first sync. Confirmation counts are relative to that block, as explained in §4.
+
+### Smaller decisions
+- **`mine` is regtest-only twice over.** `Node::mine` refuses other networks, and the CLI checks
+  first too, so `btcw --network testnet4 mine 1` fails at once instead of needing a node or touching
+  the wallet. `--to` is parsed as `Address<NetworkUnchecked>` and checked with `require_network`;
+  a `tb1…` address on regtest gives `network mismatch: expected regtest, found a testnet4/signet
+  address` (testnet4 and signet share the `tb` prefix, so the message names both).
+- **Errors before prompts.** `create` and `restore` check `api::wallet_exists` before asking for
+  anything (the core checks again, under the lock), so you don't type a password just to hear the
+  wallet already exists.
+- **No `.env` loading.** `scripts/regtest.sh env` prints `export` lines for `eval`. Silently reading
+  a `.env` from the current directory or one of its parents could switch the network, datadir or node
+  of a wallet without the user noticing, and invite people to keep `BTCW_PASSWORD` in a file.
+- **`--rpc-user` / `--rpc-pass`** were added as global flags (they map onto `Overrides`). The help
+  text says that other local users can see command-line arguments in `ps`, and points to the cookie
+  file or `BTCW_RPC_PASS` instead.
+
+### Demo session (regtest)
+```console
+$ scripts/regtest.sh start                   # bitcoind + "faucet" wallet with 101 blocks
+regtest node up on 127.0.0.1:18443
+$ eval "$(scripts/regtest.sh env)"            # BTCW_NETWORK, BTCW_RPC_URL, BTCW_RPC_COOKIE
+$ cargo install --path crates/btcw-cli        # or: alias btcw=target/debug/btcw
+
+$ btcw create
+Choose a password to encrypt the recovery phrase on this computer (at least 8 characters).
+You will need it to send coins; viewing the balance and history does not need it.
+New wallet password:
+Repeat the password:
+[regtest] Created a new wallet in /home/me/.local/share/btcw/regtest
+
+Recovery phrase (12 words). Write them down on paper, in this order:
+  …the grid and warning shown above…
+
+First receive address (#0): bcrt1qrk69aywnt0ujqfgz0qtv6lrx62qh70c4hpfw2w
+Wallet birthday: block 101 (the first sync starts there)
+Next: `btcw sync`, then `btcw balance`.
+
+$ btcw address new
+[regtest] Receive address #0
+bcrt1qrk69aywnt0ujqfgz0qtv6lrx62qh70c4hpfw2w
+btcw hands out this address until it receives a payment, so asking again returns it again.
+
+$ scripts/regtest.sh fund bcrt1qrk69aywnt0ujqfgz0qtv6lrx62qh70c4hpfw2w 0.01
+c60488d152e83d8cce92c1d9c7c1077d82746950a926403ac61669059f23d94f
+$ btcw sync
+[regtest] Synced to block 101: scanned 1 block; 1 unconfirmed wallet transaction waiting in the mempool.
+$ btcw balance
+[regtest] Balance as of block 101 (run `btcw sync` to update)
+  Confirmed   0.00000000 BTC (0 sat)
+  Unconfirmed 0.01000000 BTC (1,000,000 sat)
+  Total       0.01000000 BTC (1,000,000 sat)
+
+$ btcw mine 1                                # to the wallet's next unused address
+[regtest] Mined 1 block to bcrt1qyluzz4nfscy4wmna0sft45vdgsxjz46r0glwz4 (wallet receive address #1); the node's tip is now block 102.
+Run `btcw sync` to see the reward in the wallet; mined coins can be spent after 100 confirmations.
+$ btcw sync
+[regtest] Synced to block 102: scanned 1 block; no unconfirmed wallet transactions.
+$ btcw balance
+[regtest] Balance as of block 102 (run `btcw sync` to update)
+  Confirmed    0.01000000 BTC (1,000,000 sat)
+  Unconfirmed  0.00000000 BTC (0 sat)
+  Immature    50.00002820 BTC (5,000,002,820 sat)  mined; spendable after 100 confirmations
+  Total       50.01002820 BTC (5,001,002,820 sat)
+
+$ btcw history
+[regtest] 2 transactions as of block 102 (run `btcw sync` to update)
+╭──────────────────┬──────────┬───────────────────────────────────────┬───────┬────────────────┬──────────────────────────────────────────────────────────────────╮
+│ Date (UTC)       ┆ Type     ┆                                Amount ┆   Fee ┆ Status         ┆ Txid                                                             │
+╞══════════════════╪══════════╪═══════════════════════════════════════╪═══════╪════════════════╪══════════════════════════════════════════════════════════════════╡
+│ 2026-10-03 02:02 ┆ received ┆ +50.00002820 BTC (+5,000,002,820 sat) ┆ 0 sat ┆ 1 confirmation ┆ c39f788536d71bae7c729e11ad7edfcf39fe3f13cb3787254e0855d7c84e1a91 │
+│ 2026-10-03 02:02 ┆ received ┆      +0.01000000 BTC (+1,000,000 sat) ┆     — ┆ 1 confirmation ┆ c60488d152e83d8cce92c1d9c7c1077d82746950a926403ac61669059f23d94f │
+╰──────────────────┴──────────┴───────────────────────────────────────┴───────┴────────────────┴──────────────────────────────────────────────────────────────────╯
+```
+
+Two things in that history are worth a second look. The mined block pays 50 BTC **plus 2 820 sat**:
+the miner also collects the fee of every transaction in the block, here our funding transaction. And
+the fee column shows `—` for the incoming payment because the wallet never saw the sender's inputs (§4),
+but `0 sat` for the coinbase, which has no inputs and so pays no fee. The `Immature` line disappears
+once the reward has 100 confirmations: `scripts/regtest.sh mine 100` (to the faucet; `btcw mine 100`
+would pay 100 *new* immature rewards to the wallet), then `btcw sync`.
+
+### Testing
+`crates/btcw-cli/tests/cli.rs` runs the real binary (`env!("CARGO_BIN_EXE_btcw")`) with a temporary
+`--datadir`, `--network regtest`, `NO_COLOR=1`, `BTCW_PASSWORD`, and every inherited `BTCW_*`
+variable removed, so a developer's own `eval "$(scripts/regtest.sh env)"` can't leak into a test.
+"Offline" tests point `--rpc-url` at port 1, where nothing listens.
+
+- **Errors:** `wallet_not_found` before `create` (and no directory left behind), `mainnet_disabled`,
+  testnet3 → `config`, a 7-character password → `weak_password` with nothing written, `wallet_exists`,
+  an invalid phrase → `invalid_mnemonic` without echoing it, no terminal and no `BTCW_PASSWORD` → a
+  clear hint, usage errors → exit 2 (JSON with `--json`), `send`/`status` → "not implemented yet (Phase 2)".
+- **Secrets:** `create --json` puts nothing but `{network, birthday_height, first_address}` on
+  stdout; the 12 words parsed back from stderr derive that same first address, and restoring them
+  in a fresh datadir gives it again. `echo "abandon … about" | btcw restore` yields
+  `bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk`, which the test also derives independently with the
+  core's `derive_account` and an in-memory BDK wallet.
+- **With a node** (skipped without `bitcoind`): create (birthday = tip) → fund → `sync --json`
+  (`mempool_txs ≥ 1`) → unconfirmed balance → `mine 1` to the wallet → sync → confirmed + immature
+  balance, history with 1 confirmation each, two UTXOs → mine 2 → 3 confirmations → restore the
+  phrase elsewhere: a full rescan from genesis finds the same balance and history.
+- **Unit tests** for the formatting helpers: thousands separators, sat → BTC strings, signed amounts,
+  UTC dates (leap days, 2100), the JSON error shape, the phrase grid and address network checks.
+
+### Try it
+```bash
+cargo run -p btcw-cli -- --help
+cargo test -p btcw-cli                                            # offline tests + unit tests
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-cli --test cli   # + the regtest round trip
+```
+
 ## 6. Desktop UI, Phase 1 / Agent E — _pending_
 ## 7. Sending and status, Phase 2 / Agent F — _pending_
 ## 8. Tauri bridge, Phase 2 / Agent G — _pending_
