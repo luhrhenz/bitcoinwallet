@@ -164,6 +164,22 @@ describe("send flow", () => {
     expect(screen.getByLabelText("Recipient address")).toHaveValue(TB_ADDRESS);
   });
 
+  it("goes back to the form when sending fails: the prepared payment is gone", async () => {
+    const { mock } = await openSend();
+    fillForm(TB_ADDRESS, "0.0015");
+    review();
+    const preview = await screen.findByRole("region", { name: "Transaction preview" });
+    mock.setNodeOnline(false);
+    fireEvent.click(within(preview).getByRole("button", { name: "Send 0.00150000 BTC" }));
+    expect(await screen.findByText(/Can't reach your Bitcoin node/)).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Transaction preview" })).toBeNull();
+    // What was typed is still there, ready to review again.
+    expect(screen.getByLabelText("Recipient address")).toHaveValue(TB_ADDRESS);
+    mock.setNodeOnline(true);
+    review();
+    expect(await screen.findByRole("region", { name: "Transaction preview" })).toBeInTheDocument();
+  });
+
   it("asks for the password first when the wallet is locked", async () => {
     const { mock } = await openSend({ unlocked: false });
     const prepare = vi.spyOn(mock, "prepareSend");

@@ -8,6 +8,7 @@ import type { Go } from "../state/nav";
 import { useWallet } from "../state/wallet";
 import { AddressChunks } from "../components/Address";
 import { Btc, Sat } from "../components/Amount";
+import { BackupReminder } from "../components/BackupReminder";
 import { ErrorNotice } from "../components/ErrorNotice";
 import { Field, NO_ASSIST } from "../components/Field";
 import { ScreenHeader } from "../components/Frame";
@@ -47,7 +48,6 @@ export function Send({ go }: { go: Go }) {
   const [feeText, setFeeText] = useState("");
   const [errors, setErrors] = useState<FieldErrors>(NO_ERRORS);
   const [formError, setFormError] = useState<unknown>(null);
-  const [confirmError, setConfirmError] = useState<unknown>(null);
   const [busy, setBusy] = useState<null | "preparing" | "sending">(null);
   const [prepared, setPrepared] = useState<PreparedSend | null>(null);
 
@@ -117,7 +117,6 @@ export function Send({ go }: { go: Go }) {
       setBusy("preparing");
       try {
         setPreview(await api.prepareSend(to.trim(), input.amountSat, input.feeRate));
-        setConfirmError(null);
         setBusy(null);
         void wallet.refreshWallet(); // preparing syncs first; show the balance it used
         return;
@@ -143,7 +142,6 @@ export function Send({ go }: { go: Go }) {
     if (!pending || busy) return;
     setBusy("sending");
     sending.current = true;
-    setConfirmError(null);
     try {
       const { txid } = await api.confirmSend(pending.id);
       open.current = null; // sent: nothing to cancel any more
@@ -158,13 +156,11 @@ export function Send({ go }: { go: Go }) {
         await wallet.refreshInfo().catch(() => undefined);
         return;
       }
-      if (code === "tx_build") {
-        // The preview is no longer valid (expired, or its coins were spent): start over.
-        setPreview(null);
-        setFormError(err);
-        return;
-      }
-      setConfirmError(err);
+      // The backend drops a prepared payment after any failed send (and an expired one): back
+      // to the form, with what was typed still there, to review it again.
+      setPreview(null);
+      setFormError(err);
+      void wallet.refreshWallet();
     }
   }
 
@@ -185,7 +181,6 @@ export function Send({ go }: { go: Go }) {
       <Preview
         preview={prepared.preview}
         sending={busy === "sending"}
-        error={confirmError}
         onConfirm={() => void confirm()}
         onCancel={() => void cancel()}
       />
@@ -203,6 +198,7 @@ export function Send({ go }: { go: Go }) {
   return (
     <div className="screen">
       <ScreenHeader title="Send" lead={`Pay a ${meta.label} address. You'll see the fee and check everything before anything is sent.`} />
+      <BackupReminder />
       {!info.unlocked && (
         <p className="inline-note">
           <Icon name="lock" size={16} /> The wallet is locked. You&apos;ll be asked for your password when you review.
@@ -288,13 +284,11 @@ export function Send({ go }: { go: Go }) {
 function Preview({
   preview,
   sending,
-  error,
   onConfirm,
   onCancel,
 }: {
   preview: SendPreview;
   sending: boolean;
-  error: unknown;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -374,7 +368,6 @@ function Preview({
             </div>
           </div>
         )}
-        <ErrorNotice error={error} network={info.network} />
         <div className="actions">
           <button type="button" className="btn btn--ghost" onClick={onCancel} disabled={sending}>
             Cancel

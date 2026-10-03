@@ -14,6 +14,7 @@ describe("create wallet", () => {
   it("shows the phrase once, requires the backup check, then forgets the words", async () => {
     const { mock } = await renderApp();
     const create = vi.spyOn(mock, "createWallet");
+    const verify = vi.spyOn(mock, "verifyBackup");
     await startCreate();
     fillPasswords(PASSWORD, PASSWORD);
     fireEvent.click(screen.getByRole("button", { name: "Create wallet" }));
@@ -55,12 +56,45 @@ describe("create wallet", () => {
     fireEvent.click(screen.getByRole("button", { name: "Check and finish" }));
     await waitForDashboard();
 
+    // The passed check is recorded in Rust (1-based positions), so no reminder asks again.
+    expect(verify).toHaveBeenCalledTimes(1);
+    const [password, answers] = verify.mock.calls[0]!;
+    expect(password).toBe(PASSWORD);
+    expect(answers.map(([position, word]) => words[position - 1] === word)).toEqual([true, true, true]);
+    expect((await mock.appInfo()).backup_verified).toBe(true);
+    expect(screen.queryByRole("region", { name: "Check your recovery phrase backup" })).toBeNull();
+
     // The words are gone: not on screen, not in storage, not in the URL.
     expect(screen.queryByRole("list", { name: "Recovery phrase" })).toBeNull();
     for (const word of words) expect(screen.queryByText(word)).toBeNull();
     expect(localStorage.length).toBe(0);
     expect(sessionStorage.length).toBe(0);
     for (const word of words) expect(window.location.href).not.toContain(word);
+  });
+
+  it("says so, and keeps the reminder, if the passed check can't be recorded", async () => {
+    const { mock } = await renderApp();
+    vi.spyOn(mock, "verifyBackup").mockRejectedValueOnce({
+      code: "wallet_in_use",
+      message: "wallet is open in another btcw process",
+    });
+    await startCreate();
+    fillPasswords(PASSWORD, PASSWORD);
+    fireEvent.click(screen.getByRole("button", { name: "Create wallet" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Show the 12 words" }));
+    const words = within(screen.getByRole("list", { name: "Recovery phrase" }))
+      .getAllByRole("listitem")
+      .map((item) => item.querySelector(".phrase__word")?.textContent ?? "");
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Continue to the check" }));
+    for (const input of screen.getAllByLabelText(/^Word #\d+$/)) {
+      const n = Number(/#(\d+)/.exec(document.querySelector(`label[for="${input.id}"]`)?.textContent ?? "")?.[1]);
+      type(input, words[n - 1] ?? "");
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Check and finish" }));
+    await waitForDashboard();
+    expect(screen.getByText(/Your backup check passed, but btcw couldn't record it/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Check your recovery phrase backup" })).toBeInTheDocument();
   });
 
   it("can show the words again from the check", async () => {

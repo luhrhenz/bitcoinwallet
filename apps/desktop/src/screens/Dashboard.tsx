@@ -3,6 +3,7 @@ import { sortNewestFirst } from "../lib/format";
 import type { Go } from "../state/nav";
 import { useWallet } from "../state/wallet";
 import { Btc } from "../components/Amount";
+import { BackupReminder } from "../components/BackupReminder";
 import { ErrorNotice } from "../components/ErrorNotice";
 import { Icon } from "../components/Icon";
 import { SyncStatus } from "../components/SyncStatus";
@@ -17,6 +18,7 @@ export function Dashboard({ go }: { go: Go }) {
 
   return (
     <div className="screen">
+      <BackupReminder />
       <section className="balance" aria-labelledby="balance-title">
         <div className="balance__head">
           <h1 className="eyebrow" id="balance-title">

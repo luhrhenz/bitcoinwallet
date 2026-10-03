@@ -169,6 +169,7 @@ describe("settings", () => {
       rpc_url: "http://127.0.0.1:48332",
       rpc_cookie: null,
       auto_lock_minutes: 10,
+      mainnet_opt_in: false,
     });
   });
 });

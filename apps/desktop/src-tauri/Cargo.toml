@@ -1,0 +1,46 @@
+[package]
+name = "btcw-desktop"
+description = "btcw desktop app: the Tauri 2 bridge between the React UI and btcw-core"
+version.workspace = true
+edition.workspace = true
+# Tauri 2.12 needs Rust 1.90 (one release above the rest of the workspace).
+rust-version = "1.90"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "btcw_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "btcw-desktop"
+path = "src/main.rs"
+
+[features]
+# Compiles mainnet in; it still needs the opt-in in Settings (PLAN §4.1).
+mainnet = ["btcw-core/mainnet"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+btcw-core = { path = "../../../crates/btcw-core" }
+dirs.workspace = true
+# Same minor version as @tauri-apps/api and @tauri-apps/cli in package.json (the CLI checks).
+# No plugins: no shell, fs, http or dialog access for the webview.
+tauri = { version = "2.12", features = [] }
+getrandom.workspace = true
+secrecy = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+btcw-core = { path = "../../../crates/btcw-core", features = ["test-utils"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

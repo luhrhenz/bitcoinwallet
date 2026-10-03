@@ -184,9 +184,17 @@ export function WalletProvider({
     [notify, refreshInfo, settings.auto_lock_minutes],
   );
 
-  useAutoLock(info.unlocked, settings.auto_lock_minutes, () => {
-    void lock("auto");
-  });
+  useAutoLock(
+    info.unlocked,
+    settings.auto_lock_minutes,
+    () => {
+      void lock("auto");
+    },
+    () => {
+      // Best effort: if it fails, the backend just locks a little earlier.
+      void api.keepAlive().catch(() => undefined);
+    },
+  );
 
   const saveSettings = useCallback(
     async (next: Settings) => {

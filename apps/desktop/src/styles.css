@@ -870,6 +870,18 @@ fieldset.panel {
   color: var(--info);
 }
 
+.notice__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* The backup reminder: the info tone, so it reads as a to-do rather than an alarm. */
+.reminder .notice__title {
+  font-size: inherit;
+}
+
 .notice--success {
   background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 35%, transparent);
@@ -1720,6 +1732,10 @@ fieldset.panel {
   border: 1px solid var(--line);
   box-shadow: 0 24px 60px -20px rgb(0 0 0 / 0.5);
   animation: rise 0.18s ease-out;
+}
+
+.modal--wide {
+  width: min(640px, 100%);
 }
 
 .modal__title {

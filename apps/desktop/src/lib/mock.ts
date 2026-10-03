@@ -8,7 +8,13 @@
 //   (~141 vB for 1 input and 2 outputs);
 // - the wallet only learns about the chain by syncing: a payment shows up after `sync`, and a
 //   block mined with `mineBlocks` turns into confirmations after `sync` or `txStatus` (which
-//   syncs first, as PLAN §5.9 and `tx::tx_status`'s doc ask of the real command);
+//   syncs first when the node is up and otherwise answers from the last sync, like the Rust
+//   command);
+// - sending follows the Rust bridge: one prepared payment at a time (a new one replaces it),
+//   `locked` without the password, and a prepared payment is gone after any `confirmSend`
+//   (sent, failed or expired after 10 minutes) and after locking;
+// - the backup flag: a new wallet is unverified, a restored one verified; `backupChallenge`,
+//   `verifyBackup` and `revealPhrase` check the password like the keystore does;
 // - every failure rejects with a plain `ApiError { code, message }` object, like Tauri.
 //
 // Simplifications: one fake "node" per network, coins only to and from this wallet, no
@@ -77,6 +83,8 @@ const HRP: Record<NetworkName, string> = { testnet4: "tb", signet: "tb", regtest
 const RPC_PORT: Record<NetworkName, number> = { testnet4: 48332, signet: 38332, regtest: 18443, bitcoin: 8332 };
 const BLOCK_SECS = 600;
 const COINBASE_MATURITY = 100;
+const PENDING_SEND_TTL_MS = 10 * 60_000;
+const BACKUP_CHECK_WORDS = 3;
 
 // ---------------------------------------------------------------------------------------------
 // State
@@ -106,6 +114,9 @@ interface MockTx {
 
 interface Wallet {
   password: string;
+  /** The recovery phrase. Only `revealPhrase` and the backup check read it. */
+  words: string[];
+  backupVerified: boolean;
   seed: Uint8Array;
   birthday: number;
   syncedHeight: number;
@@ -127,6 +138,8 @@ interface Chain {
 
 interface Pending {
   network: NetworkName;
+  /** `Date.now()` when prepared; previews expire like the Rust side's (10 minutes). */
+  created: number;
   preview: PreparedSend["preview"];
   inputs: Output[];
   change: Output | null;
@@ -187,6 +200,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     rpc_url: null,
     rpc_cookie: null,
     auto_lock_minutes: 5,
+    mainnet_opt_in: false,
   };
   let nodeOnline = true;
   const listeners = new Set<(p: SyncProgress) => void>();
@@ -212,6 +226,10 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
 
   function requireUnlocked(wallet: Wallet): void {
     if (!wallet.unlocked) throw fail("locked", "the wallet is locked; unlock it with your password to send");
+  }
+
+  function checkPassword(wallet: Wallet, password: string): void {
+    if (password !== wallet.password) throw fail("wrong_password", "wrong password or corrupted keystore");
   }
 
   function checkNewPassword(password: string): void {
@@ -409,9 +427,17 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     if (amountSat < DUST_LIMIT_SAT) {
       throw fail("dust_amount", `amount ${formatBtc(amountSat)} BTC is below the dust limit`);
     }
-    if (feeRate !== null && !(Number.isFinite(feeRate) && feeRate > 0 && feeRate <= 10_000)) {
-      throw fail("tx_build", "could not build transaction: the fee rate must be between 0 and 10,000 sat/vB");
+    if (feeRate !== null && !(Number.isFinite(feeRate) && feeRate > 0)) {
+      throw fail("tx_build", "could not build transaction: the fee rate must be a positive number of sat/vB");
     }
+    if (feeRate !== null && feeRate < 1) {
+      throw fail("tx_build", `could not build transaction: fee rate ${feeRate} sat/vB is below the 1 sat/vB minimum that nodes relay`);
+    }
+    if (feeRate !== null && feeRate > 25_000) {
+      throw fail("tx_build", `could not build transaction: fee rate ${feeRate} sat/vB is above the 25000 sat/vB safety limit`);
+    }
+    // One prepared payment at a time: this one replaces any earlier preview.
+    for (const id of [...pending.keys()]) release(id);
     requireNode();
     applySync(chain, wallet); // spend from fresh UTXO state, like the core's send flow
     const rate = feeRate ?? defaultFeeRate;
@@ -463,7 +489,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       change_sat: change ? change.value : null,
       total_sat: amount + fee,
     };
-    pending.set(id, { network: chain.network, preview, inputs, change });
+    pending.set(id, { network: chain.network, created: Date.now(), preview, inputs, change });
     return { id, preview };
   }
 
@@ -482,10 +508,21 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     const { chain, wallet } = requireWallet();
     requireUnlocked(wallet);
     const entry = pending.get(id);
-    if (!entry || entry.network !== chain.network) {
-      throw fail("tx_build", "could not build transaction: this send was already confirmed or cancelled; prepare it again");
+    if (!entry) {
+      throw fail(
+        "tx_build",
+        "could not build transaction: this payment is no longer waiting to be sent (it was sent, cancelled or replaced); review it again",
+      );
     }
-    requireNode();
+    // Like the Rust side: the prepared payment is used up by this call, whatever happens next.
+    if (entry.network !== chain.network || Date.now() - entry.created > PENDING_SEND_TTL_MS) {
+      release(id);
+      throw fail("tx_build", "could not build transaction: this payment preview expired after 10 minutes; review it again");
+    }
+    if (!nodeOnline) {
+      release(id);
+      requireNode();
+    }
     const spent = new Set(visibleTxs(chain, wallet).flatMap((tx) => tx.spends));
     if (entry.inputs.some((input) => spent.has(input.outpoint))) {
       release(id);
@@ -565,6 +602,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
           wallet_exists: chain.wallet !== null,
           unlocked: chain.wallet?.unlocked ?? false,
           synced_height: chain.wallet ? chain.wallet.syncedHeight : null,
+          backup_verified: chain.wallet ? chain.wallet.backupVerified : null,
         };
       }),
 
@@ -577,6 +615,8 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         const mnemonic = entropyToMnemonic(randomBytes(words === 12 ? 16 : 32));
         chain.wallet = {
           password,
+          words: [...mnemonic],
+          backupVerified: false,
           seed: sha256(utf8(mnemonic.join(" "))),
           birthday: nodeOnline ? chain.tip : 0,
           syncedHeight: 0,
@@ -600,6 +640,9 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         }
         const wallet: Wallet = {
           password,
+          words,
+          // The user just typed the whole phrase: that is the backup, and it's correct.
+          backupVerified: true,
           seed: sha256(utf8(words.join(" "))),
           birthday: birthday ?? 0,
           syncedHeight: 0,
@@ -614,15 +657,19 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     unlock: (password) =>
       answer(() => {
         const { wallet } = requireWallet();
-        if (password !== wallet.password) throw fail("wrong_password", "wrong password or corrupted keystore");
+        checkPassword(wallet, password);
         wallet.unlocked = true;
       }, latency * 3), // Argon2id is meant to be slow
 
     lock: () =>
       answer(() => {
-        const wallet = active().wallet;
-        if (wallet) wallet.unlocked = false;
+        const chain = active();
+        if (chain.wallet) chain.wallet.unlocked = false;
+        // Locking drops the prepared payment with the keys.
+        for (const [id, entry] of pending) if (entry.network === chain.network) release(id);
       }),
+
+    keepAlive: () => answer(() => undefined),
 
     newAddress: () =>
       answer((): AddressRow => {
@@ -695,8 +742,8 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     txStatus: (txid) =>
       answer((): TxStatus | null => {
         const { chain, wallet } = requireWallet();
-        requireNode();
-        applySync(chain, wallet);
+        // Syncs when the node answers; otherwise the status is as of the last sync.
+        if (nodeOnline) applySync(chain, wallet);
         const tx = visibleTxs(chain, wallet).find((t) => t.txid === txid);
         return tx ? statusOf(chain, wallet, tx) : null;
       }),
@@ -705,14 +752,14 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
 
     setSettings: (next) =>
       answer(() => {
-        if (!networks.includes(next.network)) {
+        if (!networks.includes(next.network) || (next.network === "bitcoin" && !next.mainnet_opt_in)) {
           if (next.network === "bitcoin") {
             throw fail("mainnet_disabled", "mainnet is disabled; build with `--features mainnet` and opt in explicitly");
           }
           throw fail("config", `configuration error: network ${next.network} is not available`);
         }
-        if (!Number.isInteger(next.auto_lock_minutes) || next.auto_lock_minutes < 1 || next.auto_lock_minutes > 1440) {
-          throw fail("config", "configuration error: auto-lock must be between 1 and 1440 minutes");
+        if (!Number.isInteger(next.auto_lock_minutes) || next.auto_lock_minutes < 1 || next.auto_lock_minutes > 60) {
+          throw fail("config", "configuration error: auto-lock must be between 1 and 60 minutes");
         }
         if (next.rpc_url !== null && !/^https?:\/\/[^\s/]+(\/\S*)?$/.test(next.rpc_url)) {
           throw fail("config", `configuration error: \`${next.rpc_url}\` is not an http:// URL`);
@@ -729,6 +776,45 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         }
         settings = clone(next);
       }),
+
+    backupChallenge: (password) =>
+      answer((): number[] => {
+        const { wallet } = requireWallet();
+        checkPassword(wallet, password);
+        return randomPositions(BACKUP_CHECK_WORDS, wallet.words.length);
+      }, latency * 3),
+
+    verifyBackup: (password, answers) =>
+      answer(() => {
+        const { wallet } = requireWallet();
+        checkPassword(wallet, password);
+        const total = wallet.words.length;
+        const seen = new Set<number>();
+        for (const [position] of answers) {
+          if (!Number.isInteger(position) || position < 1 || position > total) {
+            throw fail("config", `configuration error: word position ${position} is outside 1..=${total}`);
+          }
+          if (seen.has(position)) throw fail("config", `configuration error: word position ${position} was given twice`);
+          seen.add(position);
+        }
+        const needed = Math.min(BACKUP_CHECK_WORDS, total);
+        if (seen.size < needed) {
+          throw fail("config", `configuration error: the backup check needs at least ${needed} words, got ${seen.size}`);
+        }
+        const wrong = answers
+          .filter(([position, word]) => word.trim().toLowerCase() !== wallet.words[position - 1])
+          .map(([position]) => position)
+          .sort((a, b) => a - b);
+        if (wrong.length > 0) throw fail("backup_mismatch", backupMismatchMessage(wrong));
+        wallet.backupVerified = true;
+      }, latency * 3),
+
+    revealPhrase: (password) =>
+      answer(() => {
+        const { wallet } = requireWallet();
+        checkPassword(wallet, password);
+        return { mnemonic: [...wallet.words] };
+      }, latency * 3),
 
     // --- controls ----------------------------------------------------------------------------
 
@@ -761,6 +847,25 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       miner = null;
     },
   };
+}
+
+/** `count` distinct positions in 1..=total, ascending, from the OS RNG without modulo bias. */
+function randomPositions(count: number, total: number): number[] {
+  const picked = new Set<number>();
+  const zone = 2 ** 32 - (2 ** 32 % total);
+  const random = new Uint32Array(1);
+  while (picked.size < Math.min(count, total)) {
+    crypto.getRandomValues(random);
+    const value = random[0] ?? 0;
+    if (value < zone) picked.add((value % total) + 1);
+  }
+  return [...picked].sort((a, b) => a - b);
+}
+
+/** The core's `BackupMismatch` text: positions only, never words. */
+function backupMismatchMessage(positions: number[]): string {
+  if (positions.length === 1) return `word ${positions[0]} does not match your recovery phrase`;
+  return `words ${positions.slice(0, -1).join(", ")} and ${positions.at(-1)} do not match your recovery phrase`;
 }
 
 // ---------------------------------------------------------------------------------------------

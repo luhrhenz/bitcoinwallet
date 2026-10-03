@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- btcw mark: the brand square from the app's top bar (and index.html's favicon), scaled up. -->
+  <rect x="96" y="96" width="832" height="832" rx="184" fill="#f8faf9" stroke="#15211d" stroke-width="72"/>
+  <rect x="352" y="352" width="320" height="320" rx="56" fill="#1d5b4c"/>
+</svg>

@@ -1,10 +1,11 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api } from "../lib/api";
+import { describeError } from "../lib/errors";
 import { useWallet } from "../state/wallet";
 import { ErrorNotice } from "../components/ErrorNotice";
 import { Field, NO_ASSIST } from "../components/Field";
-import { Icon } from "../components/Icon";
 import { PasswordFields, passwordPairErrors, type PasswordPairState } from "../components/PasswordFields";
+import { PhraseGrid, PhraseWarning } from "../components/Phrase";
 import { Steps } from "../components/Steps";
 
 type Step = "password" | "backup" | "verify";
@@ -25,12 +26,16 @@ export function pickPositions(count: number, total: number): number[] {
 }
 
 /**
- * Create → show the phrase once → check three words. The phrase is the only secret the UI ever
- * receives (PLAN §4.2): it lives in this component's state from `createWallet` until the check
- * passes, and is never written to storage, the URL or a log.
+ * Create → write the phrase down → check three words. The phrase lives in this component's state
+ * from `createWallet` until the check passes, and is never written to storage, the URL or a log.
+ * (Later it can only be shown again through Settings, with the password: `revealPhrase`.)
+ *
+ * A passed check is recorded in Rust with `verifyBackup`, so the backup reminder doesn't ask the
+ * user to prove again what they just proved. That needs the password once more: it is kept in a
+ * ref (never rendered) for exactly as long as the phrase itself is held here, and cleared with it.
  */
 export function CreateWallet({ onBack, onFinished }: { onBack: () => void; onFinished: () => void }) {
-  const { refreshInfo } = useWallet();
+  const { refreshInfo, notify } = useWallet();
   const [step, setStep] = useState<Step>("password");
   const [wordCount, setWordCount] = useState<12 | 24>(12);
   const [password, setPassword] = useState(EMPTY_PASSWORD);
@@ -38,6 +43,14 @@ export function CreateWallet({ onBack, onFinished }: { onBack: () => void; onFin
   const [error, setError] = useState<unknown>(null);
   const [mnemonic, setMnemonic] = useState<string[] | null>(null);
   const [positions, setPositions] = useState<number[]>([]);
+  const [recording, setRecording] = useState(false);
+  const passwordRef = useRef<string | null>(null);
+  useEffect(
+    () => () => {
+      passwordRef.current = null;
+    },
+    [],
+  );
 
   async function create(e: FormEvent) {
     e.preventDefault();
@@ -50,7 +63,8 @@ export function CreateWallet({ onBack, onFinished }: { onBack: () => void; onFin
     setError(null);
     try {
       const created = await api.createWallet(wordCount, password.password);
-      setPassword(EMPTY_PASSWORD); // the backend has it now; the UI doesn't need it
+      passwordRef.current = password.password; // for `verifyBackup` once the check passes
+      setPassword(EMPTY_PASSWORD);
       setMnemonic(created.mnemonic);
       setPositions(pickPositions(CHECKED_WORDS, created.mnemonic.length));
       setStep("backup");
@@ -61,11 +75,32 @@ export function CreateWallet({ onBack, onFinished }: { onBack: () => void; onFin
     }
   }
 
-  async function finish() {
-    // The words leave UI state for good; nothing can show them again.
+  async function finish(answers: [number, string][]) {
+    if (recording) return;
+    setRecording(true);
+    // The user just proved their copy: record it, so the reminder doesn't ask again.
+    let notRecorded: string | null = null;
+    const pw = passwordRef.current;
+    if (pw === null) {
+      notRecorded = "the password is no longer available";
+    } else {
+      try {
+        await api.verifyBackup(pw, answers);
+      } catch (err) {
+        notRecorded = describeError(err).title;
+      }
+    }
+    // The words and the password leave UI state for good.
+    passwordRef.current = null;
     setMnemonic(null);
     setPositions([]);
     await refreshInfo().catch(() => undefined);
+    if (notRecorded !== null) {
+      notify(
+        "info",
+        `Your backup check passed, but btcw couldn't record it (${notRecorded}). The reminder stays until you verify the backup again.`,
+      );
+    }
     onFinished();
   }
 
@@ -113,7 +148,13 @@ export function CreateWallet({ onBack, onFinished }: { onBack: () => void; onFin
       {step === "backup" && mnemonic && <Backup words={mnemonic} onContinue={() => setStep("verify")} />}
 
       {step === "verify" && mnemonic && (
-        <Verify words={mnemonic} positions={positions} onShowAgain={() => setStep("backup")} onVerified={finish} />
+        <Verify
+          words={mnemonic}
+          positions={positions}
+          checking={recording}
+          onShowAgain={() => setStep("backup")}
+          onVerified={(answers) => void finish(answers)}
+        />
       )}
     </div>
   );
@@ -134,29 +175,10 @@ function Backup({ words, onContinue }: { words: string[]; onContinue: () => void
         </p>
       </div>
 
-      <div className="notice notice--warning" role="note">
-        <Icon name="alert" className="notice__icon" />
-        <div className="notice__body">
-          <p className="notice__title">Anyone with these words can take your coins.</p>
-          <ul className="notice__list">
-            <li>Write them on paper, in order, and keep the paper somewhere safe and private.</li>
-            <li>Don&apos;t take a screenshot or photo, and don&apos;t paste them into a file, email or chat.</li>
-            <li>btcw will never show them again. Lose the paper and this computer, and the coins are gone.</li>
-          </ul>
-        </div>
-      </div>
+      <PhraseWarning />
 
       {revealed ? (
-        <ol className="phrase" aria-label="Recovery phrase">
-          {words.map((word, i) => (
-            <li key={i} className="phrase__item">
-              <span className="phrase__n" aria-hidden="true">
-                {i + 1}
-              </span>
-              <span className="phrase__word">{word}</span>
-            </li>
-          ))}
-        </ol>
+        <PhraseGrid words={words} />
       ) : (
         <div className="phrase phrase--hidden">
           <p>Make sure nobody can see your screen, then show the words.</p>
@@ -182,13 +204,17 @@ function Backup({ words, onContinue }: { words: string[]; onContinue: () => void
 function Verify({
   words,
   positions,
+  checking,
   onShowAgain,
   onVerified,
 }: {
   words: string[];
   positions: number[];
+  /** Recording the passed check in Rust. */
+  checking: boolean;
   onShowAgain: () => void;
-  onVerified: () => void;
+  /** With the answers as `[1-based position, word]`, for `verifyBackup`. */
+  onVerified: (answers: [number, string][]) => void;
 }) {
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [wrong, setWrong] = useState<number[]>([]);
@@ -205,8 +231,9 @@ function Verify({
     const mismatched = positions.filter((i) => normalized(i) !== words[i]);
     setWrong(mismatched);
     if (mismatched.length === 0) {
+      const checked = positions.map((i): [number, string] => [i + 1, normalized(i)]);
       setAnswers({});
-      onVerified();
+      onVerified(checked);
     }
   }
 
@@ -247,11 +274,11 @@ function Verify({
         </p>
       )}
       <div className="actions">
-        <button type="button" className="btn btn--ghost" onClick={onShowAgain}>
+        <button type="button" className="btn btn--ghost" onClick={onShowAgain} disabled={checking}>
           Show the words again
         </button>
-        <button type="submit" className="btn btn--primary">
-          Check and finish
+        <button type="submit" className="btn btn--primary" disabled={checking}>
+          {checking ? "Checking…" : "Check and finish"}
         </button>
       </div>
     </form>

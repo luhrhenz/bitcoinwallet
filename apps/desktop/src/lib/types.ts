@@ -77,13 +77,22 @@ export interface AppInfo {
    * without, a successful sync (the CLI's `as_of`).
    */
   synced_height: number | null;
+  /**
+   * Whether the user has proved their paper copy of the recovery phrase is right
+   * (`WalletService::read_backup_verified`), or null when there is no wallet. False after
+   * `createWallet` until `verifyBackup` passes; a restored wallet starts verified.
+   */
+  backup_verified: boolean | null;
 }
 
 export interface Settings {
   network: NetworkName;
   rpc_url: string | null;
   rpc_cookie: string | null;
+  /** 1 to 60. The Rust side also locks on its own, a minute after the UI would. */
   auto_lock_minutes: number;
+  /** The user typed MAINNET in Settings (the runtime half of the mainnet gate, PLAN §4.1). */
+  mainnet_opt_in: boolean;
 }
 
 export interface PreparedSend {

@@ -49,18 +49,26 @@ describe("auto-lock", () => {
     await waitForDashboard();
     expect(banner().getByRole("button", { name: /Unlocked/ })).toBeInTheDocument();
     const lock = vi.spyOn(mock, "lock");
+    const keepAlive = vi.spyOn(mock, "keepAlive");
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
     fireEvent.keyDown(window, { key: "Shift" }); // the user is still here
+    // ...and Rust's own auto-lock (the backstop) hears it too, at most every 30 s.
+    expect(keepAlive).toHaveBeenCalledTimes(1);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(90_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    fireEvent.keyDown(window, { key: "Shift" });
+    expect(keepAlive).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(88_000);
     });
     expect(lock).not.toHaveBeenCalled();
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.advanceTimersByTimeAsync(33_000);
     });
     expect(lock).toHaveBeenCalledTimes(1);
     expect(await screen.findByText(/Locked after 2 minutes without activity/)).toBeInTheDocument();

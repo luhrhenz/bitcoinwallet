@@ -6,7 +6,18 @@ const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([di
  * A modal dialog: focus moves in, Tab stays in, Escape closes, and focus returns to where it
  * was. The rest of the app is made `inert` by the caller while it is open.
  */
-export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+export function Modal({
+  title,
+  onClose,
+  wide = false,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  /** Room for a 4-column recovery phrase grid. */
+  wide?: boolean;
+  children: ReactNode;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const titleId = useId();
   const close = useRef(onClose);
@@ -47,7 +58,7 @@ export function Modal({ title, onClose, children }: { title: string; onClose: ()
 
   return (
     <div className="modal-backdrop">
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={ref}>
+      <div className={wide ? "modal modal--wide" : "modal"} role="dialog" aria-modal="true" aria-labelledby={titleId} ref={ref}>
         <h2 className="modal__title" id={titleId}>
           {title}
         </h2>

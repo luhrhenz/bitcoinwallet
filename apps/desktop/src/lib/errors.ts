@@ -107,7 +107,35 @@ const DESCRIPTIONS: Record<string, Describe> = {
   }),
   io: (message) => ({ title: "A wallet file couldn't be read or written.", detail: message }),
   locked: () => ({ title: "The wallet is locked. Enter your password to continue." }),
+  backup_mismatch: (message) => {
+    const positions = mismatchPositions(message);
+    return {
+      title: "That doesn't match your recovery phrase.",
+      detail:
+        positions.length > 0
+          ? `Check ${positions.length === 1 ? "word" : "words"} ${listPositions(positions)} against your paper copy.`
+          : null,
+    };
+  },
+  internal: (message) => ({
+    title: "Something went wrong inside btcw. Try again; if it keeps happening, restart the app.",
+    detail: message,
+  }),
 };
+
+/**
+ * The word positions in a `backup_mismatch` message ("word 7 does not match…", "words 3 and 7
+ * do not match…"). The core names positions only, never words.
+ */
+export function mismatchPositions(message: string): number[] {
+  return Array.from(message.matchAll(/\d+/g), (m) => Number(m[0])).filter((n) => Number.isSafeInteger(n) && n > 0);
+}
+
+/** `[7]` → "#7", `[3, 7]` → "#3 and #7", `[2, 3, 7]` → "#2, #3 and #7". */
+export function listPositions(positions: number[]): string {
+  const named = positions.map((p) => `#${p}`);
+  return named.length <= 1 ? (named[0] ?? "") : `${named.slice(0, -1).join(", ")} and ${named.at(-1)}`;
+}
 
 export function describeError(error: unknown, ctx: ErrorContext = {}): FriendlyError {
   const { code, message } = toApiError(error);

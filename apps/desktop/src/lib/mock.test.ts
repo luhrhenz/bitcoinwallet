@@ -60,6 +60,7 @@ describe("mock wallet", () => {
       wallet_exists: false,
       unlocked: false,
       synced_height: null,
+      backup_verified: null,
     });
     expect(await rejection(api.balance())).toMatchObject({ code: "wallet_not_found" });
   });
@@ -173,7 +174,7 @@ describe("mock wallet", () => {
     expect(await rejection(api.confirmSend(id))).toMatchObject({ code: "tx_build" });
   });
 
-  it("drops dust change into the fee and releases cancelled sends", async () => {
+  it("drops dust change into the fee; a new preview replaces the last one", async () => {
     const api = createMockApi({ latencyMs: 0 });
     await api.createWallet(12, PASSWORD);
     api.simulateIncoming(10_000);
@@ -184,10 +185,13 @@ describe("mock wallet", () => {
     expect(preview.change_sat).toBeNull();
     expect(preview.vsize).toBe(110);
     expect(preview.fee_sat).toBe(300);
-    // The coin is reserved while the preview is open, and free again after cancel.
-    expect(await rejection(api.prepareSend(to, 1_000, 1))).toMatchObject({ code: "insufficient_funds" });
-    await api.cancelSend(id);
-    expect((await api.prepareSend(to, 1_000, 1)).preview.change_sat).toBe(10_000 - 1_000 - 141);
+    // One prepared payment at a time (like the Rust side): a new preview replaces the open one,
+    // whose coin is free again, and the old id is dead.
+    const second = await api.prepareSend(to, 1_000, 1);
+    expect(second.preview.change_sat).toBe(10_000 - 1_000 - 141);
+    expect(await rejection(api.confirmSend(id))).toMatchObject({ code: "tx_build" });
+    await api.cancelSend(second.id);
+    expect(await rejection(api.confirmSend(second.id))).toMatchObject({ code: "tx_build" });
   });
 
   it("fails node-backed commands with rpc when the node is down", async () => {
@@ -197,6 +201,70 @@ describe("mock wallet", () => {
     expect(await rejection(api.sync())).toMatchObject({ code: "rpc" });
     // Watch-only views still work offline.
     expect((await api.balance()).total_sat).toBe(0);
+  });
+
+  it("tracks the backup like the core: created unverified, checked with the password", async () => {
+    const api = createMockApi({ latencyMs: 0 });
+    const { mnemonic } = await api.createWallet(12, PASSWORD);
+    expect((await api.appInfo()).backup_verified).toBe(false);
+
+    expect(await rejection(api.backupChallenge("nope nope"))).toMatchObject({ code: "wrong_password" });
+    const positions = await api.backupChallenge(PASSWORD);
+    expect(positions).toHaveLength(3);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+    expect(positions.every((p) => p >= 1 && p <= 12)).toBe(true);
+    expect(new Set(positions).size).toBe(3);
+
+    const answers = positions.map((p): [number, string] => [p, mnemonic[p - 1] ?? ""]);
+    expect(await rejection(api.verifyBackup("nope nope", answers))).toMatchObject({ code: "wrong_password" });
+    expect(await rejection(api.verifyBackup(PASSWORD, answers.slice(0, 2)))).toMatchObject({ code: "config" });
+    expect(await rejection(api.verifyBackup(PASSWORD, [[13, "x"], ...answers]))).toMatchObject({ code: "config" });
+    const twoWrong = answers.map(([p, w], i): [number, string] => [p, i === 0 ? w : "zzz"]);
+    expect(await rejection(api.verifyBackup(PASSWORD, twoWrong))).toEqual({
+      code: "backup_mismatch",
+      message: `words ${positions[1]} and ${positions[2]} do not match your recovery phrase`,
+    });
+    expect((await api.appInfo()).backup_verified).toBe(false);
+    await api.verifyBackup(PASSWORD, answers.map(([p, w]) => [p, ` ${w.toUpperCase()} `]));
+    expect((await api.appInfo()).backup_verified).toBe(true);
+
+    expect(await rejection(api.revealPhrase("nope nope"))).toMatchObject({ code: "wrong_password" });
+    expect((await api.revealPhrase(PASSWORD)).mnemonic).toEqual(mnemonic);
+  });
+
+  it("starts a restored wallet verified", async () => {
+    const api = createMockApi({ latencyMs: 0 });
+    await api.restoreWallet(ABANDON, PASSWORD, null);
+    expect((await api.appInfo()).backup_verified).toBe(true);
+  });
+
+  it("uses up a prepared payment on any confirm, and drops it on lock", async () => {
+    const api = createMockApi({ latencyMs: 0 });
+    await api.createWallet(12, PASSWORD);
+    api.simulateIncoming(1_000_000);
+    api.mineBlocks(1);
+    await api.sync();
+    const to = encodeSegwit("tb", 0, new Uint8Array(20).fill(7));
+
+    const first = await api.prepareSend(to, 10_000, 2);
+    api.setNodeOnline(false);
+    expect(await rejection(api.confirmSend(first.id))).toMatchObject({ code: "rpc" });
+    api.setNodeOnline(true);
+    expect(await rejection(api.confirmSend(first.id))).toMatchObject({ code: "tx_build" });
+
+    const second = await api.prepareSend(to, 10_000, 2);
+    await api.lock();
+    await api.unlock(PASSWORD);
+    expect(await rejection(api.confirmSend(second.id))).toMatchObject({ code: "tx_build" });
+
+    // tx_status answers from the last sync when the node is down.
+    const third = await api.prepareSend(to, 10_000, 2);
+    const { txid } = await api.confirmSend(third.id);
+    api.setNodeOnline(false);
+    api.mineBlocks(1);
+    expect(await api.txStatus(txid)).toMatchObject({ state: "unconfirmed" });
+    api.setNodeOnline(true);
+    expect(await api.txStatus(txid)).toMatchObject({ state: "confirmed", confirmations: 1 });
   });
 
   it("keeps a separate wallet per network", async () => {

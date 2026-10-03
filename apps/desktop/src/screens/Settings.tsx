@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useId, useState, type FormEvent } from "react";
 import { NETWORKS } from "../lib/network";
 import type { AppInfo, NetworkName, Settings } from "../lib/types";
 import { useWallet } from "../state/wallet";
@@ -7,6 +7,8 @@ import { Field, NO_ASSIST } from "../components/Field";
 import { ScreenHeader } from "../components/Frame";
 import { Icon } from "../components/Icon";
 import { NetworkBadge } from "../components/Network";
+import { RevealPhrase } from "../components/RevealPhrase";
+import { VerifyBackupDialog } from "../components/VerifyBackup";
 
 const MIN_AUTO_LOCK = 1;
 const MAX_AUTO_LOCK = 60;
@@ -25,7 +27,7 @@ const draftOf = (s: Settings): Draft => ({
   autoLock: String(s.auto_lock_minutes),
 });
 
-/** Network, node connection and auto-lock. Also reachable before a wallet exists. */
+/** Network, node connection, auto-lock and the recovery phrase. Also reachable before a wallet exists. */
 export function SettingsScreen({
   onboarding = false,
   onDone,
@@ -78,6 +80,8 @@ export function SettingsScreen({
         rpc_url: url === "" ? null : url,
         rpc_cookie: draft.cookie.trim() === "" ? null : draft.cookie.trim(),
         auto_lock_minutes: minutes,
+        // Typing MAINNET above is the opt-in (the second mainnet gate); it stays given.
+        mainnet_opt_in: settings.mainnet_opt_in || (networkChanged && chosen.real),
       });
       setSaving(false);
       setMainnetConfirm("");
@@ -217,6 +221,54 @@ export function SettingsScreen({
           </button>
         </div>
       </form>
+      {!onboarding && info.wallet_exists && <RecoveryPhrasePanel />}
     </div>
+  );
+}
+
+/** The backup state, "Verify backup", and "Show recovery phrase" (password, any time). */
+function RecoveryPhrasePanel() {
+  const { info } = useWallet();
+  const titleId = useId();
+  const [revealing, setRevealing] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+
+  return (
+    <section className="panel stack" aria-labelledby={titleId}>
+      <h2 className="panel__legend" id={titleId}>
+        Recovery phrase
+      </h2>
+      <div className="row">
+        <span className="muted small">
+          {info.backup_verified
+            ? "Backup verified: you've shown that your paper copy is complete and in order."
+            : "Backup not verified yet. Check your paper copy so you know it can restore this wallet."}
+        </span>
+        {!info.backup_verified && (
+          <button type="button" className="btn btn--quiet" onClick={() => setVerifying(true)}>
+            Verify backup
+          </button>
+        )}
+      </div>
+      {revealing ? (
+        <RevealPhrase onClose={() => setRevealing(false)} />
+      ) : (
+        <div className="row">
+          <span className="muted small">See the words again, for example to make a second copy. It needs your password.</span>
+          <button type="button" className="btn btn--quiet" onClick={() => setRevealing(true)}>
+            Show recovery phrase
+          </button>
+        </div>
+      )}
+      {verifying && (
+        <VerifyBackupDialog
+          onClose={() => setVerifying(false)}
+          onShowWords={() => {
+            setVerifying(false);
+            setRevealing(true);
+          }}
+        />
+      )}
+    </section>
   );
 }

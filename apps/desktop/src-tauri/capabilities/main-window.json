@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "The one app window. It may call btcw's own commands and listen for `sync-progress`; nothing else: no window, menu, tray, path or image APIs, and no plugins.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

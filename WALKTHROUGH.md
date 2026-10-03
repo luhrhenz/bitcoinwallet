@@ -1401,7 +1401,251 @@ Wallet password:
 [regtest] Sent 0.00100000 BTC (100,000 sat) to bcrt1q4z…
 ```
 
-## 9. Tauri bridge, Phase 2 / Agent G — _pending_
+## 9. Tauri bridge, Phase 2 / Agent G
+
+**What we built:** the Rust half of the desktop app. `apps/desktop/src-tauri` (crate
+`btcw-desktop`) answers every call the React UI makes through `api.ts` by running the same
+`btcw-core` functions the CLI uses, and keeps every secret on the Rust side while it does. The UI
+also gained the backup features from §8: a reminder until the backup is verified, a "Verify backup"
+dialog, and "Show recovery phrase" in Settings.
+
+```text
+apps/desktop/src-tauri/
+├── tauri.conf.json          window, CSP, icons; no plugins
+├── capabilities/            what the webview may call besides our commands: listen/unlisten only
+└── src/
+    ├── commands.rs          every command as a plain function over AppState (unit-tested)
+    ├── state.rs             AppState: settings, the signing session, per-network wallet gates
+    ├── settings.rs          <datadir>/desktop.json, applied as config::Overrides
+    ├── error.rs             ApiError { code, message }
+    ├── ipc.rs               thin #[tauri::command] wrappers (run on a blocking thread)
+    └── lib.rs, main.rs      the window (navigation locked to the app), logging, startup
+apps/desktop/src/components/ BackupReminder, VerifyBackup, RevealPhrase, Phrase (grid + warning)
+```
+
+### Tauri's model: a webview and Rust, with IPC in between
+A Tauri app is one native process. It opens a window with the operating system's webview
+(WebKitGTK on Linux) and loads the React build into it from inside the binary (`tauri://localhost`;
+nothing is fetched from the network). The page can't touch files, sockets or keys. It can only
+send messages to Rust over Tauri's IPC: `invoke("balance")` serializes the call to JSON, Tauri
+finds the Rust function registered as `balance`, deserializes the arguments (JS `amountSat` →
+Rust `amount_sat`), runs it, and sends the `Result` back as JSON. `Ok` resolves the promise, `Err`
+rejects it. Events go the other way: `sync` calls `app.emit("sync-progress", …)` and `api.ts`
+`listen`s for it.
+
+```rust
+#[tauri::command]
+pub async fn balance(state: State<'_, Arc<AppState>>) -> ApiResult<BalanceView> {
+    blocking("balance", &state, commands::balance).await   // spawn_blocking + log the code
+}
+```
+
+Every wrapper looks like that. The work happens in `commands.rs`, in plain functions that take
+`&AppState` and know nothing about Tauri, so the tests call them directly, without a window.
+They run on Tauri's blocking thread pool, because nearly everything they do blocks: SQLite, Argon2
+(about half a second per password), RPC calls to bitcoind, and a first sync that can take minutes.
+On the UI thread that would freeze the window. Commands that panic come back as
+`{ code: "internal" }`, not as a crashed app.
+
+### Why secrets stay in Rust
+A webview is the most exposed part of a desktop app: it parses HTML, runs JavaScript, and a bug in
+any npm package runs with the page's rights. So the rule from PLAN §4.2 is that Rust holds
+everything that can spend:
+
+| What | Where it lives | Does it cross into JS? |
+|---|---|---|
+| Master private key (`keys::Signer`) | `Session` in `AppState`, while unlocked | never |
+| Recovery phrase | encrypted keystore on disk | only as the reply of `create_wallet` (backup screen) and `reveal_phrase` (the user asked, with the password) |
+| Password | arrives as `secrecy::SecretString`, used once, dropped | it starts in JS (the user types it); never sent back |
+| Unsigned PSBT of a payment | `Session.pending`, behind a random id | never; the UI gets the `SendPreview` and the id |
+| Words typed in a backup check | wiped after the check (`zeroize`) | they start in JS |
+
+The phrase is serialized straight from the core's wipe-on-drop buffer (`PhraseWords` writes a JSON
+array from the `Zeroizing<String>`, no `Vec<String>` copy). JS strings can't be wiped, so the UI's
+answer is to keep them briefly: the create screen drops the words once the check passes, "Show
+recovery phrase" after a minute or when the screen closes. Nothing secret goes into a log, an error
+message or a `Debug` print: errors are the core's messages (written never to contain secrets),
+`Session`, `PhraseWords` and the settings (whose RPC URL may hold `user:pass@`) have redacted
+`Debug`, and the command log has names and error codes only.
+
+### One wallet open per command, one signer per session
+The wallet is **not** kept open while the app runs. Each command opens it watch-only, does its work
+and closes it:
+
+```rust
+fn with_wallet<T>(state: &AppState, cfg: &Config,
+                  f: impl FnOnce(&mut WalletService) -> ApiResult<T>) -> ApiResult<T> {
+    let gate = state.gate(cfg.network);
+    let _turn = lock(&gate);                       // this process's commands take turns
+    let mut wallet = api::open_watch_only(cfg)?;   // takes the wallet's lock file (§4)
+    let result = f(&mut wallet);
+    drop(wallet);                                  // releases it again
+    result
+}
+```
+
+So the wallet's lock file (§4) is held for milliseconds, and `btcw balance` in a terminal works
+while the app is open. If the CLI has the wallet at that moment, the app's command fails with
+`wallet_in_use`, which the UI already explains. The **gate** is needed because the lock is per
+*open file*: the dashboard asks for balance, history and app info at once, and three opens from
+the same process would refuse each other. One gate per network means they wait for each other
+instead (a test fires eight commands at once), and a long sync on testnet4 never blocks regtest.
+`app_info` doesn't wait at all: while a sync holds the wallet it answers from the height the last
+progress event reported.
+
+The **signer** is what stays. `unlock(password)` opens the wallet, calls `api::load_signer` (which
+decrypts the keystore and checks the seed belongs to this wallet), keeps only the `Signer`, and
+closes the wallet. `lock()` drops it, and `Signer`'s `Drop` erases the key. `create_wallet` and
+`restore_wallet` keep their signer too, so a new wallet is unlocked, as the UI expects. A signer is
+tied to its network: switching networks in Settings locks the app.
+
+### Sending: the PSBT waits in Rust
+```text
+prepare_send(to, amountSat, feeRate)               confirm_send(id)
+  locked? → "locked"                                 locked? → "locked"
+  address, dust, fee rate (no node, no lock yet)     take the PSBT for id (gone either way)
+  drop any earlier preview                           unknown, used or > 10 min old → tx_build
+  open wallet → sync → tx::prepare_send              open wallet → node
+  persist (the change address must survive)          sign (holding the session) → tx::sign_psbt
+  id = 16 random bytes (OS RNG), keep {id, PSBT}     broadcast → tx::broadcast_signed
+  → { id, preview }                                  → { txid }
+```
+
+The UI never sees the transaction, so it can't change it between the preview and the signature,
+and an id it made up finds nothing. There is at most **one** prepared payment: a new preview
+replaces the last, a lock drops it, and it expires after 10 minutes, so a forgotten preview can't
+be signed an hour later against a changed wallet. `prepare_send` persists the wallet because the
+wallet is closed in between; without it, the change address BDK revealed for the preview would be
+unknown to the wallet that signs. Signing is `tx::complete_send` split into its two halves: the
+signature is made while holding the session, so `lock` can't wipe the key in the middle of it,
+and the broadcast happens after letting go, so "Lock" never waits for a slow node.
+`cancel_send(id)` drops the PSBT and runs `tx::cancel`. Since BDK keeps "used" marks only in memory,
+a reopened wallet has nothing left to release, but `tx::cancel` still runs, so cancelling stays
+correct if that ever changes.
+
+Fee rates arrive as decimals (`2.5` sat/vB). They are converted to BDK's sat per 1000 weight units
+by rounding *up* (`2.3 × 250` is `575.0000000000001` in floating point, so a tiny epsilon keeps it at
+575), then go through the core's `check_fee_rate` (1 to 25 000 sat/vB) before anything is built.
+
+`tx_status` syncs first when the node answers, so the transaction screen sees new confirmations;
+when it doesn't, it answers from the last sync, like `btcw status`.
+
+### Auto-lock in two layers
+The UI locks after `auto_lock_minutes` without a key press, click or mouse move (§6). Rust has a
+second timer as a backstop, in case the UI's never fires (a bug, a hung or throttled webview):
+every command first checks how long it has been since the last *user* activity, and if that is
+more than `auto_lock_minutes` plus one minute, it drops the signer and any prepared payment before
+doing anything else.
+
+What counts as activity matters. The transaction screen polls `tx_status` every 10 s; if polls
+counted, leaving that screen open would keep the key in memory forever. So reads (`app_info`,
+`balance`, `history`, `utxos`, `list_addresses`, `sync`, `tx_status`, `get_settings`) only *check*
+the deadline, and only actions (unlock, prepare, send, settings, backup, …) push it back. Reading
+the dashboard isn't a command at all, so the UI reports activity with `keep_alive` at most every
+30 s while unlocked. The extra minute on the Rust side means the UI's timer always fires first when
+it works, and says why ("Locked after 5 minutes without activity").
+
+### Locking the window down
+- **CSP** (`tauri.conf.json`): `default-src 'self'`, scripts and styles only from the app's own
+  files (Vite emits no inline script, and React sets styles through the DOM, which CSP allows),
+  images also as `data:` (the favicon), IPC through `ipc:`, and `object-src`, `frame-src`,
+  `base-uri`, `form-action` all `'none'`. No remote origin appears anywhere.
+- **No plugins**: no shell, fs, http, dialog or clipboard APIs exist for the page.
+- **Capabilities**: Tauri 2 allows nothing to the webview unless a capability grants it. Ours
+  (`capabilities/main-window.json`) grants `core:event:allow-listen` and `allow-unlisten` to the
+  `main` window, enough for `sync-progress`. This is narrower than `core:default`, which would also
+  let the page create menus and tray icons, read images from paths and query windows and monitors.
+- **Navigation**: the window is built in `setup()` so it can refuse to navigate anywhere but the
+  app itself (`tauri://localhost`, or the Vite dev server in development builds) and to open new
+  windows. A remote page can never end up in the window that has the IPC bridge.
+- `freezePrototype` is on and `withGlobalTauri` off (no `window.__TAURI__`).
+
+### Settings: `desktop.json` on top of the CLI's config
+The app reads and writes `<datadir>/desktop.json` (mode 0600, written to a temp file, fsynced and
+renamed, so a crash leaves the old file or the new one, never half of one):
+
+```json
+{ "network": "regtest", "rpc_url": null, "rpc_cookie": null, "auto_lock_minutes": 5, "mainnet_opt_in": false }
+```
+
+Each command turns it into `config::Overrides` and calls `Config::load`, so a `null` falls through to
+`BTCW_*`, then `btcw.toml`, then the defaults, exactly as for the CLI (§1). The data directory is
+`BTCW_DATADIR` or the default (`~/.local/share/btcw`), so the app and `btcw` share wallets.
+`set_settings` checks everything before saving: the network must be selectable in this build,
+mainnet also needs `mainnet_opt_in` (the UI sets it after the user types MAINNET), auto-lock
+1–60 minutes, an `http://` URL, and the whole configuration must still resolve. A damaged file
+never stops the app from starting: unusable values are dropped (logged, without the file's
+contents) and the next save replaces it. `~/` in the cookie path is expanded, as the placeholder
+in the Settings screen suggests.
+
+### The backup reminder
+While `AppInfo.backup_verified` is `false`, the dashboard and the send screen show a calm, blue
+reminder ("Check your recovery phrase backup") with two buttons:
+
+- **Verify backup**: password first, then `backup_challenge` returns three positions. It takes the
+  password because only the encrypted keystore knows how long the phrase is (12- and 24-word
+  phrases overlap in length, and restored ones can have 15, 18 or 21 words), and because a wrong
+  password then fails *before* the user types any words, as in `btcw backup verify`. The words are
+  typed into password-style fields with a "Show the words as I type" box. A mismatch names the
+  position ("Word #7 doesn't match your recovery phrase. Check your paper copy…"), never a word.
+  Success marks the wallet verified and the reminder disappears.
+- **Show the words again**: the same component as Settings → **Show recovery phrase**: password,
+  then the words decrypted but still hidden until "Reveal", in the numbered grid with the same
+  warning as at creation. They are dropped after a minute, on "Hide", or when the screen or dialog
+  closes, and can't be selected or copied.
+
+The creation screen no longer says btcw will never show the words again. Its own three-word check
+now also calls `verify_backup` with the same answers, so a new wallet whose owner just passed the
+check isn't reminded to do it again. That needs the password one more time: the create screen keeps
+it in a ref (never rendered) for exactly as long as it already holds the phrase, and drops both
+together. If recording fails (say the CLI has the wallet open), the user is told and the reminder
+stays.
+
+### Errors across the bridge
+Every failure reaches JS as `{ code, message }`: `WalletError::code()` and its `Display` text, or one
+of the bridge's own codes, `locked` (sending without the signer) and `internal` (a panic).
+`errors.ts` gained `backup_mismatch` and `internal`. Because a prepared payment is gone after any
+failed `confirm_send`, the send screen now goes back to the form, with what was typed still there.
+
+### Testing
+- **Rust, offline** (21 tests in `btcw-desktop`; `commands_tests.rs` uses a temp datadir and node settings pointing nowhere): create →
+  `app_info` → lock → wrong password → unlock; the CLI can open the wallet while the app is unlocked,
+  and `app_info` still answers while it does; eight concurrent commands all succeed; restore is
+  verified; backup challenge, mismatch (positions only), wrong password, success, reveal; settings
+  validation, the 0600 file, `desktop.json` beating `BTCW_NETWORK`, switching networks locks and
+  drops the payment; `locked` on prepare and confirm, input refused before the node, unknown ids,
+  "removed either way", expiry after 10 minutes; the auto-lock backstop (polls don't count,
+  `keep_alive` does); fee-rate conversion, the progress throttle, ids; settings files and the
+  navigation filter.
+- **Rust, regtest** (`send_flow_against_a_regtest_node`): create (birthday from the node) → fund →
+  sync with progress events → prepare → cancel → prepare twice (the first id dies) → confirm (in the
+  node's mempool, the id can't be reused) → `tx_status` unconfirmed → mine → confirmed, balance and
+  history agree. Skipped only when no bitcoind is available; it fails if `BITCOIND_EXE` is set but
+  broken.
+- **UI** (Vitest, 68 tests in all, 12 new): the reminder on the dashboard and send screens and not for a restored wallet;
+  verify with a wrong password, a mismatch and success; reveal with a wrong password, hidden until
+  "Reveal", not copyable, gone after leaving the screen and after a minute; creation records the
+  check (or says why not); a failed send returns to the form; `keep_alive` is throttled; the mock's
+  new rules.
+
+### Try it
+```bash
+cd apps/desktop && npm ci
+npm run dev:mock                                 # the UI with the in-memory backend, in a browser
+npm run tauri dev                                # the real app (Vite + Rust, hot reload)
+npm run tauri build -- --debug --no-bundle       # target/debug/btcw-desktop, assets embedded
+```
+
+The built app against a local regtest node, in a throwaway datadir (from the repo root):
+
+```bash
+scripts/regtest.sh start && eval "$(scripts/regtest.sh env)"
+BTCW_DATADIR=$(mktemp -d) RUST_LOG=btcw_desktop=debug target/debug/btcw-desktop
+scripts/regtest.sh reset
+
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-desktop   # the bridge's tests
+```
+
 ## 10. End-to-end tests, Phase 2 / Agent H — _pending_
 ## 11. Running the demo (regtest and testnet4) — _pending_
 ## 12. Lessons learned — _pending_
