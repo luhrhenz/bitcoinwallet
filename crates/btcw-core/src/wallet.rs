@@ -253,13 +253,10 @@ impl WalletService {
     }
 
     /// Escape hatches for `chain` and `tx`. Not public API.
-    // Only the tests use these until Agent B's `chain::Node::sync` and Agent F's `tx` land.
-    #[allow(dead_code)]
     pub(crate) fn bdk(&self) -> &PersistedWallet<Connection> {
         &self.wallet
     }
 
-    #[allow(dead_code)]
     pub(crate) fn bdk_mut(&mut self) -> &mut PersistedWallet<Connection> {
         &mut self.wallet
     }

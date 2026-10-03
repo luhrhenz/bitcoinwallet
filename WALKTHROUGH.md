@@ -195,7 +195,221 @@ cargo test -p btcw-core --test keys       # BIP39/BIP84 vectors, parsing, PSBT s
 cargo test -p btcw-core --test keystore   # round trip, wrong password, tampering, AAD, 0600, KDF bounds
 ```
 
-## 3. Chain backend, Phase 1 / Agent B — _pending_
+## 3. Chain backend, Phase 1 / Agent B
+
+**What we built:** `chain.rs` is the only module that talks to the outside world. A `Node` connects to
+our own Bitcoin Core (`bitcoind`) over JSON-RPC and does five things: checks it's on the right network,
+reports the tip height, **syncs** a `WalletService` block by block (plus the mempool), broadcasts signed
+transactions, and estimates fees. On regtest it can also mine blocks for demos and tests.
+
+### What Bitcoin Core's RPC gives us
+`bitcoind` keeps a full copy of the chain and validates every block itself, so asking it is as
+trustworthy as it gets: no third-party server learns our addresses. Its RPC is JSON over HTTP on a local
+port (`18443` regtest, `48332` testnet4, …). We use a handful of calls:
+
+| RPC | Used for |
+|---|---|
+| `getblockchaininfo` | which chain the node is on, its height, whether it's still syncing or pruned |
+| `getblockcount` | `tip_height()` |
+| `getblock`, `getblockhash`, `getrawmempool`, `getrawtransaction` | sync (called for us by BDK's `Emitter`) |
+| `sendrawtransaction` | broadcast |
+| `estimatesmartfee` | fee estimates |
+| `generatetoaddress` | `mine()`, regtest only |
+
+`bitcoincore-rpc` 0.19 has typed helpers for all of these, but it predates Core v28 and some of its
+result structs no longer match what Core v31 sends. Where we read the response ourselves, we make a raw
+`client.call::<serde_json::Value>(..)` and pick out the fields we need.
+
+### Connecting: cookie auth, a 120 s timeout, and checking the chain
+Bitcoin Core protects its RPC with a password. The easy and safe way is the **cookie**: every time
+bitcoind starts it writes a fresh random `__cookie__:<password>` line to `<datadir>/<network>/.cookie`,
+readable only by the user running it. Whoever can read that file is trusted, so there's no password to
+configure or leak. We read it ourselves (split on the first `:`), keep it in a `Zeroizing` buffer, and
+never put it in an error. Explicit `--rpc-user`/`--rpc-pass` also work.
+
+The client is built by hand instead of with `Client::new`, for one reason: **timeouts**. Phase 0 found
+that `bitcoincore-rpc`'s HTTP transport gives up after 15 s, while Core v31 mines regtest blocks at about
+200 ms each. A 101-block `generatetoaddress` failed with a baffling "Resource temporarily unavailable
+(os error 11)", which turned out to be the socket read timeout. A large block on a slow disk can take a while too.
+So we build the transport ourselves with 120 s:
+
+```rust
+let builder = simple_http::Builder::new()
+    .timeout(RPC_TIMEOUT)                      // 120 s, not the default 15 s
+    .url(&rpc.url)?
+    .auth(user.as_str(), Some(pass.as_str()));
+let client = Client::from_jsonrpc(jsonrpc::Client::with_transport(builder.build()));
+```
+
+`mine()` still batches (25 blocks ≈ 5 s per call), so no single request gets anywhere near the limit.
+
+Then `connect` asks `getblockchaininfo` which chain the node is on (`"main"`, `"test"`, `"testnet4"`,
+`"signet"`, `"regtest"`) and refuses a mismatch. This is a safety check, not a formality: a wallet
+syncing against the wrong chain would show a history that isn't real, its birthday height would point
+at an unrelated block, and a broadcast would go to a network the user didn't choose. So a testnet4
+wallet on a regtest node gets
+`NetworkMismatch { expected: testnet4, found: "regtest" }` before anything else happens. If the node
+reports `initialblockdownload: true` we log a warning: sync works, but only up to the node's current height.
+
+Connection errors say what to check, with the URL (any `user:pass@` in it is stripped first):
+
+| Problem | Message (after `bitcoin node RPC error: `) |
+|---|---|
+| nothing listening | `getblockchaininfo: cannot connect to bitcoind at http://127.0.0.1:18443 (connection refused); is bitcoind running for regtest? check --rpc-url` |
+| no cookie file | `cannot read the RPC cookie file /home/me/.bitcoin/testnet4/.cookie: No such file or directory (os error 2); is bitcoind running for testnet4? set --rpc-cookie (or --rpc-user and --rpc-pass)` |
+| wrong password | `… rejected the RPC credentials (HTTP 401); check --rpc-user and --rpc-pass, or --rpc-cookie (bitcoind writes a new cookie each time it starts)` |
+| too slow | `… did not answer within 120 s` |
+
+### Sync: walking the chain block by block
+The wallet's job during sync is to find every transaction that pays to, or spends from, one of its
+scripts. BDK's `bdk_bitcoind_rpc::Emitter` feeds it whole blocks from our node, one at a time:
+
+```rust
+let mut emitter = Emitter::new(
+    &self.client,
+    wallet.bdk().latest_checkpoint(),   // where we stopped last time
+    wallet.birthday_height(),           // where a brand-new wallet starts
+    unconfirmed_txs(wallet),            // our mempool txs, so evictions can be reported
+);
+while let Some(event) = emitter.next_block()? {
+    let height = event.block_height();
+    wallet.bdk_mut().apply_block_connected_to(&event.block, height, event.connected_to())?;
+    on_progress(SyncProgress { height, tip_height });
+    if blocks_scanned.is_multiple_of(100) { wallet.persist()?; }   // crash-safe progress
+}
+```
+
+`apply_block_connected_to` does two things: it keeps the transactions in the block that touch our
+scripts (anchored to that block), and it adds the block to the wallet's **local chain**.
+
+**Checkpoints.** The local chain (BDK's `LocalChain`, see the table in §4) is a list of
+`(height, block hash)` checkpoints, and its tip is "how far we've synced". It's persisted, so the next
+sync starts from there. The Emitter begins by walking our checkpoints *backwards* and asking the node
+about each one, until it finds one that's still on the node's best chain: the **agreement point**.
+Normally that's simply our tip, and it continues with the next block.
+
+**The birthday.** When the agreement point is below `start_height` (a new wallet has only the
+genesis checkpoint), the Emitter jumps straight to `start_height` and emits *that* block. So a
+wallet created at height 871 234 downloads block 871 234 onwards and never touches the 871 233 before
+it. After the first sync our checkpoint is above the birthday, so the birthday stops mattering. The
+test proves both sides: a wallet whose birthday is the tip scans exactly **1** block, while a restore
+(birthday 0) of the same seed scans every block from 1 to the tip and ends up with the same balance.
+
+**Persisting every 100 blocks.** BDK only writes on `persist()`. The first sync of a restored testnet4
+wallet can run for a long time, so we save every 100 blocks: if it's interrupted, the next run resumes
+from the last save rather than from the birthday.
+
+### Reorgs, and how `connected_to` handles them
+Sometimes two miners find a block at the same height. The network briefly disagrees, then follows
+whichever branch gets more work on top, and the losing block is **reorged out**. Its transactions go
+back to the mempool. A wallet that remembered "my payment is confirmed in block 102" now has to forget it.
+
+This is what `connected_to` is for. Each emitted block says which earlier block it builds on: the
+previous emitted block, or after a reorg the agreement point. `LocalChain` compares that with its own
+checkpoints. When the new block has the same height as one of ours but a different hash, ours is stale:
+BDK drops it and every checkpoint above it. A transaction is only "confirmed" if its anchor block is in
+the local chain, so a transaction anchored in a dropped block goes back to being unconfirmed, with no
+extra code on our side.
+
+The regtest test proves it, step by step:
+
+```text
+fund 1 000 000 sat → sync: unconfirmed          balance 0 / 1 000 000
+mine 1 (block 102) → sync: confirmed, 1 conf    balance 1 000 000 / 0
+invalidateblock 102          node tip is 101 again; Core puts our tx back in its mempool
+generateblock faucet []      a competing, *empty* block 102'
+sync → 1 block scanned (102', connected to 101)  tx unconfirmed again: balance 0 / 1 000 000
+mine 1 (block 103) → sync: confirmed at 103, 1 conf
+```
+
+One subtlety came out of this test. Right after `invalidateblock`, before 102' exists, the node's chain
+is simply *shorter* than ours. The Emitter only emits blocks that connect, so there's nothing to apply,
+and BDK has no public way to drop checkpoints without a replacing block. So the wallet keeps its
+height-102 tip until the node has *some* block at that height again, and `sync` logs a warning. On a real
+network a reorg always comes with the competing block, so this only shows up with manual `invalidateblock`
+or when you switch to a node that is still catching up.
+
+### The mempool and evictions
+After the last block, `emitter.mempool()` returns every transaction in the node's mempool (unconfirmed,
+waiting to be mined) with the current time as "last seen". `apply_unconfirmed_txs` keeps the ones that
+touch our scripts. That's how an incoming payment appears as *unconfirmed* within seconds of being sent.
+
+A mempool transaction can also disappear without being mined: replaced by a higher-fee version (RBF),
+expired after two weeks, or kicked out when the mempool is full. That's an **eviction**. The Emitter
+can only spot one if it knows what was there before, so we seed it with the wallet's currently
+unconfirmed transactions. Any of those that are neither in a new block nor in the mempool anymore come
+back in `mempool.evicted`, and `apply_evicted_txs` stops counting them in the balance. (The Emitter only
+reports evictions once it has reached the node's tip, because before that it can't tell "evicted" from
+"confirmed in a block we haven't fetched yet".) `SyncReport::mempool_txs` is the number of the wallet's
+transactions still unconfirmed afterwards.
+
+### Pruned nodes
+A node started with `-prune=N` deletes old blocks once it has validated them, keeping only the most
+recent ones. That's fine for a wallet *if* the blocks it still needs are there. If they're not, BDK would
+fail deep inside `getblock` with "Block not available (pruned data)". So `sync` checks first:
+
+```rust
+// getblockchaininfo: "pruned": true, "pruneheight": 4000 (the lowest block still stored)
+if first_needed < prune_height {
+    "node pruned blocks below 4000; the wallet needs blocks from 1 — use a non-pruned node or a later --birthday"
+}
+```
+
+`first_needed` is the block after our checkpoint, or the birthday for a new wallet. A new wallet on a
+pruned testnet4 node works fine, because its birthday is the tip. Restoring an old seed needs either a
+full node or a birthday the user is sure is early enough.
+
+### Fee estimates: three units and a rounding rule
+Fees are paid per unit of transaction *size*, and three units are involved:
+
+| Unit | Who uses it | 1 sat/vB is… |
+|---|---|---|
+| **BTC/kvB** (BTC per 1000 virtual bytes) | Core's `estimatesmartfee` answer | 0.00001 |
+| **sat/vB** | what people and block explorers quote | 1 |
+| **sat/kwu** (sat per 1000 weight units) | BDK's `FeeRate` internally | 250 |
+
+SegWit measures size in *weight*: witness bytes (signatures) count 1 weight unit each, everything else 4.
+A *virtual byte* is 4 weight units. So:
+
+```text
+sat/kwu = BTC/kvB × 100 000 000 (sat per BTC) ÷ 4 (wu per vB)
+```
+
+We round **up**, and never go below 1 sat/vB (250 sat/kwu), the default minimum relay fee. Rounding down
+could undercut the node's estimate, or drop below the relay minimum and get the transaction rejected:
+0.00001001 BTC/kvB is 250.25 sat/kwu, and 250 would be *below* what was asked. Float input
+needs care too: `0.29 × 1e8` is `28999999.999999996` in `f64`, and truncating would lose a satoshi. Core
+prints amounts with exactly 8 decimals, so we `round()` to whole sat/kvB first and only then divide by
+4, rounding up. Unit tests check these cases without a node.
+
+When Core has no estimate (it answers `{"errors": ["Insufficient data or no feerate found"]}`), we fall
+back to `FALLBACK_FEE_RATE` = 2 sat/vB and log a warning. Core estimates from how long past transactions
+took to confirm, so a fresh regtest chain, with no fee-paying history at all, *always* takes this path.
+A fresh testnet4 node can too.
+
+### Broadcast: Core's reason is the message
+`broadcast` is `sendrawtransaction`. Core checks the transaction fully (signatures, inputs exist and
+are unspent, fee policy) and either accepts it into its mempool, returning the txid, or rejects it with
+a reason. We pass that reason through, because it's the only useful part. From the regtest test,
+broadcasting a second payment that spends the same coin:
+
+```text
+broadcasting 1e78…9bdb: insufficient fee, rejecting replacement 1e78…9bdb, not enough additional fees to relay; 0.00 < 0.00000015 (code -26)
+```
+
+That's *replace-by-fee* at work: since Core 28 a conflicting transaction can replace a mempool one, but only
+by paying more. Once the first payment is mined, the same broadcast fails with
+`bad-txns-inputs-missingorspent (code -25)`, because the coin no longer exists.
+
+### Try it
+```bash
+cargo test -p btcw-core --lib chain            # fee conversion, cookie parsing, pruning check (offline)
+                                               # + broadcast/double-spend on regtest
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-core --test chain
+    # connect errors, network mismatch, user/pass auth, mining in batches,
+    # receive → confirm → reorg → re-confirm, birthday vs full rescan, resume after reopen
+```
+
 ## 4. Wallet service, Phase 1 / Agent C
 
 **What we built:** `wallet.rs` wraps a BDK `Wallet` in a `WalletService`. It creates or opens the wallet's
