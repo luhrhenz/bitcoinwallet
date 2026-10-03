@@ -1,9 +1,9 @@
 import type { ReactNode } from "react";
 import { NETWORKS } from "../lib/network";
 import type { NetworkName } from "../lib/types";
-import { NetworkBadge, NetworkTape } from "./Network";
+import { NetworkBadge } from "./Network";
 
-/** The window: network tape on the left, top bar, scrolling content. Every screen sits in one. */
+/** The window: top bar (with the network badge) and scrolling content. Every screen sits in one. */
 export function Frame({
   network,
   nav,
@@ -17,7 +17,6 @@ export function Frame({
 }) {
   return (
     <div className={`frame frame--${network}`}>
-      <NetworkTape network={network} />
       <div className="frame__body">
         <header className="topbar">
           <span className="brand">

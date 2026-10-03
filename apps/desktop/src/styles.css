@@ -193,52 +193,12 @@ select {
   }
 }
 
-/* ---------- frame: network tape + top bar + content ---------- */
+/* ---------- frame: top bar + content ---------- */
 
 .frame {
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   min-height: 100%;
-}
-
-.net-tape {
-  position: sticky;
-  top: 0;
-  height: 100vh;
-  overflow: hidden;
-  display: flex;
-  justify-content: center;
-  background: var(--tape);
-  color: var(--tape-ink);
-  /* Hatching marks a test environment; mainnet is solid. */
-  background-image: repeating-linear-gradient(-45deg, transparent 0 10px, rgb(0 0 0 / 0.09) 10px 20px);
-}
-
-.net-tape__text {
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-  font: 700 10.5px/1 var(--font-mono);
-  letter-spacing: 0.24em;
-  white-space: nowrap;
-  padding: 14px 0;
-}
-
-.net-tape--testnet4 {
-  --tape: var(--net-testnet4);
-  --tape-ink: var(--net-testnet4-ink);
-}
-.net-tape--signet {
-  --tape: var(--net-signet);
-  --tape-ink: var(--net-signet-ink);
-}
-.net-tape--regtest {
-  --tape: var(--net-regtest);
-  --tape-ink: var(--net-regtest-ink);
-}
-.net-tape--bitcoin {
-  --tape: var(--net-bitcoin);
-  --tape-ink: var(--net-bitcoin-ink);
-  background-image: none;
 }
 
 .frame__body {
