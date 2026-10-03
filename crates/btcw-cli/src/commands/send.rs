@@ -3,13 +3,16 @@
 //! 1. Checks that need neither the password nor the node: `--json` needs `--yes`, the address
 //!    (format and network), the amount (dust), `--fee-rate`, `--psbt-out`, the wallet exists,
 //!    and a terminal to confirm on (unless `--yes`).
-//! 2. Password → `api::unlock_wallet`. `send` is the only command that needs the seed.
+//! 2. Open the wallet **watch-only**: building and previewing a payment needs no secrets.
 //! 3. `Node::connect` + sync, so coin selection sees the current coins.
 //! 4. `tx::prepare_send`: fee rate (`--fee-rate`, else the node's 6-block estimate), unsigned
 //!    PSBT, preview. The desktop bridge calls the same function.
 //! 5. The preview on stdout, warnings for unusual fees, the unsigned PSBT if `--psbt-out`.
 //! 6. `Send? [y/N]` on the terminal unless `--yes`. Anything but yes → `tx::cancel`, exit 0.
-//! 7. `tx::sign_psbt`, drop the signer (wiping the master key), `tx::broadcast_signed`
+//! 7. Only now the password → `api::load_signer` (checks the seed belongs to this wallet), so the
+//!    master key is never in memory while the user reads the preview, and a declined payment
+//!    never touches it at all.
+//! 8. `tx::sign_psbt`, drop the signer (wiping the master key), `tx::broadcast_signed`
 //!    (extract → broadcast → record in the wallet).
 //!
 //! From step 4 on, every way out except a successful broadcast releases the change address.
@@ -20,7 +23,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use btcw_core::WalletError;
-use btcw_core::api::{self, Unlocked};
+use btcw_core::api;
 use btcw_core::bitcoin::{Amount, FeeRate, Network, Psbt};
 use btcw_core::chain::Node;
 use btcw_core::config::Config;
@@ -81,10 +84,8 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
         return Err(WalletError::WalletNotFound(cfg.network_dir()).into());
     }
 
-    // 2. Unlock: decrypt the seed, check it matches the wallet database.
-    let password = prompt::password(ui)?;
-    let Unlocked { mut wallet, signer } = api::unlock_wallet(cfg, &password)?;
-    drop(password);
+    // 2. Watch-only: no password until the user has approved the payment.
+    let mut wallet = api::open_watch_only(cfg)?;
 
     // 3. Spend from fresh state: coins that arrived or were spent since the last sync.
     let node = Node::connect(&cfg.rpc, cfg.network)?;
@@ -94,8 +95,7 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
     let (mut psbt, preview) =
         tx::prepare_send(&mut wallet, &node, req.to, req.amount_sat, fee_rate)?;
 
-    // 5–6. Declined or failed: give the change address back. (The signer is dropped, and its
-    // key wiped, when this function returns.)
+    // 5–6. Declined or failed: give the change address back.
     match review(cfg, ui, req, &psbt, &preview, terminal.as_mut()) {
         Ok(true) => {}
         Ok(false) => {
@@ -111,7 +111,18 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
         }
     }
 
-    // 7. Sign, then wipe the master key before anything touches the network.
+    // 7. The password authorises this one payment.
+    let signer = match prompt::password(ui)
+        .and_then(|password| Ok(api::load_signer(cfg, &wallet, &password)?))
+    {
+        Ok(signer) => signer,
+        Err(e) => {
+            release(ui, &mut wallet, &psbt);
+            return Err(e);
+        }
+    };
+
+    // 8. Sign, then wipe the master key before anything touches the network.
     let signed = tx::sign_psbt(&wallet, &signer, &mut psbt);
     drop(signer);
     if let Err(e) = signed {

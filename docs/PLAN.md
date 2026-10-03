@@ -123,6 +123,11 @@ flowchart LR
 - **Rust owns all secrets.** The React side never receives the mnemonic after creation, a private key, or a descriptor
   with an xprv. It sends the password to a Rust command, and Rust unlocks the wallet and keeps it in app state
   (`Mutex<Option<WalletService>>`). "Lock" drops it (zeroize).
+- **Backup reminder (owner's request):** banner on the dashboard and the send screen while
+  `AppInfo.backup_verified` is false; "Verify backup" (password + 3 random words) and "Show
+  recovery phrase" (password, any time) in Settings. Commands: `verify_backup(password, answers)`,
+  `backup_challenge() -> positions`, `reveal_phrase(password) -> words` (the only command besides
+  `create_wallet` that returns the words).
 - Commands (async, run on a blocking thread so the UI stays responsive):
   `create_wallet(words, password) -> MnemonicOnce` · `restore_wallet(phrase, password)` · `unlock(password)` · `lock()` ·
   `new_address()` · `list_addresses()` · `sync()` (emits `sync-progress` events) · `balance()` · `history()` · `utxos()` ·
@@ -315,6 +320,17 @@ fn send(to_str, amount_sat, fee_rate_opt, yes):
     wallet.apply_unconfirmed_txs([(tx, now)])           // balance reflects the spend immediately
     wallet.persist()
     print txid + "run `btcw status <txid> --watch`"
+```
+
+### 5.8b Backup check and showing the phrase (added on the owner's request)
+```
+create          → backup_verified = false (missing row = false)
+restore         → backup_verified = true
+every command   → if !read_backup_verified(cfg): warn "run `btcw backup verify`"   // lock-free read
+backup verify   → password; positions = 3 random (OS RNG); hidden prompts
+                  verify_backup: decrypt, compare (case-insensitive) → mark verified | BackupMismatch(positions)
+backup show     → password → numbered grid, any time; never --json
+send            → watch-only open → sync → build → preview → confirm → *then* password → load_signer
 ```
 
 ### 5.9 Status polling (R10)

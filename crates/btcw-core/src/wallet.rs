@@ -38,6 +38,10 @@ pub const LOOKAHEAD: u32 = 25;
 const CREATE_META_TABLE: &str =
     "CREATE TABLE IF NOT EXISTS btcw_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
 const BIRTHDAY_KEY: &str = "birthday_height";
+/// `"1"` once the user proved they wrote the recovery phrase down (see `api::verify_backup`).
+/// A missing row means *not verified*, so a crash can only cause an extra reminder, never a
+/// missing one.
+const BACKUP_KEY: &str = "backup_verified";
 
 pub struct WalletService {
     wallet: PersistedWallet<Connection>,
@@ -45,6 +49,9 @@ pub struct WalletService {
     network: Network,
     /// Read once at open time: `birthday_height()` is infallible, and the value never changes.
     birthday: u32,
+    /// Cached copy of the `backup_verified` row; [`WalletService::set_backup_verified`] keeps
+    /// both in step.
+    backup_verified: bool,
     /// Declared last so it is dropped last: the lock is released only after the database
     /// connection has been closed.
     _lock: File,
@@ -76,6 +83,8 @@ impl WalletService {
                 db,
                 network: cfg.network,
                 birthday,
+                // No row yet: a new wallet starts unverified (`api` marks restores verified).
+                backup_verified: false,
                 _lock: lock,
             }),
             Err(e) => {
@@ -127,11 +136,13 @@ impl WalletService {
         };
 
         let birthday = read_birthday(&db)?;
+        let backup_verified = read_meta(&db, BACKUP_KEY)?.as_deref() == Some("1");
         Ok(Self {
             wallet,
             db,
             network: cfg.network,
             birthday,
+            backup_verified,
             _lock: lock,
         })
     }
@@ -143,6 +154,60 @@ impl WalletService {
     /// Height sync starts from on a fresh wallet (0 = genesis).
     pub fn birthday_height(&self) -> u32 {
         self.birthday
+    }
+
+    /// Whether the user has proved they hold a correct copy of the recovery phrase.
+    pub fn backup_verified(&self) -> bool {
+        self.backup_verified
+    }
+
+    /// Record the backup state; written straight to the database (not staged with BDK's data).
+    pub fn set_backup_verified(&mut self, verified: bool) -> Result<()> {
+        self.db
+            .execute(CREATE_META_TABLE, [])
+            .and_then(|_| {
+                self.db.execute(
+                    "INSERT OR REPLACE INTO btcw_meta (key, value) VALUES (?1, ?2)",
+                    (BACKUP_KEY, if verified { "1" } else { "0" }),
+                )
+            })
+            .map_err(|e| persist_err("storing the backup state", e))?;
+        self.backup_verified = verified;
+        Ok(())
+    }
+
+    /// The backup flag without opening the wallet: no lock, no BDK load, read-only SQLite.
+    /// For reminders shown next to other commands (and while another process has the wallet
+    /// open). `None` if there is no wallet for this network.
+    pub fn read_backup_verified(cfg: &Config) -> Result<Option<bool>> {
+        let db_path = cfg.wallet_db_path();
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let db = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| persist_err(format!("opening {}", db_path.display()), e))?;
+        let has_table: bool = db
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'btcw_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| persist_err("reading the backup state", e))?;
+        if !has_table {
+            return Ok(Some(false));
+        }
+        let value: Option<String> = db
+            .query_row(
+                "SELECT value FROM btcw_meta WHERE key = ?1",
+                [BACKUP_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| persist_err("reading the backup state", e))?;
+        Ok(Some(value.as_deref() == Some("1")))
     }
 
     /// Height of the wallet's latest checkpoint (0 before the first sync).
@@ -252,6 +317,21 @@ impl WalletService {
             .map_err(|e| persist_err("saving wallet changes", e))
     }
 
+    /// True if `descriptors` are this wallet's (both keychains), e.g. to check that a decrypted
+    /// seed belongs to the wallet before signing with it.
+    pub fn matches(&self, descriptors: &Descriptors) -> bool {
+        // Both sides are miniscript's `Display` of the same public descriptor, checksum included.
+        self.wallet
+            .public_descriptor(KeychainKind::External)
+            .to_string()
+            == descriptors.external()
+            && self
+                .wallet
+                .public_descriptor(KeychainKind::Internal)
+                .to_string()
+                == descriptors.internal()
+    }
+
     /// Escape hatches for `chain` and `tx`. Not public API.
     pub(crate) fn bdk(&self) -> &PersistedWallet<Connection> {
         &self.wallet
@@ -338,20 +418,7 @@ fn write_birthday(db: &Connection, birthday: u32) -> Result<()> {
 
 /// A missing table or row means "no birthday recorded" and reads as 0 (genesis).
 fn read_birthday(db: &Connection) -> Result<u32> {
-    // Create-if-missing instead of querying `sqlite_master`: databases from a crashed `create`
-    // (see `create_db`) may lack the table, and an empty table answers the query the same way.
-    let value: Option<String> = db
-        .execute(CREATE_META_TABLE, [])
-        .and_then(|_| {
-            db.query_row(
-                "SELECT value FROM btcw_meta WHERE key = ?1",
-                [BIRTHDAY_KEY],
-                |row| row.get(0),
-            )
-            .optional()
-        })
-        .map_err(|e| persist_err("reading the wallet birthday", e))?;
-    match value {
+    match read_meta(db, BIRTHDAY_KEY)? {
         None => Ok(0),
         Some(v) => v.parse().map_err(|_| {
             WalletError::Persist(format!(
@@ -359,6 +426,20 @@ fn read_birthday(db: &Connection) -> Result<u32> {
             ))
         }),
     }
+}
+
+/// One `btcw_meta` value (`None` if the row is missing).
+fn read_meta(db: &Connection, key: &str) -> Result<Option<String>> {
+    // Create-if-missing instead of querying `sqlite_master`: databases from a crashed `create`
+    // (see `create_db`) may lack the table, and an empty table answers the query the same way.
+    db.execute(CREATE_META_TABLE, [])
+        .and_then(|_| {
+            db.query_row("SELECT value FROM btcw_meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+        })
+        .map_err(|e| persist_err(format!("reading `{key}` from the wallet database"), e))
 }
 
 /// Best effort: the original error matters more than a failed cleanup, so this only logs.

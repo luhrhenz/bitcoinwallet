@@ -20,6 +20,9 @@ pub enum WalletError {
     #[error("password must be at least {0} characters")]
     WeakPassword(usize),
 
+    #[error("{}", backup_mismatch_message(.0))]
+    BackupMismatch(Vec<usize>),
+
     #[error("a wallet already exists in {}", .0.display())]
     WalletExists(PathBuf),
 
@@ -76,6 +79,7 @@ impl WalletError {
             Self::InvalidMnemonic(_) => "invalid_mnemonic",
             Self::WrongPassword => "wrong_password",
             Self::WeakPassword(_) => "weak_password",
+            Self::BackupMismatch(_) => "backup_mismatch",
             Self::WalletExists(_) => "wallet_exists",
             Self::WalletNotFound(_) => "wallet_not_found",
             Self::WalletInUse => "wallet_in_use",
@@ -93,5 +97,18 @@ impl WalletError {
             Self::Config(_) => "config",
             Self::Io(_) => "io",
         }
+    }
+}
+
+/// "word 3 does not match …" / "words 3 and 7 do not match …": positions only, never words.
+fn backup_mismatch_message(positions: &[usize]) -> String {
+    let list: Vec<String> = positions.iter().map(ToString::to_string).collect();
+    match list.as_slice() {
+        [one] => format!("word {one} does not match your recovery phrase"),
+        [init @ .., last] => format!(
+            "words {} and {last} do not match your recovery phrase",
+            init.join(", ")
+        ),
+        [] => "the backup check needs at least one word".into(),
     }
 }

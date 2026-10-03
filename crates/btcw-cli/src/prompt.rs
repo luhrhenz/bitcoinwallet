@@ -150,6 +150,14 @@ pub fn recovery_phrase() -> Result<Zeroizing<String>> {
     Ok(line)
 }
 
+/// One word of the recovery phrase for the backup check, typed hidden (the words on screen
+/// would be as good as the phrase itself to anyone looking over the user's shoulder).
+pub fn hidden_word(prompt: &str) -> Result<Zeroizing<String>> {
+    rpassword::prompt_password(prompt)
+        .map(Zeroizing::new)
+        .map_err(|e| anyhow!("cannot read from the terminal: {e}"))
+}
+
 /// One hidden prompt on the terminal.
 fn read_password(prompt: &str) -> Result<SecretString> {
     let typed = Zeroizing::new(rpassword::prompt_password(prompt).map_err(|e| {

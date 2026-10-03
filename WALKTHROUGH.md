@@ -675,7 +675,7 @@ Recovery phrase (12 words). Write them down on paper, in this order:
      9. poverty    10. misery     11. struggle   12. snap
 
 WARNING: Anyone with these words can take your coins. Keep them offline and private;
-         never type them into a website. btcw will never show them again.
+         never type them into a website or keep a photo of them.
          They are the only backup: lose them and this computer, and the coins are gone.
 ```
 
@@ -1334,7 +1334,65 @@ BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-core --test tx  # regtest 
 BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-cli --test cli  # the CLI, end to end
 ```
 
-## 8. Tauri bridge, Phase 2 / Agent G — _pending_
-## 9. End-to-end tests, Phase 2 / Agent H — _pending_
-## 10. Running the demo (regtest and testnet4) — _pending_
-## 11. Lessons learned — _pending_
+## 8. Backup check, showing the phrase, password after the preview (lead)
+
+**Why:** the 12 words on paper are the wallet's only real backup. A wallet whose owner never wrote
+them down correctly works perfectly right up until the laptop dies, and then the coins are gone.
+So btcw keeps asking until the user has *proved* their copy is right, and lets them see the words
+again (with the password) if they need to redo it.
+
+### The flag
+`btcw_meta` (the wallet's own SQLite table, §4) gets a `backup_verified` row:
+
+| Event | Flag |
+|---|---|
+| `create` | unverified (no row yet; a missing row *means* unverified, so a crash can only cause an extra reminder) |
+| `restore` | verified (the user just typed the whole phrase in) |
+| `backup verify` succeeds | verified |
+
+`WalletService::read_backup_verified(cfg)` reads it **without the wallet lock** (read-only SQLite),
+so the reminder works even while the desktop app has the wallet open.
+
+### Verifying
+```rust
+let positions = api::backup_challenge(word_count)?;          // e.g. [2, 6, 7], random, ascending
+let answers: Vec<(usize, String)> = /* hidden prompt per position */;
+api::verify_backup(cfg, &mut wallet, &password, &answers)?;  // compares against the decrypted phrase
+```
+- Positions come from the OS RNG with rejection sampling (no modulo bias).
+- The words are typed **hidden**: on screen they'd be as good as the phrase to anyone watching.
+- A mismatch is `backup_mismatch` with **positions only** ("word 7 does not match your recovery
+  phrase"), never the words.
+- The password is needed because the only copy of the phrase on the computer is encrypted (§2).
+- Scripts can pipe the whole phrase: `echo "<words>" | btcw backup verify` checks every word.
+
+### Showing the phrase again
+`btcw backup show` (and the desktop "Show recovery phrase") decrypt with the password and print
+the numbered grid, **at any time**, the owner's choice, like Electrum or Sparrow. It is never
+available as `--json`: the phrase must not end up in machine-readable output, logs or pipes.
+
+### The reminder
+After every other command, while unverified:
+```text
+warning: your recovery phrase backup is not verified yet: run `btcw backup verify` (`btcw backup show` displays the words again)
+```
+It goes to stderr, so `--json` output stays one clean JSON value.
+
+### `send` asks for the password last
+`send` now opens the wallet **watch-only**, syncs, builds the PSBT, shows the preview, asks
+`Send? [y/N]`, and only then asks for the password (`api::load_signer`, which also checks the
+decrypted seed belongs to this wallet). So the master key is never in memory while the user reads
+the preview, and a declined payment never decrypts anything:
+```text
+[regtest] Payment preview
+  To        bcrt 1q4z wueh …
+  …
+Send? [y/N] y
+Wallet password:
+[regtest] Sent 0.00100000 BTC (100,000 sat) to bcrt1q4z…
+```
+
+## 9. Tauri bridge, Phase 2 / Agent G — _pending_
+## 10. End-to-end tests, Phase 2 / Agent H — _pending_
+## 11. Running the demo (regtest and testnet4) — _pending_
+## 12. Lessons learned — _pending_

@@ -521,7 +521,7 @@ fn offline_wallet_lifecycle() -> TestResult {
         err.contains("Anyone with these words can take your coins"),
         "{err}"
     );
-    assert!(err.contains("btcw will never show them again"), "{err}");
+    assert!(err.contains("btcw backup show"), "{err}");
     assert!(err.contains("scan from the genesis block"), "{err}");
     assert!(!err.contains(PASSWORD), "{err}");
     // The displayed words *are* this wallet's: they derive its first address.
@@ -709,23 +709,22 @@ fn send_and_status_fail_fast_without_a_node() -> TestResult {
     }
     assert_eq!(std::fs::read_to_string(&existing)?, "keep me");
 
-    // Then the password; with the right one, the next stop is the (missing) node.
-    let out = env
-        .command_on(
-            "regtest",
-            &[
-                "--json", "send", "--yes", "--to", &first, "--amount", "10000",
-            ],
-        )
-        .env("BTCW_PASSWORD", "not the password")
-        .output()?;
-    let (code, message) = json_error(&out)?;
-    assert_eq!(code, "wrong_password");
-    assert_eq!(message, "wrong password or corrupted keystore");
-    let (code, message) =
-        env.json_error(&["send", "--yes", "--to", &first, "--amount", "10000"])?;
-    assert_eq!(code, "rpc");
-    assert!(message.contains("connection refused"), "{message}");
+    // The password isn't asked until a payment has been previewed and approved, so without a
+    // node the next stop is the connection, whatever the password.
+    for password in ["not the password", PASSWORD] {
+        let out = env
+            .command_on(
+                "regtest",
+                &[
+                    "--json", "send", "--yes", "--to", &first, "--amount", "10000",
+                ],
+            )
+            .env("BTCW_PASSWORD", password)
+            .output()?;
+        let (code, message) = json_error(&out)?;
+        assert_eq!(code, "rpc", "{message}");
+        assert!(message.contains("connection refused"), "{message}");
+    }
 
     // `status`: a malformed txid, then an unknown one answered from the wallet file.
     let (code, message) = env.json_error(&["status", "not-a-txid"])?;
@@ -1008,6 +1007,20 @@ fn send_and_follow(node: &TestNode, env: &Env) -> TestResult {
         eprintln!("skipping the interactive prompt check: no `script`");
     }
 
+    // Approved but signed with the wrong password: refused after the preview, nothing sent.
+    let out = env
+        .command_on(
+            "regtest",
+            &[
+                "--json", "send", "--yes", "--to", &faucet, "--amount", "100000",
+            ],
+        )
+        .env("BTCW_PASSWORD", "not the password")
+        .output()?;
+    let (code, message) = json_error(&out)?;
+    assert_eq!(code, "wrong_password", "{message}");
+    assert!(mempool(node)?.is_empty());
+
     // Sent, with the unsigned PSBT kept for inspection.
     let psbt_path = env.root.path().join("payment.psbt");
     let out = env.run(&[
@@ -1213,5 +1226,103 @@ fn grid_parser_reads_numbered_words_in_order() -> TestResult {
     assert_eq!(phrase_from_grid(grid)?, "zoo wrong abandon about");
     assert!(phrase_from_grid("     2. zoo\n").is_err());
     assert!(Path::new(env!("CARGO_BIN_EXE_btcw")).exists());
+    Ok(())
+}
+
+#[test]
+fn backup_reminder_verify_and_show() -> TestResult {
+    let env = Env::offline()?;
+    let out = env.run(&["--json", "create"])?;
+    let created = ok_json(&out)?;
+    let phrase = phrase_from_grid(&stderr(&out))?;
+    assert!(
+        stderr(&out).contains("btcw backup verify"),
+        "{}",
+        describe(&out)
+    );
+    let first = created["first_address"]
+        .as_str()
+        .ok_or("no first_address")?
+        .to_owned();
+
+    // Every other command reminds (on stderr; stdout JSON stays clean) until verified.
+    let out = env.run(&["--json", "balance"])?;
+    ok_json(&out)?;
+    assert!(
+        stderr(&out).contains("run `btcw backup verify`"),
+        "{}",
+        describe(&out)
+    );
+    let out = env.run(&["address", "list"])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        stderr(&out).contains("btcw backup verify"),
+        "{}",
+        describe(&out)
+    );
+
+    // `show` needs the password, prints the same words, and is never JSON.
+    let (code, message) = env.json_error(&["backup", "show"])?;
+    assert_eq!(code, "cli");
+    assert!(
+        message.contains("never written as machine-readable data"),
+        "{message}"
+    );
+    let out = env
+        .command_on("regtest", &["backup", "show"])
+        .env("BTCW_PASSWORD", "not the password")
+        .output()?;
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("wrong password"),
+        "{}",
+        describe(&out)
+    );
+    assert!(!stdout(&out).contains(phrase.split(' ').next().unwrap_or("-")));
+    let out = env.run(&["backup", "show"])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(phrase_from_grid(&stdout(&out))?, phrase);
+    assert!(
+        stderr(&out).contains("not a terminal"),
+        "{}",
+        describe(&out)
+    );
+
+    // A wrong phrase on stdin: positions only in the message, and still unverified.
+    let mut wrong: Vec<&str> = phrase.split(' ').collect();
+    wrong.swap(0, 1);
+    let out = env.run_with_stdin(
+        &["--json", "backup", "verify"],
+        &format!("{}\n", wrong.join(" ")),
+    )?;
+    let (code, message) = json_error(&out)?;
+    assert_eq!(code, "backup_mismatch");
+    assert_eq!(message, "words 1 and 2 do not match your recovery phrase");
+    assert!(stderr(&env.run(&["balance"])?).contains("btcw backup verify"));
+
+    // The right phrase verifies; the reminder stops; `show` still works afterwards.
+    let out = env.run_with_stdin(&["--json", "backup", "verify"], &format!("{phrase}\n"))?;
+    assert_eq!(ok_json(&out)?["backup_verified"], true);
+    let out = env.run(&["balance"])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        !stderr(&out).contains("backup verify"),
+        "{}",
+        describe(&out)
+    );
+    let out = env.run(&["backup", "show"])?;
+    assert_eq!(phrase_from_grid(&stdout(&out))?, phrase);
+
+    // A restored wallet starts verified: no reminder at all.
+    let restored = Env::offline()?;
+    let out = restored.run_with_stdin(&["restore"], &format!("{phrase}\n"))?;
+    assert!(out.status.success(), "{}", describe(&out));
+    let out = restored.run(&["address", "new"])?;
+    assert!(stdout(&out).contains(&first), "{}", describe(&out));
+    assert!(
+        !stderr(&out).contains("backup verify"),
+        "{}",
+        describe(&out)
+    );
     Ok(())
 }

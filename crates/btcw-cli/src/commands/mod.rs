@@ -8,10 +8,13 @@
 //! | `address new/list`, `balance`, `history`, `utxos` | watch-only, no password | no |
 //! | `sync` | watch-only, no password | yes |
 //! | `mine` | watch-only (only without `--to`) | yes, regtest |
-//! | `send` | **unlocked** (password; the signer is dropped right after signing) | yes |
+//! | `send` | watch-only, then the password **after** the user confirms (signer dropped right after signing) | yes |
 //! | `status` | watch-only, reopened for every poll | yes (falls back to the last sync) |
+//! | `backup verify` | watch-only + password (decrypts the phrase to compare) | no |
+//! | `backup show` | password only (reads the encrypted phrase, not the wallet) | no |
 
 pub mod address;
+pub mod backup;
 pub mod create;
 pub mod mine;
 pub mod restore;

@@ -169,6 +169,9 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         until: u32,
     },
+    /// Your recovery phrase backup: check your paper copy, or show the words again
+    #[command(subcommand)]
+    Backup(BackupCmd),
     /// Regtest only: mine blocks (to --to, or to a fresh wallet address)
     Mine {
         /// Number of blocks to mine
@@ -178,6 +181,14 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCmd {
+    /// Prove your paper copy is right: type 3 words it asks for (or pipe the whole phrase)
+    Verify,
+    /// Show the recovery phrase again (asks for the wallet password; never as --json)
+    Show,
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,7 +233,12 @@ fn init_logging(ui: &Ui) {
 fn run(cli: Cli, ui: &Ui) -> Result<()> {
     let Cli { global, command } = cli;
     let cfg = Config::load(global.into_overrides())?;
-    match command {
+    // `create` prints its own "verify your copy" step; restored wallets are verified already.
+    let remind = !matches!(
+        command,
+        Command::Create { .. } | Command::Restore { .. } | Command::Backup(_)
+    );
+    let result = match command {
         Command::Create { words } => commands::create::run(&cfg, ui, word_count(&words)?),
         Command::Restore { birthday } => commands::restore::run(&cfg, ui, birthday),
         Command::Address(AddressCmd::New) => commands::address::new(&cfg, ui),
@@ -261,7 +277,13 @@ fn run(cli: Cli, ui: &Ui) -> Result<()> {
             });
             commands::status::run(&cfg, ui, &txid, watch)
         }
+        Command::Backup(BackupCmd::Verify) => commands::backup::verify(&cfg, ui),
+        Command::Backup(BackupCmd::Show) => commands::backup::show(&cfg, ui),
+    };
+    if result.is_ok() && remind {
+        commands::backup::remind(&cfg, ui);
     }
+    result
 }
 
 /// clap already restricts `--words` to "12" or "24".

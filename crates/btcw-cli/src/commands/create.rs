@@ -73,6 +73,7 @@ pub fn run(cfg: &Config, ui: &Ui, words: WordCount) -> Result<()> {
     let shown = if ui.json() {
         // JSON mode: the phrase goes to stderr; stdout gets only the JSON below.
         write_phrase(&mut text, &phrase, ui.err)
+            .and_then(|()| write!(text, "\n\nNext: check your copy with `btcw backup verify`."))
             .map_err(|e| not_shown(&network_dir, &e.to_string()))
             .and_then(|()| {
                 ui.eprintln(&text)
@@ -160,13 +161,16 @@ impl Human<'_> {
                  whole chain)"
             )?,
         }
-        write!(text, "Next: `btcw sync`, then `btcw balance`.")
+        write!(
+            text,
+            "Next: check your copy with `btcw backup verify`, then `btcw sync` and `btcw balance`."
+        )
     }
 }
 
 /// The numbered grid plus the warning. Row-major, 4 words per row: `1. word   2. word ...`.
 /// Written straight into `text` so no other buffer ever holds the words.
-fn write_phrase(text: &mut String, phrase: &str, paint: Painter) -> fmt::Result {
+pub(crate) fn write_phrase(text: &mut String, phrase: &str, paint: Painter) -> fmt::Result {
     let words: Vec<&str> = phrase.split_whitespace().collect();
     writeln!(
         text,
@@ -196,11 +200,12 @@ fn write_phrase(text: &mut String, phrase: &str, paint: Painter) -> fmt::Result 
     )?;
     writeln!(
         text,
-        "         never type them into a website. btcw will never show them again."
+        "         never type them into a website or keep a photo of them."
     )?;
     write!(
         text,
-        "         They are the only backup: lose them and this computer, and the coins are gone."
+        "         They are the only backup: lose them and this computer, and the coins are gone.\n         \
+         (`btcw backup show` displays them again; it needs your password.)"
     )
 }
 
@@ -239,7 +244,7 @@ mod tests {
         );
         assert!(text.contains("Recovery phrase (12 words)"));
         assert!(text.contains("Anyone with these words can take your coins"));
-        assert!(text.contains("btcw will never show them again"));
+        assert!(text.contains("btcw backup show"));
         Ok(())
     }
 }
