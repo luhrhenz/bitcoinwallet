@@ -21,6 +21,7 @@ mod prompt;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use btcw_core::config::{Config, Overrides};
@@ -138,7 +139,7 @@ enum Command {
     History,
     /// Spendable outputs (offline, as of the last sync)
     Utxos,
-    /// Build, sign and broadcast a payment
+    /// Build, sign and broadcast a payment (asks for the wallet password)
     Send {
         /// Destination address (must match --network)
         #[arg(long)]
@@ -149,10 +150,10 @@ enum Command {
         /// Fee rate in sat/vB [default: node estimate for 6 blocks]
         #[arg(long)]
         fee_rate: Option<u64>,
-        /// Skip the confirmation prompt
+        /// Skip the confirmation prompt (required with --json)
         #[arg(long, short)]
         yes: bool,
-        /// Also write the unsigned PSBT (base64) to this file
+        /// Also write the unsigned PSBT (base64) to this new file
         #[arg(long)]
         psbt_out: Option<PathBuf>,
     },
@@ -161,10 +162,10 @@ enum Command {
         txid: String,
         #[arg(long)]
         watch: bool,
-        /// Seconds between polls
-        #[arg(long, default_value_t = 10)]
+        /// With --watch: seconds between polls
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
-        /// Stop watching after this many confirmations
+        /// With --watch: stop once the transaction has this many confirmations
         #[arg(long, default_value_t = 1)]
         until: u32,
     },
@@ -231,8 +232,35 @@ fn run(cli: Cli, ui: &Ui) -> Result<()> {
         Command::History => commands::view::history(&cfg, ui),
         Command::Utxos => commands::view::utxos(&cfg, ui),
         Command::Mine { blocks, to } => commands::mine::run(&cfg, ui, blocks, to.as_deref()),
-        Command::Send { .. } => bail!("`btcw send` is not implemented yet (Phase 2)"),
-        Command::Status { .. } => bail!("`btcw status` is not implemented yet (Phase 2)"),
+        Command::Send {
+            to,
+            amount,
+            fee_rate,
+            yes,
+            psbt_out,
+        } => commands::send::run(
+            &cfg,
+            ui,
+            &commands::send::Request {
+                to: &to,
+                amount_sat: amount,
+                fee_rate_sat_vb: fee_rate,
+                yes,
+                psbt_out: psbt_out.as_deref(),
+            },
+        ),
+        Command::Status {
+            txid,
+            watch,
+            interval,
+            until,
+        } => {
+            let watch = watch.then_some(commands::status::Watch {
+                interval: Duration::from_secs(interval),
+                until,
+            });
+            commands::status::run(&cfg, ui, &txid, watch)
+        }
     }
 }
 

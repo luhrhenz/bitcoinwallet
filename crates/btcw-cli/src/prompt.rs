@@ -7,8 +7,12 @@
 //!
 //! Prompts are written to the TTY, never to stdout, so `--json` output stays clean. Secrets
 //! are copied into `SecretString` / `Zeroizing` buffers straight away and never printed.
+//!
+//! [`Terminal`] asks the one non-secret question, `send`'s "Send? [y/N]". It reads the TTY too,
+//! never stdin, so a piped-in "y" can't approve a payment.
 
-use std::io::{BufRead, IsTerminal, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 use btcw_core::api;
@@ -61,6 +65,64 @@ pub fn new_password(ui: &Ui) -> Result<SecretString> {
         ui.warn(format_args!("{problem}; please try again"));
         attempt += 1;
     }
+}
+
+/// The password of an existing wallet, to unlock it for signing (`send`). Not checked against
+/// the new-password rules: unlocking never second-guesses a password that already works.
+pub fn password(ui: &Ui) -> Result<SecretString> {
+    if let Some(password) = password_from_env(ui)? {
+        return Ok(password);
+    }
+    read_password("Wallet password: ")
+}
+
+/// The controlling terminal, for yes/no questions.
+///
+/// Opened *before* any work starts, so "no terminal to confirm on" is reported before the
+/// password prompt, the sync and the coin selection, not after.
+pub struct Terminal {
+    input: BufReader<File>,
+    output: File,
+}
+
+#[cfg(windows)]
+const TTY_PATHS: (&str, &str) = ("CONIN$", "CONOUT$");
+#[cfg(not(windows))]
+const TTY_PATHS: (&str, &str) = ("/dev/tty", "/dev/tty");
+
+impl Terminal {
+    pub fn open() -> Result<Self> {
+        let (input, output) = TTY_PATHS;
+        let open = || -> std::io::Result<Self> {
+            Ok(Self {
+                input: BufReader::new(File::open(input)?),
+                output: OpenOptions::new().write(true).open(output)?,
+            })
+        };
+        open().map_err(|e| {
+            anyhow!(
+                "cannot open the terminal to confirm the payment ({e}); review the amounts and \
+                 pass --yes to send without a confirmation prompt"
+            )
+        })
+    }
+
+    /// `question [y/N] `: true only for `y` or `yes` (any case). Anything else, including an
+    /// empty line or end of input, is a no.
+    pub fn confirm(&mut self, question: &str) -> Result<bool> {
+        write!(self.output, "{question} [y/N] ")
+            .and_then(|()| self.output.flush())
+            .context("writing to the terminal")?;
+        let mut answer = String::new();
+        self.input
+            .read_line(&mut answer)
+            .context("reading the answer from the terminal")?;
+        Ok(is_yes(&answer))
+    }
+}
+
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// The recovery phrase for `restore`. Hidden prompt on a terminal; otherwise the first line of
@@ -117,4 +179,19 @@ fn password_from_env(ui: &Ui) -> Result<Option<SecretString>> {
         "using the wallet password from {PASSWORD_ENV} (insecure; meant for scripts and tests)"
     ));
     Ok(Some(password))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_explicit_yes_confirms() {
+        for yes in ["y", "Y", "yes", "YES", " yes \n", "y\r\n"] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "\n", "n", "no", "yep", "sure", "y y", "1"] {
+            assert!(!is_yes(no), "{no:?}");
+        }
+    }
 }

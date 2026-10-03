@@ -3,10 +3,10 @@
 use anyhow::Result;
 use btcw_core::WalletError;
 use btcw_core::api;
-use btcw_core::bitcoin::address::NetworkUnchecked;
-use btcw_core::bitcoin::{Address, Network};
+use btcw_core::bitcoin::Network;
 use btcw_core::chain::Node;
 use btcw_core::config::Config;
+use btcw_core::tx::parse_address;
 use serde::Serialize;
 
 use crate::output::{Ui, plural};
@@ -70,86 +70,4 @@ pub fn run(cfg: &Config, ui: &Ui, blocks: u64, to: Option<&str>) -> Result<()> {
         ui.out.badge(cfg.network),
         plural(mined, "block", "blocks"),
     ))
-}
-
-/// Parse an address and require it to belong to `network`.
-///
-/// `tx::parse_address` (Agent F, Phase 2) is the shared version of this; `mine` can switch to
-/// it once it exists.
-fn parse_address(s: &str, network: Network) -> Result<Address, WalletError> {
-    let unchecked: Address<NetworkUnchecked> = s
-        .trim()
-        .parse()
-        .map_err(|e| WalletError::InvalidAddress(format!("`{}`: {e}", s.trim())))?;
-    let found = networks_of(&unchecked);
-    unchecked
-        .require_network(network)
-        .map_err(|_| WalletError::NetworkMismatch {
-            expected: network,
-            found,
-        })
-}
-
-/// Which supported networks an address is valid on, e.g. `"a testnet4/signet address"`.
-/// (A `tb1…` address can't tell testnet4 from signet: they share the prefix.)
-fn networks_of(address: &Address<NetworkUnchecked>) -> String {
-    let names: Vec<&str> = [
-        (Network::Bitcoin, "mainnet"),
-        (Network::Testnet4, "testnet4"),
-        (Network::Signet, "signet"),
-        (Network::Regtest, "regtest"),
-    ]
-    .into_iter()
-    .filter(|(network, _)| address.is_valid_for_network(*network))
-    .map(|(_, name)| name)
-    .collect();
-    if names.is_empty() {
-        "an address for another network".to_owned()
-    } else {
-        format!("a {} address", names.join("/"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn addresses_must_match_the_network() {
-        // BIP84 test phrase (`abandon … about`), m/84'/1'/0'/0/0 on regtest and on testnet4.
-        let regtest = "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk";
-        assert!(parse_address(regtest, Network::Regtest).is_ok());
-        assert!(parse_address(&format!("  {regtest}\n"), Network::Regtest).is_ok());
-
-        match parse_address(
-            "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl",
-            Network::Regtest,
-        ) {
-            Err(e @ WalletError::NetworkMismatch { .. }) => assert_eq!(
-                e.to_string(),
-                "network mismatch: expected regtest, found a testnet4/signet address"
-            ),
-            other => panic!("expected NetworkMismatch, got {other:?}"),
-        }
-        match parse_address(
-            "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
-            Network::Regtest,
-        ) {
-            Err(e @ WalletError::NetworkMismatch { .. }) => assert_eq!(
-                e.to_string(),
-                "network mismatch: expected regtest, found a mainnet address"
-            ),
-            other => panic!("expected NetworkMismatch, got {other:?}"),
-        }
-        match parse_address("not-an-address", Network::Regtest) {
-            Err(e @ WalletError::InvalidAddress(_)) => {
-                assert!(
-                    e.to_string()
-                        .starts_with("invalid address: `not-an-address`"),
-                    "{e}"
-                );
-            }
-            other => panic!("expected InvalidAddress, got {other:?}"),
-        }
-    }
 }

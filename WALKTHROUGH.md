@@ -1038,7 +1038,301 @@ npm test                # 56 tests
 npm run typecheck && npx vite build
 ```
 
-## 7. Sending and status, Phase 2 / Agent F — _pending_
+## 7. Sending and status, Phase 2 / Agent F
+
+**What we built:** the part that moves money. `tx.rs` turns "pay 100 000 sat to this address" into
+a signed transaction on the network: validate the address, let BDK pick coins and build an unsigned
+**PSBT**, summarise it for the user, sign, finalize, extract, broadcast, and record it in the wallet.
+It also answers "where is my transaction?" (unconfirmed, or confirmed with N confirmations). On top
+of it, the CLI gets `btcw send` and `btcw status [--watch]`.
+
+```text
+crates/btcw-core/src/tx.rs      parse_address · build_psbt · preview · cancel · sign_psbt · extract_tx
+                                · record_broadcast · tx_status, plus prepare_send / complete_send
+                                (/ broadcast_signed): one code path for the CLI and the desktop app
+crates/btcw-cli/src/commands/   send.rs, status.rs
+```
+
+### Spending means choosing coins
+As §4 explained, a wallet holds no balance, only **UTXOs**: outputs of earlier transactions that pay
+one of our scripts. A payment's *inputs* point at some of those outputs (`txid:vout`) and spend each
+one **whole**. Picking which ones is **coin selection**. BDK's default first tries *branch and bound*,
+which looks for a set of coins that matches amount + fee exactly (no change needed, which saves a
+little fee and is better for privacy), and otherwise falls back to picking coins at random until
+there's enough. One of the offline tests funds a wallet with coins of 60 000 and 70 000 sat and pays
+100 000: neither coin is enough alone, so the transaction has two inputs.
+
+If the coins aren't enough, BDK reports both sides and they reach the user unchanged:
+`insufficient funds: need <amount + fee> BTC, available <spendable> BTC` (`insufficient_funds` in
+JSON). Immature mining rewards (§4) don't count as available.
+
+### Change goes to a fresh internal address
+Spending a 1 000 000 sat coin to pay 100 000 creates a *second* output for the rest: the **change**.
+It goes to the **internal** keychain (`m/84'/1'/0'/1/i`), addresses that are never shown to anyone,
+and to an index that has never been used. If change went back to the address the coin came from,
+anyone looking at the chain could tell which output was the payment and which one is still ours, and
+link our payments together. BDK takes the lowest revealed-but-unused internal index; the regtest test
+checks the leftover coin really lands there (`keychain: internal` in `btcw utxos`).
+
+### Fees: inputs minus outputs, and sizing a transaction before it's signed
+There is no "fee" field in a transaction. The fee is whatever the inputs hold that the outputs don't
+pay out, and miners keep it. A **fee rate** is that fee divided by the transaction's size, in
+sat per *virtual byte*. SegWit made size a weighted sum (§3): every byte of the witness (signatures,
+public keys) weighs 1 **weight unit**, every other byte 4, and `vsize = ⌈weight ÷ 4⌉`. That discount
+is why native SegWit inputs are cheap.
+
+The catch: the fee has to be decided *before* signing, but the signatures are part of the size. So the
+unsigned transaction is measured and what signing will add is added on top, using the largest
+signatures possible. That's `estimated_signed_weight`:
+
+```text
+unsigned transaction      every byte × 4 WU (no witnesses yet, so no segwit marker either)
++ 2 WU                    segwit marker + flag bytes (witness data: 1 WU each)
++ per input   1 WU        the witness's item count
+            + 107 WU      miniscript's max_weight_to_satisfy() for wpkh:
+                            1 + 72  signature push (DER ≤ 71 bytes with low-S, + 1 sighash byte)
+                            1 + 33  compressed public key push
+```
+
+For one P2WPKH input and two P2WPKH outputs that's 562 WU, **141 vB**, the number the preview shows.
+About half of real signatures are a byte shorter, so the estimate is an upper bound and the fee rate
+actually paid is never below the one shown. The tests check the bound against the signed transaction:
+`real vsize ≤ preview vsize ≤ real vsize + 2 per input`.
+
+BDK's coin selection sizes inputs exactly the same way, and charges per weight unit: at 5 sat/vB
+(1.25 sat/WU) 562 WU cost 702.5, rounded up to 703 sat. The preview divides by whole vbytes, the way
+Core and block explorers do, so it says 703 ÷ 141 = **4.99 sat/vB** rather than 5. That's not a bug in
+the fee, just honest rounding; per weight unit the payment is at least the rate asked for, which the
+tests check too.
+
+Two limits are enforced before anything is built: at least **1 sat/vB** (nodes don't relay less) and
+at most **25 000 sat/vB**, the limit rust-bitcoin's `extract_tx` uses to catch the classic "typed BTC
+into the sat field" mistake, so a bad rate fails before the user is asked to confirm, not after
+signing. Amounts below the **dust** limit (294 sat for P2WPKH, 546 for an old P2PKH address: below
+that, spending the output would cost more than it's worth, so nodes won't relay it) are refused too.
+
+### What the user confirms: a preview that explains every output
+`preview` doesn't just add up numbers. It finds the output that pays exactly `amount` to `to`, and
+requires **every other output** to pay this wallet's change keychain; anything else is an error. The
+summary therefore always covers the whole transaction: `total = amount + fee` is what really leaves
+the wallet, and an output the user didn't ask for can't hide behind it.
+
+```text
+[regtest] Payment preview
+  To        bcrt 1q4z wueh x60r hdg9 tvvh vgf3 mefz du6y gw95 72c6
+  Amount    0.00100000 BTC (100,000 sat)
+  Fee       0.00000703 BTC (703 sat)
+  Fee rate  4.99 sat/vB for an estimated 141 vB
+  Change    0.00899297 BTC (899,297 sat), back to this wallet
+  Total     0.00100703 BTC (100,703 sat), amount + fee
+Send? [y/N]
+```
+
+The recipient is shown **in full, in groups of four**, never shortened, for the same reason as in the
+desktop app (§6): clipboard malware swaps addresses for look-alikes that share the start and the end.
+A fee of 10% of the amount or more, or a rate above 100 sat/vB, gets a warning, and on mainnet so does
+the fact that the coins are real. The question is read from the **terminal** (`/dev/tty`), never from
+stdin, so `yes | btcw send …` can't approve a payment by accident; without a terminal, `send` refuses
+up front and points to `--yes`. `--json` requires `--yes`, because a JSON run can't stop to ask.
+
+`send` also checks everything it can *before* the password prompt: the address and its network, dust,
+the fee rate, whether `--psbt-out` already exists, whether there is a terminal to ask on. A typo never
+costs a password and a sync.
+
+### The PSBT lifecycle (BIP174), and why signing is split in two
+A **PSBT** (partially signed bitcoin transaction) is the unsigned transaction plus everything a signer
+needs: for each input, the output it spends (`witness_utxo`, which is how the fee is known before
+signing) and which key can sign it (`bip32_derivation`: master fingerprint + path, e.g.
+`73c5da0a/84'/1'/0'/0/0`). It moves through four roles:
+
+| Step | Who | What changes |
+|---|---|---|
+| **create** | BDK `build_tx().add_recipient(..).fee_rate(..).finish()` | coin selection, change output, unsigned tx + input metadata |
+| **sign** | rust-bitcoin `Psbt::sign(master_xprv)` via `keys::Signer` | derives each input's key from its `bip32_derivation`, adds `partial_sigs` |
+| **finalize** | BDK `finalize_psbt` | turns signature + public key into the input's final witness, clears the rest |
+| **extract** | rust-bitcoin `Psbt::extract_tx` | the network transaction, refused above 25 000 sat/vB |
+
+Signing and finalizing are done by different libraries on purpose (Phase 0 finding 1). BDK 3.2
+deprecated keeping keys inside the wallet, so the wallet has only public descriptors and the
+`Signer` has only the master key. Finalizing needs to know the *script* (here `wpkh`: the witness is
+`[signature, public key]`), which the descriptors know; it needs no secret. `sign_psbt` insists
+the key signed **every** input (`this wallet's key signed 0 of 1 inputs` for a PSBT from another
+seed) and that BDK finalized every input, and `extract_tx` refuses an input without a final witness,
+which would otherwise produce a transaction every node rejects. The CLI drops the `Signer`, wiping
+the master key, the moment signing is done, before anything touches the network.
+
+`--psbt-out FILE` saves the **unsigned** PSBT as base64 (a new file, mode 0600: no keys in it, but
+it lists the wallet's coins and paths), so Core can double-check it:
+
+```text
+$ bitcoin-cli decodepsbt "$(cat payment.psbt)"        (abridged)
+  tx.txid           3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6
+  tx.vin[0].sequence  4294967293 (0xfffffffd)
+  tx.locktime       102
+  fee               0.00000703
+```
+
+Same txid as the broadcast transaction (a SegWit txid doesn't cover the witness, so signing doesn't
+change it), and Core computes the same fee.
+
+### RBF signalling and anti fee-sniping
+Two of BDK's defaults are kept and are visible above. Every input's `nSequence` is **`0xFFFFFFFD`**,
+which signals *replace-by-fee* (BIP125: anything below `0xFFFFFFFE`). A payment stuck at a low fee can
+then be replaced by one paying more; Core 28+ allows replacement regardless, but signalling it is the
+honest thing to tell other wallets. `nLockTime` is the current tip (102): the transaction can't be
+mined in a block *below* the tip, which takes away a miner's incentive to rewrite recent blocks just to
+collect our fee (*fee sniping*).
+
+### Broadcast, then record it straight away
+`Node::broadcast` is `sendrawtransaction` (§3). As soon as the node accepts the transaction,
+`record_broadcast` applies it to the wallet as unconfirmed (`apply_unconfirmed_txs([(tx, now)])`) and
+persists. Without that, the wallet wouldn't know about its own payment until the next sync: the
+balance would still count the spent coin, and a second payment could try to spend it again. With it,
+`btcw balance` right after a send shows the spent coin gone and the change as unconfirmed (BDK counts
+it as *trusted* pending, because we made it).
+
+If recording fails *after* the broadcast (a database error), that is only a warning: the coins are on
+their way, the spend stays staged in memory, and the next sync finds it in the mempool anyway. Reporting
+"send failed" for a payment that was sent would be the worse mistake.
+
+### Cancel: giving the change address back
+Building a transaction reveals the change address and marks it used, in memory, so a second payment
+prepared in the meantime gets a different one. If the user says no, that address was never used on
+chain. BDK 3.2 has no `cancel_tx`, so `cancel` does it by hand: for each output that pays our internal
+keychain, `unmark_used(Internal, index)`, and the next payment gets the same address again. Without it
+every declined preview would leave a never-used change address behind; in the desktop app, which stays
+open and may prepare many payments, they would pile up past the lookahead. `prepare_send`,
+`complete_send` and `broadcast_signed` call `cancel` themselves on every error before the broadcast
+succeeds; the CLI calls it when the answer is no. The tests check the index is reused.
+
+### Status and polling for confirmations
+`tx_status` looks the transaction up in the wallet (`get_tx`) and maps its chain position with the
+same helper `history` uses (§4): unconfirmed with the time it was first seen, or confirmed at height
+*h* with `tip − h + 1` confirmations, counted from the wallet's synced tip. `btcw status TXID` syncs
+first. If bitcoind can't be reached it answers anyway, from the database, with a warning saying it's
+as of the last sync.
+
+`--watch` repeats that every `--interval` seconds (10 by default) until `--until` confirmations (1
+by default). Each check opens the wallet, syncs, reads and **closes** it, so between checks the wallet
+lock is free for the desktop app or another `btcw` command, and Ctrl-C during the wait can't interrupt
+a database write. It prints a line only when something changes. It compares the printed text rather
+than the raw status, because BDK 0.23 reloads `first_seen` from the stored *last*-seen time, so that
+field creeps forward every time the wallet is reopened. A node that's down gives a warning and another
+try; a transaction the wallet doesn't know after a successful sync is `tx_not_found`.
+
+### One path for both frontends
+The desktop app (§8) can't run `send` start to finish: the user looks at the preview in between, and
+the PSBT must stay in Rust while they do. So the core offers the two halves, and the CLI uses them too:
+
+```rust
+// "Review payment": parse `to`, fee rate (given, or the node's 6-block estimate), build, preview.
+pub fn prepare_send(wallet: &mut WalletService, node: &Node, to: &str, amount_sat: u64,
+                    fee_rate: Option<FeeRate>) -> Result<(Psbt, SendPreview)>;
+// "Send": sign_psbt, then broadcast_signed (extract → broadcast → record_broadcast).
+pub fn complete_send(wallet: &mut WalletService, signer: &Signer, node: &Node, psbt: Psbt) -> Result<Txid>;
+pub fn broadcast_signed(wallet: &mut WalletService, node: &Node, psbt: Psbt) -> Result<Txid>;
+// "Cancel"
+pub fn cancel(wallet: &mut WalletService, psbt: &Psbt);
+```
+
+`check_amount` and `check_fee_rate` are the rules `build_psbt` applies, exposed so a form can reject
+bad input before unlocking or syncing.
+
+### Demo session (regtest)
+After the §5 session (one confirmed 1 000 000 sat coin), with a real terminal:
+
+```console
+$ btcw send --to bcrt1q4zwuehx60rhdg9tvvhvgf3mefzdu6ygw9572c6 --amount 100000 --fee-rate 5 --psbt-out payment.psbt
+Wallet password:
+[regtest] Payment preview
+  To        bcrt 1q4z wueh x60r hdg9 tvvh vgf3 mefz du6y gw95 72c6
+  Amount    0.00100000 BTC (100,000 sat)
+  Fee       0.00000703 BTC (703 sat)
+  Fee rate  4.99 sat/vB for an estimated 141 vB
+  Change    0.00899297 BTC (899,297 sat), back to this wallet
+  Total     0.00100703 BTC (100,703 sat), amount + fee
+note: wrote the unsigned PSBT to payment.psbt (inspect it with `bitcoin-cli decodepsbt "$(cat payment.psbt)"`)
+Send? [y/N] y
+[regtest] Sent 0.00100000 BTC (100,000 sat) to bcrt1q4zwuehx60rhdg9tvvhvgf3mefzdu6ygw9572c6
+Txid: 3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6
+It is waiting in the mempool now; follow it with `btcw status 3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6 --watch`.
+$ TXID=3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6
+
+$ btcw balance                                # no sync needed: the spend was recorded
+[regtest] Balance as of block 102 (run `btcw sync` to update)
+  Confirmed   0.00000000 BTC (0 sat)
+  Unconfirmed 0.00899297 BTC (899,297 sat)
+  Total       0.00899297 BTC (899,297 sat)
+
+$ btcw status $TXID
+[regtest] Transaction 3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6
+  Status      unconfirmed, waiting in the mempool
+  First seen  2026-10-03 09:04 UTC
+  As of       block 102
+
+$ btcw status $TXID --watch --until 3 --interval 2     # meanwhile: regtest.sh mine 1, then mine 2
+[regtest] Watching 3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6 until it has 3 confirmations (checking every 2 s; Ctrl-C to stop)
+  block 102      unconfirmed, waiting in the mempool
+  block 103      confirmed in block 103: 1 confirmation
+  block 105      confirmed in block 103: 3 confirmations
+
+$ btcw --json status $TXID
+{
+  "network": "regtest",
+  "txid": "3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6",
+  "synced_height": 105,
+  "status": { "state": "confirmed", "height": 103, "confirmations": 3, "block_time": 1791018295 },
+  "sync_error": null
+}
+```
+
+Answering `n` instead prints `[regtest] Cancelled; nothing was sent.` and exits 0. With bitcoind
+down, `status` still answers, and says so:
+
+```text
+warning: could not sync with bitcoind, so this is the status as of block 107 (the last sync): bitcoin node RPC error: getblockchaininfo: cannot connect to bitcoind at http://127.0.0.1:1 (connection refused); is bitcoind running for regtest? check --rpc-url
+[regtest] Transaction 1aea59a54784135f5becbe2380fd0fc0e47a56b4eae23dd541ab950d66ac5935
+  Status      confirmed, 2 confirmations
+  Block       106, mined 2026-10-03 09:07 UTC
+  As of       block 107 (bitcoind unreachable; may be out of date)
+```
+
+| Command | JSON (besides `network`) |
+|---|---|
+| `send --yes` | `txid`, `preview` (the `SendPreview`: `to`, `amount_sat`, `fee_sat`, `fee_rate_sat_vb`, `vsize`, `change_sat`, `total_sat`) |
+| `status` | `txid`, `synced_height`, `status` (the `TxStatus`), `sync_error` (`null`, or why it couldn't sync) |
+
+### Testing
+- **Offline unit tests** (`src/tx.rs`, a wallet funded with made-up transactions): address parsing
+  and network wording; a two-input payment through build → preview (`total = amount + fee`, fee =
+  inputs − outputs, change on the internal keychain, 209 vB) → sign → extract (estimate within
+  +0/+2 vB per input of the signed size, rate per weight unit ≥ the one asked for) → record (balance
+  pending at once); RBF sequence and lock time; `cancel` reuses the change index; dust (P2WPKH and
+  P2PKH), fee rates 0, 0.996 and above 25 000 sat/vB, insufficient funds with BDK's numbers, an address
+  checked for another network; another seed's signer (`signed 0 of 1 inputs`); extracting an unsigned
+  PSBT; a preview with the wrong amount, the wrong recipient or an extra output; a malformed PSBT is
+  an error, not a panic inside rust-bitcoin.
+- **Regtest** (`tests/tx.rs`, two node tests): the step-by-step path through broadcast, the node's
+  mempool, record, reopen, mine → 1 confirmation → 3; and `prepare_send` / `complete_send` with the
+  node's fee estimate, a stranger's signer (nothing broadcast, change address released), then a
+  real send to confirmation.
+- **CLI** (`tests/cli.rs`): offline, every early refusal comes before the password (each run uses a
+  wrong one to prove it), then `wrong_password`, `rpc`, malformed and unknown txids, and no terminal
+  without `--yes`. With a node: `insufficient_funds`; a payment declined at a real prompt (a
+  pseudo-terminal via `script`); `send --yes --json --psbt-out` (PSBT parsed back, mode 0600, same
+  txid, `decodepsbt` agrees on the fee); balance before any sync; `status --json`; `--watch --until 2`
+  while two blocks are mined; a human-mode send with both fee warnings.
+- One flaky-test trap found on the way: `TestNode::available()` runs `bitcoind -version`, which in
+  Core v31 rewrites `~/.bitcoin/settings.json`. Two at once can fail on the rename, and the test then
+  *skips* as if bitcoind were missing. The new tests serialize and retry that probe.
+
+### Try it
+```bash
+cargo test -p btcw-core --lib tx::                                    # offline
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-core --test tx  # regtest send → confirm
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-cli --test cli  # the CLI, end to end
+```
+
 ## 8. Tauri bridge, Phase 2 / Agent G — _pending_
 ## 9. End-to-end tests, Phase 2 / Agent H — _pending_
 ## 10. Running the demo (regtest and testnet4) — _pending_

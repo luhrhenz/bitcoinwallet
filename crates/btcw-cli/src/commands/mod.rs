@@ -8,10 +8,14 @@
 //! | `address new/list`, `balance`, `history`, `utxos` | watch-only, no password | no |
 //! | `sync` | watch-only, no password | yes |
 //! | `mine` | watch-only (only without `--to`) | yes, regtest |
+//! | `send` | **unlocked** (password; the signer is dropped right after signing) | yes |
+//! | `status` | watch-only, reopened for every poll | yes (falls back to the last sync) |
 
 pub mod address;
 pub mod create;
 pub mod mine;
 pub mod restore;
+pub mod send;
+pub mod status;
 pub mod sync;
 pub mod view;

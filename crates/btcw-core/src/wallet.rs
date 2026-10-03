@@ -433,7 +433,11 @@ fn net_sat(received: u64, sent: u64) -> i64 {
     i64::try_from(net).unwrap_or(if net < 0 { i64::MIN } else { i64::MAX })
 }
 
-fn tx_status(pos: &ChainPosition<bdk_wallet::chain::ConfirmationBlockTime>, tip: u32) -> TxStatus {
+/// Shared with `tx::tx_status`, so history rows and `btcw status` always agree.
+pub(crate) fn tx_status(
+    pos: &ChainPosition<bdk_wallet::chain::ConfirmationBlockTime>,
+    tip: u32,
+) -> TxStatus {
     match pos {
         // `transitively` confirmed means a descendant confirmed at this anchor, so our tx is at
         // or below it; the count is then a lower bound, which is the safe direction.

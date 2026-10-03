@@ -13,14 +13,15 @@ use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use btcw_core::bdk_wallet::{KeychainKind, Wallet};
 use btcw_core::bitcoin::address::NetworkUnchecked;
-use btcw_core::bitcoin::{Address, Amount, Network};
+use btcw_core::bitcoin::{Address, Amount, Network, Psbt};
 use btcw_core::config::RpcAuth;
 use btcw_core::keys;
 use btcw_core::testnode::TestNode;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -31,6 +32,8 @@ const ABANDON: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 /// Nothing listens on port 1 (tcpmux), so connecting is refused immediately.
 const CLOSED_RPC_URL: &str = "http://127.0.0.1:1";
+/// `ABANDON`'s first receive address on testnet4: valid, but for the wrong network here.
+const TESTNET_ADDRESS: &str = "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl";
 
 /// One isolated btcw setup: its own data directory and node settings.
 struct Env {
@@ -91,6 +94,35 @@ impl Env {
         cmd
     }
 
+    /// The same on regtest, but inside a pseudo-terminal: `script` runs the command with a pty
+    /// as its controlling terminal and copies our stdin into it, which is exactly what someone
+    /// typing at a prompt looks like. Its stdout is everything the command wrote to the pty.
+    fn command_in_pty(&self, args: &[&str]) -> Command {
+        let mut inner = Command::new(env!("CARGO_BIN_EXE_btcw"));
+        self.configure(&mut inner, "regtest", args);
+        let line: Vec<String> = std::iter::once(inner.get_program())
+            .chain(inner.get_args())
+            .map(|arg| shell_quote(&arg.to_string_lossy()))
+            .collect();
+        let mut cmd = Command::new("script");
+        cmd.args([
+            "--quiet",
+            "--return",
+            "--command",
+            &line.join(" "),
+            "/dev/null",
+        ])
+        .current_dir(self.root.path());
+        // `script` passes its environment on to the command.
+        for (key, value) in inner.get_envs() {
+            match value {
+                Some(value) => cmd.env(key, value),
+                None => cmd.env_remove(key),
+            };
+        }
+        cmd
+    }
+
     fn configure(&self, cmd: &mut Command, network: &str, args: &[&str]) {
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("BTCW_") {
@@ -139,6 +171,46 @@ impl Env {
     fn json_error(&self, args: &[&str]) -> TestResult<(String, String)> {
         json_error(&self.run(&with_json(args))?)
     }
+}
+
+/// `it's` → `'it'\''s'`, for `sh -c`.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// Same grouping as the CLI's `output::grouped`, written independently.
+fn in_groups_of_four(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(4)
+        .map(|group| group.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `TestNode::available()` runs `bitcoind -version`, and Core v31 rewrites
+/// `~/.bitcoin/settings.json` even for that: two probes at once (another test binary, another
+/// checkout) can fail on the rename and read as "no bitcoind", silently skipping the node test.
+/// Retry, so it only skips when bitcoind really is missing.
+fn bitcoind_available() -> bool {
+    (0..3).any(|_| TestNode::available())
+}
+
+fn has_program(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn mempool(node: &TestNode) -> TestResult<Vec<Value>> {
+    Ok(node
+        .call("getrawmempool", &[])?
+        .as_array()
+        .cloned()
+        .ok_or("getrawmempool: not an array")?)
 }
 
 fn with_json<'a>(args: &[&'a str]) -> Vec<&'a str> {
@@ -416,7 +488,7 @@ fn create_with_24_words() -> TestResult {
     Ok(())
 }
 
-/// create → addresses → offline views → Phase 2 stubs → restore the displayed phrase elsewhere.
+/// create → addresses → offline views → restore the displayed phrase elsewhere.
 #[test]
 fn offline_wallet_lifecycle() -> TestResult {
     let env = Env::offline()?;
@@ -519,23 +591,6 @@ fn offline_wallet_lifecycle() -> TestResult {
         "{text}"
     );
 
-    // Phase 2 commands: a clear error, still with the JSON shape and exit code.
-    let (code, message) = env.json_error(&["send", "--to", &first, "--amount", "1000", "--yes"])?;
-    assert_eq!(code, "cli");
-    assert_eq!(message, "`btcw send` is not implemented yet (Phase 2)");
-    let (code, message) = env.json_error(&["status", &"0".repeat(64)])?;
-    assert_eq!(code, "cli");
-    assert!(
-        message.contains("not implemented yet (Phase 2)"),
-        "{message}"
-    );
-    let out = env.run(&["status", &"0".repeat(64)])?;
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(
-        stderr(&out),
-        "error: `btcw status` is not implemented yet (Phase 2)\n"
-    );
-
     // No node: sync and mine fail with the core's RPC error.
     let (code, message) = env.json_error(&["sync"])?;
     assert_eq!(code, "rpc");
@@ -571,6 +626,144 @@ fn offline_wallet_lifecycle() -> TestResult {
         elsewhere.json(&["address", "new"])?["address"],
         first.as_str()
     );
+    Ok(())
+}
+
+/// `send` and `status` check everything they can before asking for a password or a node, and
+/// say exactly what is wrong.
+#[test]
+fn send_and_status_fail_fast_without_a_node() -> TestResult {
+    let env = Env::offline()?;
+    let txid = "5e3c1f1d2a6b7c8d9e0f11223344556677889900aabbccddeeff001122334455";
+    let (code, _) = env.json_error(&["status", txid])?;
+    assert_eq!(code, "wallet_not_found");
+    let (code, _) = env.json_error(&[
+        "send",
+        "--yes",
+        "--to",
+        "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk",
+        "--amount",
+        "10000",
+    ])?;
+    assert_eq!(code, "wallet_not_found");
+
+    let created = env.json(&["create"])?;
+    let first = created["first_address"]
+        .as_str()
+        .ok_or("no address")?
+        .to_owned();
+
+    // `--json` can't stop to ask, so it needs `--yes`.
+    let (code, message) = env.json_error(&["send", "--to", &first, "--amount", "10000"])?;
+    assert_eq!(code, "cli");
+    assert!(message.starts_with("--json needs --yes"), "{message}");
+
+    // Bad payments are refused before the password is read: each of these runs with a wrong
+    // password, which would otherwise be the error.
+    let existing = env.root.path().join("existing.psbt");
+    std::fs::write(&existing, "keep me")?;
+    let existing_str = existing.to_str().ok_or("non-UTF-8 temp path")?;
+    for (args, expected, needle) in [
+        (
+            vec!["--to", TESTNET_ADDRESS, "--amount", "10000"],
+            "network_mismatch",
+            "network mismatch: expected regtest, found a testnet4/signet address",
+        ),
+        (
+            vec!["--to", "bcrt1qnotanaddress", "--amount", "10000"],
+            "invalid_address",
+            "invalid address: `bcrt1qnotanaddress`",
+        ),
+        (
+            vec!["--to", &first, "--amount", "293"],
+            "dust_amount",
+            "below the dust limit",
+        ),
+        (
+            vec!["--to", &first, "--amount", "10000", "--fee-rate", "0"],
+            "tx_build",
+            "fee rate 0 sat/vB is below the 1 sat/vB minimum",
+        ),
+        (
+            vec![
+                "--to",
+                &first,
+                "--amount",
+                "10000",
+                "--psbt-out",
+                existing_str,
+            ],
+            "cli",
+            "already exists; refusing to overwrite it",
+        ),
+    ] {
+        let mut full = vec!["--json", "send", "--yes"];
+        full.extend(args);
+        let out = env
+            .command_on("regtest", &full)
+            .env("BTCW_PASSWORD", "not the password")
+            .output()?;
+        let (code, message) = json_error(&out)?;
+        assert_eq!(code, expected, "{full:?}: {message}");
+        assert!(message.contains(needle), "{full:?}: {message}");
+    }
+    assert_eq!(std::fs::read_to_string(&existing)?, "keep me");
+
+    // Then the password; with the right one, the next stop is the (missing) node.
+    let out = env
+        .command_on(
+            "regtest",
+            &[
+                "--json", "send", "--yes", "--to", &first, "--amount", "10000",
+            ],
+        )
+        .env("BTCW_PASSWORD", "not the password")
+        .output()?;
+    let (code, message) = json_error(&out)?;
+    assert_eq!(code, "wrong_password");
+    assert_eq!(message, "wrong password or corrupted keystore");
+    let (code, message) =
+        env.json_error(&["send", "--yes", "--to", &first, "--amount", "10000"])?;
+    assert_eq!(code, "rpc");
+    assert!(message.contains("connection refused"), "{message}");
+
+    // `status`: a malformed txid, then an unknown one answered from the wallet file.
+    let (code, message) = env.json_error(&["status", "not-a-txid"])?;
+    assert_eq!(code, "cli");
+    assert!(
+        message.starts_with("invalid transaction id `not-a-txid`"),
+        "{message}"
+    );
+    assert!(message.contains("64 hexadecimal characters"), "{message}");
+    let out = env.run(&["--json", "status", txid])?;
+    let (code, message) = json_error(&out)?;
+    assert_eq!(code, "tx_not_found");
+    assert_eq!(message, format!("transaction not found: {txid}"));
+    let err = stderr(&out);
+    assert!(
+        err.contains("warning: could not sync with bitcoind, so this is the status as of block 0"),
+        "{err}"
+    );
+    assert!(err.contains("this wallet's own transactions"), "{err}");
+    let out = env.run(&["status", "--watch", "--interval", "0", txid])?;
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+
+    // The confirmation is read from the terminal, never from stdin; without one, say so.
+    if has_program("setsid") {
+        let out = env
+            .command_without_terminal(&["send", "--to", &first, "--amount", "10000"])
+            .output()?;
+        assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+        assert!(out.stdout.is_empty(), "{}", describe(&out));
+        let err = stderr(&out);
+        assert!(
+            err.starts_with("error: cannot open the terminal to confirm the payment"),
+            "{err}"
+        );
+        assert!(err.contains("pass --yes"), "{err}");
+    } else {
+        eprintln!("skipping the no-terminal check: no `setsid`");
+    }
     Ok(())
 }
 
@@ -624,7 +817,7 @@ fn restore_from_stdin_without_a_node_matches_bip84() -> TestResult {
 /// restore the phrase from genesis. One test, because each node takes ~20 s to start.
 #[test]
 fn regtest_round_trip_with_a_node() -> TestResult {
-    if !TestNode::available() {
+    if !bitcoind_available() {
         eprintln!("skipping: no bitcoind (set BITCOIND_EXE)");
         return Ok(());
     }
@@ -762,6 +955,7 @@ fn regtest_round_trip_with_a_node() -> TestResult {
     let balance = env.json(&["balance"])?;
 
     // Restoring the phrase in a fresh datadir rescans from genesis and finds the same coins.
+    // (Before any payment, so the restored history matches the one above.)
     let elsewhere = Env::with_node(&node)?;
     let out = elsewhere.run_with_stdin(&["--json", "restore"], &format!("{phrase}\n"))?;
     let restored = ok_json(&out)?;
@@ -773,6 +967,241 @@ fn regtest_round_trip_with_a_node() -> TestResult {
     );
     assert_eq!(restored["balance"], balance["balance"]);
     assert_eq!(elsewhere.json(&["history"])?, history);
+    drop(elsewhere);
+
+    send_and_follow(&node, &env)
+}
+
+/// `send` and `status` against the node, from the wallet the round trip above built: 1 000 000
+/// sat spendable (the 50 BTC reward is still immature).
+fn send_and_follow(node: &TestNode, env: &Env) -> TestResult {
+    let faucet = node.faucet_address()?.to_string();
+    let tip = node.tip_height()?;
+    assert!(mempool(node)?.is_empty());
+
+    let (code, message) =
+        env.json_error(&["send", "--yes", "--to", &faucet, "--amount", "100000000"])?;
+    assert_eq!(code, "insufficient_funds", "{message}");
+    assert!(
+        message.starts_with("insufficient funds: need 1.0"),
+        "{message}"
+    );
+
+    // Declined at the prompt, typed into a real pseudo-terminal: nothing is sent.
+    if has_program("script") {
+        let mut child = env
+            .command_in_pty(&["send", "--to", &faucet, "--amount", "100000"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().ok_or("no stdin")?.write_all(b"n\n")?;
+        let out = child.wait_with_output()?;
+        assert!(out.status.success(), "{}", describe(&out));
+        let text = stdout(&out);
+        assert!(text.contains("[regtest] Payment preview"), "{text}");
+        assert!(text.contains(&in_groups_of_four(&faucet)), "{text}");
+        assert!(text.contains("Send? [y/N]"), "{text}");
+        assert!(text.contains("Cancelled; nothing was sent."), "{text}");
+        assert!(mempool(node)?.is_empty());
+    } else {
+        eprintln!("skipping the interactive prompt check: no `script`");
+    }
+
+    // Sent, with the unsigned PSBT kept for inspection.
+    let psbt_path = env.root.path().join("payment.psbt");
+    let out = env.run(&[
+        "--json",
+        "send",
+        "--yes",
+        "--to",
+        &faucet,
+        "--amount",
+        "100000",
+        "--fee-rate",
+        "5",
+        "--psbt-out",
+        psbt_path.to_str().ok_or("non-UTF-8 temp path")?,
+    ])?;
+    let sent = ok_json(&out)?;
+    assert_eq!(
+        keys_of(&sent),
+        BTreeSet::from(["network", "preview", "txid"].map(String::from))
+    );
+    assert_eq!(sent["network"], "regtest");
+    let txid = sent["txid"].as_str().ok_or("no txid")?.to_owned();
+    let preview = &sent["preview"];
+    let fee = as_u64(&preview["fee_sat"])?;
+    let vsize = as_u64(&preview["vsize"])?;
+    assert_eq!(preview["to"], faucet.as_str());
+    assert_eq!(preview["amount_sat"], 100_000);
+    assert_eq!(as_u64(&preview["total_sat"])?, 100_000 + fee);
+    assert_eq!(as_u64(&preview["change_sat"])?, 1_000_000 - 100_000 - fee);
+    assert!((5 * vsize - 5..=5 * vsize + 5).contains(&fee), "{preview}");
+    let rate = preview["fee_rate_sat_vb"].as_f64().ok_or("no fee rate")?;
+    assert!((rate - 5.0).abs() < 0.1, "{preview}");
+    assert!(
+        stderr(&out).contains("wrote the unsigned PSBT"),
+        "{}",
+        describe(&out)
+    );
+
+    // The PSBT file: private, unsigned, the very transaction that was broadcast, and Core agrees
+    // with our fee.
+    let text = std::fs::read_to_string(&psbt_path)?;
+    let psbt: Psbt = text.trim_end().parse()?;
+    assert_eq!(psbt.unsigned_tx.compute_txid().to_string(), txid);
+    assert!(
+        psbt.inputs
+            .iter()
+            .all(|input| input.partial_sigs.is_empty() && input.final_script_witness.is_none())
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&psbt_path)?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+    let decoded = node.call("decodepsbt", &[json!(text.trim_end())])?;
+    assert_eq!(decoded["tx"]["txid"], txid.as_str());
+    let core_fee = decoded["fee"].as_f64().ok_or("decodepsbt: no fee")?;
+    assert_eq!((core_fee * 1e8).round(), fee as f64);
+
+    // In the node's mempool, and in the wallet before any sync.
+    assert_eq!(mempool(node)?, [json!(txid)]);
+    let change = 1_000_000 - 100_000 - fee;
+    let balance = env.json(&["balance"])?;
+    assert_eq!(balance["balance"]["confirmed_sat"], 0);
+    assert_eq!(balance["balance"]["unconfirmed_sat"], change);
+
+    let status = env.json(&["status", &txid])?;
+    assert_eq!(
+        keys_of(&status),
+        BTreeSet::from(
+            ["network", "status", "sync_error", "synced_height", "txid"].map(String::from)
+        )
+    );
+    assert_eq!(status["txid"], txid.as_str());
+    assert_eq!(status["status"]["state"], "unconfirmed");
+    assert_eq!(status["sync_error"], Value::Null);
+    assert_eq!(as_u64(&status["synced_height"])?, u64::from(tip));
+    let text = stdout(&env.run(&["status", &txid])?);
+    assert!(
+        text.starts_with(&format!("[regtest] Transaction {txid}\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains("unconfirmed, waiting in the mempool"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("As of       block {tip}")), "{text}");
+
+    // `--watch` until 2 confirmations while two blocks are mined, one at a time.
+    let mut watcher = env
+        .command_on(
+            "regtest",
+            &[
+                "status",
+                &txid,
+                "--watch",
+                "--until",
+                "2",
+                "--interval",
+                "1",
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    std::thread::sleep(Duration::from_millis(1_500));
+    node.mine(1)?;
+    std::thread::sleep(Duration::from_millis(1_500));
+    node.mine(1)?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while watcher.try_wait()?.is_none() {
+        if Instant::now() > deadline {
+            watcher.kill()?;
+            return Err("status --watch did not stop at 2 confirmations".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = watcher.wait_with_output()?;
+    assert!(out.status.success(), "{}", describe(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with(&format!(
+            "[regtest] Watching {txid} until it has 2 confirmations (checking every 1 s; Ctrl-C to stop)\n"
+        )),
+        "{text}"
+    );
+    // A line per change and never the same line twice. (Whether the first check still saw the
+    // transaction unconfirmed depends on timing, so that line isn't required.)
+    let lines: Vec<&str> = text.lines().skip(1).collect();
+    assert!(lines.windows(2).all(|pair| pair[0] != pair[1]), "{text}");
+    assert!(
+        lines.len() <= 3,
+        "unconfirmed, 1 and 2 confirmations at most: {text}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.starts_with("  block ") && line.contains("confirm")),
+        "{text}"
+    );
+    assert!(
+        text.trim_end()
+            .ends_with(&format!("confirmed in block {}: 2 confirmations", tip + 1)),
+        "{text}"
+    );
+
+    let status = env.json(&["status", &txid, "--watch", "--until", "2"])?;
+    assert_eq!(
+        status["status"],
+        json!({
+            "state": "confirmed",
+            "height": tip + 1,
+            "confirmations": 2,
+            "block_time": status["status"]["block_time"],
+        })
+    );
+    assert_eq!(
+        as_u64(&env.json(&["balance"])?["balance"]["confirmed_sat"])?,
+        change
+    );
+
+    // In human mode, with fees that deserve a second look: 150 sat/vB, and far more than 10% of
+    // the 1 000 sat being sent.
+    let out = env.run(&[
+        "send",
+        "--yes",
+        "--to",
+        &faucet,
+        "--amount",
+        "1000",
+        "--fee-rate",
+        "150",
+    ])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("[regtest] Payment preview\n"), "{text}");
+    assert!(
+        text.contains(&format!("  To        {}\n", in_groups_of_four(&faucet))),
+        "{text}"
+    );
+    assert!(
+        text.contains("  Amount    0.00001000 BTC (1,000 sat)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[regtest] Sent 0.00001000 BTC (1,000 sat) to"),
+        "{text}"
+    );
+    assert!(text.contains("--watch`."), "{text}");
+    let err = stderr(&out);
+    assert!(err.contains("warning: the fee ("), "{err}");
+    assert!(err.contains("of the amount being sent"), "{err}");
+    assert!(err.contains("unusually high"), "{err}");
+    assert_eq!(mempool(node)?.len(), 1);
     Ok(())
 }
 

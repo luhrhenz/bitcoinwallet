@@ -274,6 +274,20 @@ pub fn signed_amount(sat: i64) -> String {
     )
 }
 
+/// `"tb1qw508d6qe…"` → `"tb1q w508 d6qe …"`: the full address in groups of four, so it can be
+/// checked group by group against the recipient's copy. Shortening it (`tb1qw5…pjzsx`) would hide
+/// exactly the middle part that clipboard-swapping malware changes.
+pub fn grouped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    for (i, c) in text.chars().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Unix seconds → `"2026-10-03 14:05"` (UTC).
 pub fn utc_datetime(unix_secs: u64) -> String {
     let (days, secs_of_day) = (unix_secs / 86_400, unix_secs % 86_400);
@@ -370,6 +384,17 @@ mod tests {
             signed_amount(i64::MIN),
             "-92233720368.54775808 BTC (-9,223,372,036,854,775,808 sat)"
         );
+    }
+
+    #[test]
+    fn addresses_in_groups_of_four() {
+        assert_eq!(
+            grouped("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"),
+            "tb1q w508 d6qe jxtd g4y5 r3za rvar y0c5 xw7k xpjz sx"
+        );
+        assert_eq!(grouped("bcrt1q6rz2"), "bcrt 1q6r z2");
+        assert_eq!(grouped("abcd"), "abcd");
+        assert_eq!(grouped(""), "");
     }
 
     #[test]
