@@ -13,6 +13,9 @@ repository = "https://github.com/luhrhenz/bitcoinwallet"
 # Bitcoin. Always import `bitcoin` through `bdk_wallet::bitcoin` so there is exactly one version (0.32).
 bdk_wallet = { version = "3.2", features = ["rusqlite"] }
 bdk_bitcoind_rpc = "0.22"
+# TLS for `https://` RPC URLs (hosted providers). bitcoincore-rpc already uses minreq; this only
+# turns on its rustls backend.
+minreq = { version = "2.14", default-features = false, features = ["https-rustls"] }
 bip39 = { version = "2.2", features = ["rand", "zeroize"] }
 
 # Secrets / crypto

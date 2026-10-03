@@ -24,14 +24,14 @@ use std::time::Duration;
 
 use bdk_bitcoind_rpc::Emitter;
 use bdk_bitcoind_rpc::bitcoincore_rpc::jsonrpc;
-use bdk_bitcoind_rpc::bitcoincore_rpc::jsonrpc::simple_http;
+use bdk_bitcoind_rpc::bitcoincore_rpc::jsonrpc::{minreq_http, simple_http};
 use bdk_bitcoind_rpc::bitcoincore_rpc::{self, Client, RpcApi};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::bitcoin::{Address, Amount, BlockHash, FeeRate, Network, Transaction, Txid};
-use crate::config::{RpcAuth, RpcConfig};
+use crate::config::{self, RpcAuth, RpcConfig};
 use crate::error::{Result, WalletError};
 use crate::types::{SyncProgress, SyncReport};
 use crate::wallet::WalletService;
@@ -62,20 +62,36 @@ impl Node {
     /// Connect (cookie or user/pass) and verify the node is on `network`.
     pub fn connect(rpc: &RpcConfig, network: Network) -> Result<Self> {
         let url = redact_url(&rpc.url);
-        let builder = simple_http::Builder::new()
-            .timeout(RPC_TIMEOUT)
-            .url(&rpc.url)
-            .map_err(|e| url_error(&url, e))?;
-        let builder = match &rpc.auth {
-            RpcAuth::Cookie(path) => {
-                let (user, pass) = read_cookie(path, network)?;
-                builder.auth(user.as_str(), Some(pass.as_str()))
-            }
-            RpcAuth::UserPass { user, pass } => {
-                builder.auth(user.as_str(), Some(pass.expose_secret()))
-            }
+        let credentials = match &rpc.auth {
+            RpcAuth::Cookie(path) => Some(read_cookie(path, network)?),
+            RpcAuth::UserPass { user, pass } => Some((
+                user.clone(),
+                Zeroizing::new(pass.expose_secret().to_owned()),
+            )),
+            RpcAuth::None => None,
         };
-        let client = Client::from_jsonrpc(jsonrpc::Client::with_transport(builder.build()));
+        let client = if config::is_https(&rpc.url) {
+            // Hosted providers and remote nodes: TLS via minreq (rustls, Mozilla's root store).
+            // simple_http only speaks plain HTTP, which would send credentials and the API key
+            // in the URL unencrypted.
+            let mut builder = minreq_http::Builder::new()
+                .timeout(RPC_TIMEOUT)
+                .url(&rpc.url)
+                .map_err(|_| WalletError::Config(format!("invalid RPC URL `{url}`")))?;
+            if let Some((user, pass)) = &credentials {
+                builder = builder.basic_auth(user.clone(), Some(pass.to_string()));
+            }
+            Client::from_jsonrpc(jsonrpc::Client::with_transport(builder.build()))
+        } else {
+            let mut builder = simple_http::Builder::new()
+                .timeout(RPC_TIMEOUT)
+                .url(&rpc.url)
+                .map_err(|e| url_error(&url, e))?;
+            if let Some((user, pass)) = &credentials {
+                builder = builder.auth(user.as_str(), Some(pass.as_str()));
+            }
+            Client::from_jsonrpc(jsonrpc::Client::with_transport(builder.build()))
+        };
         let node = Self {
             client,
             network,
@@ -152,12 +168,17 @@ impl Node {
         //
         // The wallet's unconfirmed txs are passed in so the Emitter can report the ones that
         // have since disappeared from the mempool (replaced, expired) as evicted.
-        let unconfirmed = unconfirmed_txs(wallet);
+        // Plus every mempool transaction a previous sync already downloaded (see
+        // `mempool_cache`): the Emitter only fetches txids it doesn't hold yet, one
+        // `getrawtransaction` round trip each, which is most of a sync against a remote node.
+        let cache_path = wallet.mempool_cache_path();
+        let mut expected = unconfirmed_txs(wallet);
+        expected.extend(mempool_cache::load(&cache_path));
         let mut emitter = Emitter::new(
             &self.client,
             wallet.bdk().latest_checkpoint(),
             wallet.birthday_height(),
-            unconfirmed,
+            expected,
         );
 
         let mut blocks_scanned: u32 = 0;
@@ -190,11 +211,19 @@ impl Node {
         let mempool = emitter
             .mempool()
             .map_err(|e| self.rpc_error("reading the mempool", e))?;
+        mempool_cache::save(&cache_path, mempool.update.iter().map(|(tx, _)| tx));
         let bdk = wallet.bdk_mut();
         bdk.apply_unconfirmed_txs(mempool.update);
         // Empty unless the Emitter has reached the node's tip (it can't tell "evicted" from
-        // "confirmed in a block we haven't fetched yet" before that).
-        bdk.apply_evicted_txs(mempool.evicted);
+        // "confirmed in a block we haven't fetched yet" before that). Cached strangers' txs show
+        // up here too once they leave the mempool; only the wallet's own evictions matter, and
+        // passing the rest would just add rows for unrelated txids to the database.
+        let evicted: Vec<(Txid, u64)> = mempool
+            .evicted
+            .into_iter()
+            .filter(|(txid, _)| bdk.tx_graph().get_tx(*txid).is_some())
+            .collect();
+        bdk.apply_evicted_txs(evicted);
         wallet.persist()?;
 
         let synced = wallet.synced_height();
@@ -282,6 +311,55 @@ impl Node {
 
     fn rpc_error(&self, what: &str, e: bitcoincore_rpc::Error) -> WalletError {
         rpc_error(&self.url, self.network, what, e)
+    }
+}
+
+/// Mempool transactions already downloaded by a previous sync, so the next one only fetches new
+/// ones. Public data (it's the node's mempool), so a plain file next to the wallet database.
+/// Best effort both ways: an unreadable or missing cache just means a slower sync.
+mod mempool_cache {
+    use std::io::Write;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::bitcoin::Transaction;
+    use crate::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
+
+    /// Mainnet's mempool can hold hundreds of thousands of transactions; keep the file small.
+    const MAX_TXS: usize = 5_000;
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    /// One transaction per line, consensus-encoded hex. Bad lines are skipped.
+    pub fn load(path: &Path) -> Vec<Arc<Transaction>> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .take(MAX_TXS)
+            .filter_map(|line| deserialize_hex::<Transaction>(line.trim()).ok())
+            .map(Arc::new)
+            .collect()
+    }
+
+    /// Replace the cache with the current mempool (written to a temp file, then renamed).
+    pub fn save<'a>(path: &Path, txs: impl Iterator<Item = &'a Arc<Transaction>>) {
+        let mut text = String::new();
+        for tx in txs.take(MAX_TXS) {
+            let line = serialize_hex(tx.as_ref());
+            if text.len() + line.len() + 1 > MAX_BYTES {
+                break;
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+        let tmp = path.with_extension("tmp");
+        let written = std::fs::File::create(&tmp)
+            .and_then(|mut file| file.write_all(text.as_bytes()))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::debug!(error = %e, "could not save the mempool cache");
+        }
     }
 }
 
@@ -387,20 +465,29 @@ fn read_cookie(path: &Path, network: Network) -> Result<(String, Zeroizing<Strin
     Ok((user.to_owned(), Zeroizing::new(pass.to_owned())))
 }
 
-/// `http://user:pass@host:port/path` → `http://host:port/path`, for messages and logs.
+/// `https://user:pass@host:port/v2/<API key>?x=y` → `https://host:port/…`, for messages and logs.
+///
+/// Both the userinfo *and* the path go: hosted providers (Alchemy, …) put the API key in the
+/// path, and Core's own `/wallet/<name>` paths are no help in an error message anyway.
 fn redact_url(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((scheme, rest)) => (Some(scheme), rest),
         None => (None, url),
     };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let rest = match rest[..authority_end].rfind('@') {
-        Some(at) => &rest[at + 1..],
-        None => rest,
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    let elided = if authority_end < rest.len() {
+        "/…"
+    } else {
+        ""
     };
     match scheme {
-        Some(scheme) => format!("{scheme}://{rest}"),
-        None => rest.to_owned(),
+        Some(scheme) => format!("{scheme}://{host}{elided}"),
+        None => format!("{host}{elided}"),
     }
 }
 
@@ -560,13 +647,26 @@ mod tests {
     }
 
     #[test]
-    fn urls_lose_their_credentials() {
+    fn urls_lose_their_credentials_and_api_keys() {
         assert_eq!(
             redact_url("http://alice:s3cret@127.0.0.1:8332/wallet/x"),
-            "http://127.0.0.1:8332/wallet/x"
+            "http://127.0.0.1:8332/…"
         );
         assert_eq!(redact_url("127.0.0.1:18443"), "127.0.0.1:18443");
-        assert_eq!(redact_url("http://host/a@b"), "http://host/a@b");
+        assert_eq!(
+            redact_url("http://127.0.0.1:18443"),
+            "http://127.0.0.1:18443"
+        );
+        assert_eq!(redact_url("http://host/a@b"), "http://host/…");
+        // Hosted provider: the API key lives in the path (or the query).
+        assert_eq!(
+            redact_url("https://bitcoin-testnet4.g.alchemy.com/v2/SECRETKEY"),
+            "https://bitcoin-testnet4.g.alchemy.com/…"
+        );
+        assert_eq!(
+            redact_url("https://h.example?apikey=SECRET"),
+            "https://h.example/…"
+        );
     }
 
     #[test]

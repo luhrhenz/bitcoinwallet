@@ -83,7 +83,10 @@ fn file_matches_the_documented_format() -> TestResult {
     // phrases. Two adjacent words separated by a space, though, can only come from the phrase.
     let raw = std::fs::read_to_string(&path)?;
     let phrase = mnemonic.phrase();
-    assert!(!raw.contains(phrase.as_str()), "keystore contains the phrase");
+    assert!(
+        !raw.contains(phrase.as_str()),
+        "keystore contains the phrase"
+    );
     let words: Vec<&str> = phrase.split(' ').collect();
     for pair in words.windows(2) {
         assert!(

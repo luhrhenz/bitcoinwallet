@@ -8,7 +8,6 @@
 //! crate-private `bdk_mut()`.
 
 use std::error::Error;
-use std::net::TcpListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -98,10 +97,11 @@ fn block_hash(test_node: &TestNode, height: u32) -> Result<Value, Box<dyn Error>
 
 #[test]
 fn connect_failures_are_quick_and_actionable() -> TestResult {
-    // Nothing listens on a port we just released: connection refused, immediately.
-    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    // Nothing listens on port 1 (privileged, unused): connection refused, immediately. Not a
+    // just-released ephemeral port: the regtest nodes other tests start in parallel pick free
+    // ports too, and one occasionally landed on it.
     let closed = RpcConfig {
-        url: format!("http://127.0.0.1:{port}"),
+        url: "http://127.0.0.1:1".to_owned(),
         auth: RpcAuth::UserPass {
             user: "alice".into(),
             pass: "hunter2".to_string().into(),

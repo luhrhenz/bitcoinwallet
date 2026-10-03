@@ -16,7 +16,7 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -47,6 +47,8 @@ pub struct WalletService {
     wallet: PersistedWallet<Connection>,
     db: Connection,
     network: Network,
+    /// `<datadir>/<network>/`, for files that live next to the database (the mempool cache).
+    network_dir: PathBuf,
     /// Read once at open time: `birthday_height()` is infallible, and the value never changes.
     birthday: u32,
     /// Cached copy of the `backup_verified` row; [`WalletService::set_backup_verified`] keeps
@@ -82,6 +84,7 @@ impl WalletService {
                 wallet,
                 db,
                 network: cfg.network,
+                network_dir: cfg.network_dir(),
                 birthday,
                 // No row yet: a new wallet starts unverified (`api` marks restores verified).
                 backup_verified: false,
@@ -142,6 +145,7 @@ impl WalletService {
             wallet,
             db,
             network: cfg.network,
+            network_dir: cfg.network_dir(),
             birthday,
             backup_verified,
             _lock: lock,
@@ -331,6 +335,11 @@ impl WalletService {
                 .public_descriptor(KeychainKind::Internal)
                 .to_string()
                 == descriptors.internal()
+    }
+
+    /// Where `chain::Node::sync` keeps the mempool transactions it has already downloaded.
+    pub(crate) fn mempool_cache_path(&self) -> PathBuf {
+        self.network_dir.join("mempool-cache.txt")
     }
 
     /// Escape hatches for `chain` and `tx`. Not public API.

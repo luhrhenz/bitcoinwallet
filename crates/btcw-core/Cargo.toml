@@ -17,6 +17,7 @@ test-utils = ["dep:tempfile"]
 [dependencies]
 bdk_wallet.workspace = true
 bdk_bitcoind_rpc.workspace = true
+minreq.workspace = true
 bip39.workspace = true
 argon2.workspace = true
 chacha20poly1305.workspace = true

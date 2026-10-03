@@ -88,6 +88,9 @@ pub enum RpcAuth {
         user: String,
         pass: SecretString,
     },
+    /// No RPC login. The default for `https://` URLs: hosted providers (e.g. Alchemy) put the
+    /// API key in the URL itself and have no `.cookie` file to read.
+    None,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +215,9 @@ impl Config {
                 ));
             }
             (None, None, Some(cookie)) => rpc.auth = RpcAuth::Cookie(cookie),
+            // A remote provider authenticates with the key in its URL; there is no local
+            // `.cookie` file to read for it.
+            (None, None, None) if is_https(&rpc.url) => rpc.auth = RpcAuth::None,
             (None, None, None) => {}
         }
 
@@ -244,6 +250,13 @@ impl Config {
     pub fn coin_type(&self) -> u32 {
         coin_type(self.network)
     }
+}
+
+/// `https://…`: a remote node or hosted provider (TLS transport, no cookie by default).
+pub fn is_https(url: &str) -> bool {
+    url.trim_start()
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
 }
 
 /// `$XDG_DATA_HOME/btcw` on Linux (e.g. `~/.local/share/btcw`).
@@ -335,7 +348,7 @@ mod tests {
                 assert_eq!(user, "u");
                 assert_eq!(pass.expose_secret(), "p");
             }
-            RpcAuth::Cookie(_) => panic!("expected user/pass auth from file"),
+            _ => panic!("expected user/pass auth from file"),
         }
 
         let mut o = overrides_in(dir.path());
@@ -344,6 +357,33 @@ mod tests {
         let from_flag = Config::load_with(o, env)?;
         assert_eq!(from_flag.network, Network::Testnet4);
         assert_eq!(from_flag.rpc.url, "http://flag:2");
+        Ok(())
+    }
+
+    #[test]
+    fn https_urls_default_to_no_rpc_login() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut o = overrides_in(dir.path());
+        o.rpc_url = Some("https://bitcoin-testnet4.example.com/v2/KEY".into());
+        assert!(matches!(
+            Config::load_with(o.clone(), no_env)?.rpc.auth,
+            RpcAuth::None
+        ));
+        // Explicit credentials still win over the default.
+        o.rpc_user = Some("u".into());
+        o.rpc_pass = Some(SecretString::from("p"));
+        assert!(matches!(
+            Config::load_with(o, no_env)?.rpc.auth,
+            RpcAuth::UserPass { .. }
+        ));
+        // A plain-http URL keeps the local cookie default.
+        let mut o = overrides_in(dir.path());
+        o.rpc_url = Some("http://127.0.0.1:48332".into());
+        assert!(matches!(
+            Config::load_with(o, no_env)?.rpc.auth,
+            RpcAuth::Cookie(_)
+        ));
+        assert!(is_https("HTTPS://x") && !is_https("http://x") && !is_https("htt"));
         Ok(())
     }
 
