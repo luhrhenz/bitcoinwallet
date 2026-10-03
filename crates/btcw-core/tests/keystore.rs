@@ -77,10 +77,19 @@ fn file_matches_the_documented_format() -> TestResult {
         mnemonic.phrase().len() + 16
     );
 
-    // No word of the mnemonic appears anywhere in the file.
+    // The plaintext phrase appears nowhere in the file. Single words can't be checked: short
+    // BIP39 words such as "salt", "network" or "test" legitimately occur in the file's own field
+    // names and values ("network": "regtest"), which made a per-word check fail on ~3% of random
+    // phrases. Two adjacent words separated by a space, though, can only come from the phrase.
     let raw = std::fs::read_to_string(&path)?;
-    for word in mnemonic.phrase().split(' ') {
-        assert!(!raw.contains(word), "keystore contains a plaintext word");
+    let phrase = mnemonic.phrase();
+    assert!(!raw.contains(phrase.as_str()), "keystore contains the phrase");
+    let words: Vec<&str> = phrase.split(' ').collect();
+    for pair in words.windows(2) {
+        assert!(
+            !raw.contains(&format!("{} {}", pair[0], pair[1])),
+            "keystore contains plaintext words"
+        );
     }
     Ok(())
 }
