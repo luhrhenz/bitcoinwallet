@@ -7,7 +7,7 @@
 //! - [`open_watch_only`]: no password. Balance, history, addresses, sync. Cannot sign.
 //! - [`unlock_wallet`]: password → decrypt seed → [`Unlocked`] with a [`Signer`] for sending.
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::config::Config;
 use crate::error::{Result, WalletError};
@@ -17,6 +17,10 @@ use crate::wallet::WalletService;
 
 /// Only account 0 is used (`m/84'/coin'/0'`).
 pub const ACCOUNT: u32 = 0;
+
+/// Minimum length for a new wallet password, enforced here so the CLI and desktop app agree.
+/// Argon2id makes each guess expensive, but it can't save a 4-character password.
+pub const MIN_PASSWORD_LEN: usize = 8;
 
 /// A wallet that can spend. Drop it (or just the signer) to lock.
 #[derive(Debug)]
@@ -45,6 +49,7 @@ pub fn create_wallet(
     birthday: Option<u32>,
 ) -> Result<CreatedWallet> {
     ensure_absent(cfg)?;
+    check_new_password(password)?;
     let mnemonic = keys::generate_mnemonic(words)?;
     let unlocked = init(cfg, &mnemonic, password, birthday)?;
     Ok(CreatedWallet { mnemonic, unlocked })
@@ -58,6 +63,7 @@ pub fn restore_wallet(
     birthday: Option<u32>,
 ) -> Result<Unlocked> {
     ensure_absent(cfg)?;
+    check_new_password(password)?;
     let mnemonic = keys::parse_mnemonic(phrase)?;
     init(cfg, &mnemonic, password, birthday)
 }
@@ -73,6 +79,14 @@ pub fn unlock_wallet(cfg: &Config, password: &SecretString) -> Result<Unlocked> 
     let (descriptors, signer) = keys::derive_account(&mnemonic, "", cfg.network, ACCOUNT)?;
     let wallet = WalletService::open(cfg, Some(&descriptors))?;
     Ok(Unlocked { wallet, signer })
+}
+
+/// Applied to *new* passwords only; unlocking never second-guesses an existing one.
+pub fn check_new_password(password: &SecretString) -> Result<()> {
+    if password.expose_secret().chars().count() < MIN_PASSWORD_LEN {
+        return Err(WalletError::WeakPassword(MIN_PASSWORD_LEN));
+    }
+    Ok(())
 }
 
 fn ensure_absent(cfg: &Config) -> Result<()> {

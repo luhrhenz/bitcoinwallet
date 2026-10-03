@@ -17,6 +17,9 @@ pub enum WalletError {
     #[error("wrong password or corrupted keystore")]
     WrongPassword,
 
+    #[error("password must be at least {0} characters")]
+    WeakPassword(usize),
+
     #[error("a wallet already exists in {}", .0.display())]
     WalletExists(PathBuf),
 
@@ -72,6 +75,7 @@ impl WalletError {
         match self {
             Self::InvalidMnemonic(_) => "invalid_mnemonic",
             Self::WrongPassword => "wrong_password",
+            Self::WeakPassword(_) => "weak_password",
             Self::WalletExists(_) => "wallet_exists",
             Self::WalletNotFound(_) => "wallet_not_found",
             Self::WalletInUse => "wallet_in_use",
