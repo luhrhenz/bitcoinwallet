@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
+use bdk_bitcoind_rpc::bitcoincore_rpc::jsonrpc::{self, simple_http};
+use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi};
 use serde_json::{Value, json};
 
 use crate::bitcoin::address::NetworkUnchecked;
@@ -37,19 +38,54 @@ fn bitcoind_exe() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("bitcoind"))
 }
 
+/// Same 120 s transport timeout as `chain::Node`. `bitcoincore-rpc`'s default is 15 s, and with
+/// several test nodes mining in parallel one `generatetoaddress` batch can exceed it (seen as
+/// intermittent "Resource temporarily unavailable" failures in full-workspace runs).
+fn client(url: &str, cookie: &std::path::Path) -> Result<Client> {
+    let contents = std::fs::read_to_string(cookie)?;
+    let (user, pass) = contents
+        .trim_end()
+        .split_once(':')
+        .ok_or_else(|| rpc_err("malformed cookie file"))?;
+    let transport = simple_http::Builder::new()
+        .timeout(Duration::from_secs(120))
+        .url(url)
+        .map_err(rpc_err)?
+        .auth(user, Some(pass))
+        .build();
+    Ok(Client::from_jsonrpc(jsonrpc::Client::with_transport(
+        transport,
+    )))
+}
+
 fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
 impl TestNode {
     /// True if a `bitcoind` binary can be executed.
+    ///
+    /// `-nosettings`: Core v31 rewrites `~/.bitcoin/settings.json` even for `-version`, and two
+    /// test binaries probing at once can collide on that file's rename, making a perfectly good
+    /// node look missing.
+    ///
+    /// # Panics
+    /// When `BITCOIND_EXE` is set explicitly but doesn't run: the caller asked for node tests,
+    /// so silently skipping them would turn a broken setup into a green test run.
     pub fn available() -> bool {
-        Command::new(bitcoind_exe())
-            .arg("-version")
+        let runs = Command::new(bitcoind_exe())
+            .args(["-nosettings", "-version"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .is_ok_and(|s| s.success());
+        if !runs && let Some(exe) = std::env::var_os("BITCOIND_EXE") {
+            panic!(
+                "BITCOIND_EXE={} is set but `-version` failed; refusing to skip node tests",
+                PathBuf::from(exe).display()
+            );
+        }
+        runs
     }
 
     /// Start a node, create a Core wallet named `faucet`, and mine 101 blocks to it so it has
@@ -79,7 +115,7 @@ impl TestNode {
         let deadline = Instant::now() + Duration::from_secs(30);
         let client = loop {
             if cookie.exists()
-                && let Ok(c) = Client::new(&url, Auth::CookieFile(cookie.clone()))
+                && let Ok(c) = client(&url, &cookie)
                 && c.call::<Value>("getblockcount", &[]).is_ok()
             {
                 break c;

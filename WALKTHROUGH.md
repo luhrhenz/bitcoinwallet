@@ -69,7 +69,7 @@ broadcast → confirm. It surfaced three things that changed the design:
 ```bash
 cargo test --workspace                       # unit tests + regtest smoke test (needs BITCOIND_EXE or bitcoind on PATH)
 scripts/regtest.sh start                     # local node with a funded faucet wallet
-cargo run -p btcw-cli -- --help              # the full command surface (bodies not implemented yet)
+cargo run -p btcw-cli -- --help              # the full command surface
 cd apps/desktop && npm run build             # frontend compiles
 ```
 
@@ -621,7 +621,8 @@ pub fn balance(cfg: &Config, ui: &Ui) -> Result<()> {
 | `sync` | watch-only | yes | `Node::connect`, `Node::sync` |
 | `balance`, `history`, `utxos` | watch-only | **no** | `balance` / `history` / `utxos` |
 | `mine N [--to]` | watch-only, only without `--to` | yes, regtest | `new_address`, `Node::mine` |
-| `send`, `status` | (Phase 2) | | |
+| `send` | **unlocked** (password) | yes | `api::unlock_wallet`, `tx::prepare_send`, `tx::sign_psbt`, `tx::broadcast_signed` (§7) |
+| `status <txid> [--watch]` | watch-only, reopened per poll | yes (falls back to the last sync) | `Node::sync`, `tx::tx_status` (§7) |
 
 Errors are never rewritten. The core's messages were written for people (§3, §4), so "wallet is open
 in another btcw process", "no wallet found in …; create or restore one first" and "mainnet is
@@ -634,8 +635,8 @@ new receive addresses need nothing secret. That's **watch-only** mode, `api::ope
 
 Spending is different: a transaction must be signed with private keys, and those come only from the
 recovery phrase, which lives encrypted in `seed.enc` (Argon2id + XChaCha20-Poly1305, §2). Decrypting
-it takes the password. So `send` (Phase 2) will call `api::unlock_wallet(cfg, &password)`, get a
-`Signer`, sign, and drop the signer as soon as the transaction is out. Day-to-day commands never ask
+it takes the password. So `send` calls `api::unlock_wallet(cfg, &password)`, gets a
+`Signer`, signs, and drops the signer as soon as the transaction is signed (§7). Day-to-day commands never ask
 for a password, which also means they never have the keys in memory.
 
 ### Reading secrets
@@ -734,7 +735,7 @@ $ btcw --json send --to bcrt1q… --amount 1000; echo "exit=$?"
 {
   "error": {
     "code": "cli",
-    "message": "`btcw send` is not implemented yet (Phase 2)"
+    "message": "--json needs --yes: a JSON run can't stop to ask for confirmation; review the payment without --json first"
   }
 }
 exit=1
@@ -858,7 +859,7 @@ variable removed, so a developer's own `eval "$(scripts/regtest.sh env)"` can't 
 - **Errors:** `wallet_not_found` before `create` (and no directory left behind), `mainnet_disabled`,
   testnet3 → `config`, a 7-character password → `weak_password` with nothing written, `wallet_exists`,
   an invalid phrase → `invalid_mnemonic` without echoing it, no terminal and no `BTCW_PASSWORD` → a
-  clear hint, usage errors → exit 2 (JSON with `--json`), `send`/`status` → "not implemented yet (Phase 2)".
+  clear hint, usage errors → exit 2 (JSON with `--json`). (`send`/`status` were stubs here; §7 covers them.)
 - **Secrets:** `create --json` puts nothing but `{network, birthday_height, first_address}` on
   stdout; the 12 words parsed back from stderr derive that same first address, and restoring them
   in a fresh datadir gives it again. `echo "abandon … about" | btcw restore` yields
