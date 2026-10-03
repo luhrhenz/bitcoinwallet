@@ -580,6 +580,15 @@ cargo test -p btcw-core --lib wallet           # receive offline + persist/reope
                                                # (the node test skips without bitcoind; set BITCOIND_EXE)
 ```
 
+### A BDK bug we work around: `first_seen` after a reopen
+Found by Agent F while building `status`: bdk_chain 0.23.3's `TxGraph::apply_changeset`, which
+`Wallet::load` uses, replays each transaction's `last_seen` but **drops its stored `first_seen`**.
+After a reopen an unconfirmed payment looked "first seen" at its *latest* mempool sighting. The
+value is still correct in SQLite (`bdk_txs.first_seen`), so `WalletService::open` reads it back
+and re-applies it as a sighting (`restore_first_seen`). BDK only ever moves `first_seen` earlier
+and `last_seen` later, so this restores the right value and changes nothing else. The regression
+test `first_seen_survives_reopen_after_later_sightings` failed before the fix and passes after.
+
 ## 5. Terminal app (CLI), Phase 1 / Agent D
 
 **What we built:** `btcw`, the terminal frontend. It has no wallet logic of its own: every command

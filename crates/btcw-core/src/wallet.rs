@@ -128,13 +128,14 @@ impl WalletService {
                 .descriptor(KeychainKind::External, Some(expected.external().to_owned()))
                 .descriptor(KeychainKind::Internal, Some(expected.internal().to_owned()));
         }
-        let wallet = match params.load_wallet(&mut db) {
+        let mut wallet = match params.load_wallet(&mut db) {
             Ok(Some(wallet)) => wallet,
             // The file exists but holds no wallet (e.g. an empty SQLite file).
             Ok(None) => return Err(WalletError::WalletNotFound(cfg.network_dir())),
             Err(e) => return Err(load_error(cfg.network, &db_path, e)),
         };
 
+        restore_first_seen(&mut wallet, &db)?;
         let birthday = read_birthday(&db)?;
         let backup_verified = read_meta(&db, BACKUP_KEY)?.as_deref() == Some("1");
         Ok(Self {
@@ -426,6 +427,41 @@ fn read_birthday(db: &Connection) -> Result<u32> {
             ))
         }),
     }
+}
+
+/// Workaround for bdk_chain 0.23.3: `TxGraph::apply_changeset` (which `Wallet::load` uses)
+/// replays `last_seen` but drops the stored `first_seen`, so after every reopen a transaction
+/// looks "first seen" at its latest mempool sighting. The column is still correct on disk, so
+/// read it back and feed it in as a sighting: BDK only ever *lowers* `first_seen` and never moves
+/// `last_seen` backwards, so this restores the original value and changes nothing else. (It
+/// stages the same values the database already holds; the next `persist` rewrites them as-is.)
+fn restore_first_seen(wallet: &mut PersistedWallet<Connection>, db: &Connection) -> Result<()> {
+    let mut statement = db
+        .prepare("SELECT txid, first_seen FROM bdk_txs WHERE first_seen IS NOT NULL")
+        .map_err(|e| persist_err("reading first-seen times", e))?;
+    let stored: Vec<(String, u64)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|rows| rows.collect())
+        .map_err(|e| persist_err("reading first-seen times", e))?;
+
+    let mut sightings = Vec::new();
+    for (txid, first_seen) in stored {
+        let Ok(txid) = txid.parse::<crate::bitcoin::Txid>() else {
+            continue; // Not something BDK wrote; nothing to repair.
+        };
+        if let Some(wtx) = wallet.get_tx(txid)
+            && wtx
+                .tx_node
+                .first_seen
+                .is_none_or(|current| first_seen < current)
+        {
+            sightings.push((wtx.tx_node.tx.clone(), first_seen));
+        }
+    }
+    if !sightings.is_empty() {
+        wallet.apply_unconfirmed_txs(sightings);
+    }
+    Ok(())
 }
 
 /// One `btcw_meta` value (`None` if the row is missing).
@@ -740,6 +776,42 @@ mod tests {
                 .last_revealed_index(KeychainKind::External),
             Some(1)
         );
+        Ok(())
+    }
+
+    /// bdk_chain 0.23.3's `TxGraph::apply_changeset` drops the stored `first_seen` when a wallet
+    /// is loaded and replays only `last_seen`, so without `restore_first_seen` an unconfirmed
+    /// payment would look "first seen" at its *latest* sighting after every reopen.
+    #[test]
+    fn first_seen_survives_reopen_after_later_sightings() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let cfg = regtest_config(dir.path())?;
+        let descriptors = descriptors()?;
+        let mut wallet = WalletService::create(&cfg, &descriptors, Some(0))?;
+        let address = wallet.new_address()?;
+        let funding = funding_tx(&address.address, 50_000)?;
+
+        let (first, later) = (1_700_000_000, 1_700_000_900);
+        wallet
+            .bdk_mut()
+            .apply_unconfirmed_txs([(funding.clone(), first)]);
+        // Seen again in the mempool on a later sync.
+        wallet.bdk_mut().apply_unconfirmed_txs([(funding, later)]);
+        let unconfirmed = |w: &WalletService| w.history().first().map(|row| row.status.clone());
+        let expected = Some(TxStatus::Unconfirmed {
+            first_seen: Some(first),
+        });
+        assert_eq!(unconfirmed(&wallet), expected);
+        wallet.persist()?;
+        drop(wallet);
+
+        let mut reopened = WalletService::open(&cfg, Some(&descriptors))?;
+        assert_eq!(unconfirmed(&reopened), expected);
+        // The repair only stages values the database already holds; persisting is harmless and
+        // the next reopen agrees.
+        reopened.persist()?;
+        drop(reopened);
+        assert_eq!(unconfirmed(&WalletService::open(&cfg, None)?), expected);
         Ok(())
     }
 
