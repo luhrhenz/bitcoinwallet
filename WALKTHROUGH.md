@@ -878,7 +878,166 @@ cargo test -p btcw-cli                                            # offline test
 BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-cli --test cli   # + the regtest round trip
 ```
 
-## 6. Desktop UI, Phase 1 / Agent E — _pending_
+## 6. Desktop UI, Phase 1 / Agent E
+
+**What we built:** every screen of the desktop app (PLAN §4.2) in React + TypeScript, plus an
+in-memory **mock backend** that behaves like the Rust side will. The UI holds no wallet logic: it
+asks the backend, shows the answer, and makes the dangerous moments (backup, sending) hard to get
+wrong. Nothing here touches keys; that stays in Rust (§2) behind the Tauri commands (§8).
+
+```text
+apps/desktop/src/
+├── lib/api.ts, types.ts   the contract with Rust (WalletApi + the serde shapes)
+├── lib/mock.ts            in-memory WalletApi for dev and tests (BIP39, bech32, coin selection)
+├── lib/amount.ts          sat ↔ BTC strings, integer math only
+├── lib/errors.ts          ApiError.code → plain words, the only place that does it
+├── state/wallet.tsx       shared state: info, balance, history, sync, lock/unlock, auto-lock
+├── screens/               Welcome, CreateWallet, RestoreWallet, Dashboard, Receive, Send,
+│                          TxDetail, History, Settings
+└── components/            network badge and tape, amounts, chunked addresses, unlock dialog, …
+```
+
+### One contract, two implementations
+Screens import `api` and nothing else. `api` is a `WalletApi`, an interface with one method per
+Tauri command, and every method returns a promise that either resolves with a `types.ts` shape or
+rejects with `ApiError { code, message }`, where `code` is `WalletError::code()` from §1:
+
+```ts
+export interface WalletApi {
+  createWallet(words: 12 | 24, password: string): Promise<{ mnemonic: string[] }>;
+  prepareSend(to: string, amountSat: number, feeRateSatVb: number | null): Promise<PreparedSend>;
+  confirmSend(id: string): Promise<{ txid: string }>;
+  // … unlock, lock, sync, balance, history, txStatus, settings
+}
+```
+
+There are two implementations. `tauriApi` calls `invoke("create_wallet", …)` and so on; Agent G
+writes the Rust side of those calls. `createMockApi()` keeps a fake node and wallet in memory.
+Because both satisfy the same interface, the whole UI was built and tested before a single Tauri
+command existed, and swapping in the real one changes no screen. `main.tsx` picks the mock for
+`npm run dev:mock`, or whenever the page isn't running inside Tauri (`window.__TAURI_INTERNALS__`
+is missing), and loads it with a dynamic `import()`, so the Tauri app never even downloads it. In
+demo mode a warning-colored "Demo mode: mock backend, not a real wallet" button sits on every screen.
+
+The mock is not a stub that returns canned values. It follows the core's rules so the UI meets every
+real error path: phrases are real BIP39 (word list and checksum, messages that name positions,
+never words), addresses are real bech32 for the network, `prepareSend` checks the prefix, dust
+(294 sat), funds and a locked wallet, and builds a P2WPKH fee preview (141 vB for 1 input and 2
+outputs). The wallet only learns about the chain by syncing: a payment appears after `sync`, and a
+mined block turns into confirmations after the next `sync` or `txStatus`. Tests drive it with
+`simulateIncoming(sat)`, `mineBlocks(n)` and `setNodeOnline(false)`.
+
+### The security rules, from the UI's side
+| Rule | How the UI keeps it |
+|---|---|
+| The phrase crosses into JS **once** | Only `createWallet` returns it. It lives in the create screen's state until the backup check passes, then `setMnemonic(null)`. It is never written to `localStorage`, a URL or a log; tests assert all three. The grid is `user-select: none` and has no copy button, because clipboard managers keep history. |
+| A typed phrase leaves quickly too | `restoreWallet` gets a normalized copy; the textarea is cleared right after. It has `autoComplete="off"`, `spellCheck={false}`, `autoCorrect`/`autoCapitalize="off"`, so neither the OS nor a browser extension learns the words. |
+| Passwords go straight to Rust | They're sent to `unlock`/`createWallet`/`restoreWallet` and the field is emptied. JS strings can't be wiped like `Zeroizing` buffers, so the UI keeps them short-lived instead. |
+| The PSBT stays in Rust | `prepareSend` returns a `SendPreview` and an opaque `id`; `confirmSend(id)` signs and broadcasts on the Rust side. The UI never sees the transaction, so it can't alter it. |
+| Watch-only by default | The dashboard, history and receive screens work while locked. Only sending asks for the password, in a dialog, at the moment it's needed. |
+
+### Backup: show once, then check
+The create flow is three numbered steps, because the order matters: **password → write down → check**.
+The words stay hidden until "Show the 12 words" ("make sure nobody can see your screen"), next to
+the warning the CLI prints (§5): anyone with these words can take the coins; paper, not screenshots;
+btcw never shows them again. "Continue" stays disabled until the user ticks "I've written all 12
+words down". Then the check asks for three random positions (`crypto.getRandomValues`), compared
+case- and space-insensitively. A wrong word keeps the user there, with a way back to the words.
+Only a correct check finishes the flow and drops the phrase. Without the check, the classic failure
+is a backup with a missing or swapped word, found years later when it's needed.
+
+### Sending: the full address, in groups of four
+The preview shows everything the user is about to sign: amount, fee (sat, sat/vB and vsize),
+change, and the total leaving the wallet. The recipient is shown **in full**, never shortened, split
+into groups of four:
+
+```text
+SENDING TO   tb1q w508 d6qe jxtd g4y5 r3za rvar y0c5 xw7k xpjz sx
+```
+
+Clipboard-swapping malware replaces a copied address with the attacker's own, usually one that
+starts and ends like the real one. A shortened `tb1qw5…pjzsx` would hide exactly the part that
+changed; groups of four can be ticked off one by one against the recipient's screen or paper, like
+a hardware wallet's display. (The gaps are CSS margins, so copying the text still gives the exact
+address.) Fees above 10% of the amount or above 100 sat/vB get a warning, and mainnet says "This
+sends real bitcoin". Cancel calls `cancelSend` so Rust releases the change address; leaving the
+screen or an auto-lock with a preview open does the same, and nothing is sent until "Send … BTC".
+
+After confirming, the transaction screen polls `txStatus` every 10 s while it's open (the interval
+is cleared on unmount; a test checks it) and draws confirmations as six little blocks filling up:
+"unconfirmed · waiting in the mempool" → "Confirmed · 1 confirmation" → … → treated as final at six.
+
+### Amounts are integers
+Every amount the backend sends is satoshis. BTC strings are built and parsed with integers, the
+same way the CLI's `output::btc` does it:
+
+```ts
+formatBtc(1_000_000)   // "0.01000000": Math.floor(sat / 1e8) + "." + (sat % 1e8) padded to 8
+parseBtc("4.35")       // 435_000_000 sat, digit by digit with BigInt (4.35 * 1e8 is 434999999.99999994)
+parseBtc("0,001")      // error: "Use a dot for decimals"; in many countries that comma is a decimal point
+```
+
+`parseBtc` accepts at most 8 decimals and at most 21 million BTC; `parseSat` accepts whole numbers,
+with `,`/`_`/space only as proper thousands groups. The send form has a BTC/sat toggle that converts
+exactly (`0.29` ↔ `29000000`). Displays keep all 8 decimals but dim the trailing zeros
+(`0.0125`**`0000`**), so magnitudes are easy to read without hiding a digit.
+
+### The network, everywhere
+Every screen has the network twice: a badge in the top bar (orange `TESTNET4`, violet `SIGNET`,
+teal `REGTEST`, red `MAINNET`) and a tape down the left edge of the window in the same color, with
+the network name running down it, hatched for test networks and solid for mainnet. The tape is
+the one bold element in an otherwise quiet design, and it never scrolls away. Mainnet, if a build
+ever offers it, also gets a red banner, and switching to it in Settings needs `MAINNET` typed in. Switching
+networks explains what happens: each network has its own wallet in its own folder; the current one
+stays untouched, and a network without a wallet opens at Welcome.
+
+### Auto-lock
+`useAutoLock` runs only while the wallet is unlocked. Any key, click, pointer move or scroll
+restarts a countdown of `auto_lock_minutes`; when it runs out, the UI calls `api.lock()` (Rust drops
+the signer), refreshes `appInfo`, and says "Locked after 5 minutes without activity. Viewing still
+works; sending needs your password." Any open send preview is discarded at the same moment.
+
+### Errors in one place
+`lib/errors.ts` maps every `WalletError` code to a sentence that says what happened and what to do:
+`rpc` → "Can't reach your Bitcoin node. Check that bitcoind is running and that the node settings are
+right.", `wallet_in_use` → "open in another btcw window or terminal", `network_mismatch` → "On
+testnet4, addresses start with tb1." Where the core's own message adds facts (amounts, a word
+position, the node's reason) it's shown underneath, first line only. Stack traces never are.
+
+### What the Rust side (Agent G) has to match
+- `AppInfo.synced_height: number | null` (added to `types.ts`): `WalletService::synced_height()`, or
+  `null` with no wallet. It's how the dashboard says "as of block N" even when the node is down.
+- A locked wallet: `prepare_send` / `confirm_send` reject with code `"locked"` (not a `WalletError`
+  code; the UI then asks for the password).
+- `tx_status` should sync before reading (as `tx::tx_status`'s doc says), or the open transaction
+  screen never sees new confirmations.
+- `sync` emits `sync-progress` events (`{height, tip_height}`), as `api.ts` already listens for.
+
+### Testing
+Vitest + Testing Library against the mock with zero latency; fake timers for time.
+- **Amounts:** formatting identical to the CLI's tests; `0.1 + 0.2`, `4.35`, `1.15` exact; 8-decimal and
+  21M limits; commas, exponents, signs rejected; the unit toggle round-trips.
+- **Create:** the words appear once; "Continue" needs the checkbox; a wrong word blocks; the right
+  ones (any case) finish; afterwards no word is on screen, in storage or in the URL. Short and
+  mismatched passwords are caught before the backend is called.
+- **Unlock and auto-lock:** wrong password → "That password is not correct"; Escape cancels;
+  activity postpones the lock; idle time triggers exactly one `lock()`.
+- **Send:** wrong network, invalid address, dust and insufficient funds land on the right field;
+  locked → password first; preview → confirm → "Unconfirmed" → mine → "1 confirmation" → "2";
+  cancel calls `cancelSend`; polling stops when the screen closes; locking discards a preview.
+- **Everywhere:** the badge on every screen and on Welcome; restore with progress; settings
+  validation and network switching; a failed startup shows words and a retry, not a trace.
+- **The mock itself:** SHA-256, BIP39 and BIP173 test vectors, coin selection, fee math.
+
+### Try it
+```bash
+cd apps/desktop
+npm ci
+npm run dev:mock        # http://localhost:1420, in-memory backend; open "Demo mode" for test coins
+npm test                # 56 tests
+npm run typecheck && npx vite build
+```
+
 ## 7. Sending and status, Phase 2 / Agent F — _pending_
 ## 8. Tauri bridge, Phase 2 / Agent G — _pending_
 ## 9. End-to-end tests, Phase 2 / Agent H — _pending_

@@ -71,6 +71,12 @@ export interface AppInfo {
   wallet_exists: boolean;
   /** True when a signer is loaded (password entered). Watch-only views work without it. */
   unlocked: boolean;
+  /**
+   * Height the wallet is synced to (`WalletService::synced_height`, 0 before the first sync),
+   * or null when there is no wallet. Lets the dashboard say "as of block N" before, or
+   * without, a successful sync (the CLI's `as_of`).
+   */
+  synced_height: number | null;
 }
 
 export interface Settings {
