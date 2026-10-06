@@ -1274,10 +1274,7 @@ fn contacts_labels_and_speed_up_against_a_regtest_node() {
     assert_eq!(prepared.preview.to, alice);
     assert_eq!(prepared.preview.contact.as_deref(), Some("Alice"));
     assert_eq!(prepared.preview.replaces, None);
-    assert_eq!(
-        prepared.preview.fee_sat, 281,
-        "PLAN-v2 §2: 141 vB at 2 sat/vB"
-    );
+    assert_eq!(prepared.preview.fee_sat, 281, "141 vB at 2 sat/vB");
     let original = confirm_send(state, &prepared.id).unwrap().txid;
     assert_eq!(node.call("getrawmempool", &[]).unwrap(), json!([original]));
 
@@ -1322,7 +1319,7 @@ fn contacts_labels_and_speed_up_against_a_regtest_node() {
     assert_eq!(preview.replaces.as_deref(), Some(original.as_str()));
     assert_eq!(preview.to, alice);
     assert_eq!(preview.amount_sat, 100_000);
-    assert_eq!(preview.fee_sat, 703, "PLAN-v2 §2: 141 vB at 5 sat/vB");
+    assert_eq!(preview.fee_sat, 703, "141 vB at 5 sat/vB");
     assert_eq!(
         preview.change_sat,
         prepared.preview.change_sat.map(|c| c - 422)

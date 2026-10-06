@@ -426,7 +426,7 @@ mod tests {
             "opening the wallet: wallet is open in another btcw process"
         );
 
-        let plain = anyhow::anyhow!("not implemented yet (Phase 2)");
+        let plain = anyhow::anyhow!("not implemented yet");
         assert_eq!(error_code(&plain), CLI_ERROR_CODE);
         Ok(())
     }
