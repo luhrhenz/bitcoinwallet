@@ -466,7 +466,7 @@ fn provider_errors_are_friendly_and_never_contain_the_key() {
         assert_eq!(err.code, provider::KEY);
         assert!(
             err.message
-                .contains("add your Groq API key in Settings → Assistant")
+                .contains("set GROQ_API_KEY in the project's .env file")
         );
         fx.state
             .settings_guard()

@@ -45,6 +45,7 @@ const PATHS = {
       <path d="M8 8h.01" />
     </>
   ),
+  chat: <path d="M5 5h14a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-8l-5 4v-4H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z" />,
   bolt: <path d="M13 3 5 13.5h6L10 21l8-10.5h-6L13 3Z" />,
 } as const;
 

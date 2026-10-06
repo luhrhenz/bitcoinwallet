@@ -96,6 +96,11 @@ impl AppState {
         Self::new(datadir, Box::new(env), Arc::new(SystemClock))
     }
 
+    /// An environment variable, through the same (test-injectable) lookup as the config.
+    pub fn env_var(&self, key: &str) -> Option<String> {
+        (self.env)(key)
+    }
+
     pub fn datadir(&self) -> &Path {
         &self.datadir
     }

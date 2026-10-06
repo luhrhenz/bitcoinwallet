@@ -104,6 +104,16 @@ btcw --network testnet4 sync
 
 Free testnet4 coins: e.g. <https://mempool.space/testnet4/faucet>.
 
+## Local settings: `.env`
+
+Copy `.env.example` to `.env` in the project folder and fill in your values. Both the CLI and the
+desktop app read it at startup; real environment variables take precedence. `.env` is ignored by
+git, so your node URL and keys stay on your machine.
+
+```bash
+cp .env.example .env    # then edit: BTCW_RPC_URL, GROQ_API_KEY
+```
+
 ## Configuration
 
 Precedence: command-line flag › environment variable › `<datadir>/btcw.toml` › default.

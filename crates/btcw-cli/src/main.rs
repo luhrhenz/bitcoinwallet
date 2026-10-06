@@ -238,6 +238,8 @@ enum AddressCmd {
 }
 
 fn main() -> ExitCode {
+    // Settings from the project's `.env` (never committed); real environment variables win.
+    let _ = dotenvy::dotenv();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return output::usage_error(&e),

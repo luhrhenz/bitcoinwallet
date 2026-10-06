@@ -792,7 +792,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       throw fail("assistant_off", "the assistant is off; turn it on in Settings → Assistant");
     }
     const label = assistant.provider === "custom" ? "your provider" : PRESETS[assistant.provider].label.replace("Google ", "");
-    if (assistantKey === null) throw fail("assistant_key", `add your ${label} API key in Settings → Assistant`);
+    if (assistantKey === null) throw fail("assistant_key", "no Groq API key: set GROQ_API_KEY in the project's .env file");
     if (assistantKey === "invalid") throw fail("assistant_key", `the ${label} API key was refused; check it in Settings → Assistant`);
     if (assistantKey === "ratelimited") {
       throw fail("assistant_rate_limit", `${label} is rate limiting this key (free tier); wait a minute and try again`);

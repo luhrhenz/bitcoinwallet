@@ -15,6 +15,7 @@ path = "src/main.rs"
 mainnet = ["btcw-core/mainnet"]
 
 [dependencies]
+dotenvy.workspace = true
 btcw-core = { path = "../btcw-core" }
 anyhow.workspace = true
 clap.workspace = true

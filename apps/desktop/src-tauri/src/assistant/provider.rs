@@ -53,7 +53,7 @@ impl Provider<'_> {
                 return Err(error(
                     KEY,
                     format!(
-                        "the {} API key was refused; check it in Settings → Assistant",
+                        "the {} API key was refused; check GROQ_API_KEY in the project's .env file",
                         self.label
                     ),
                 ));

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "./lib/api";
 import type { MockControls } from "./lib/mock";
 import type { AppInfo, Settings } from "./lib/types";
-import type { Route } from "./state/nav";
+import type { Go, Route } from "./state/nav";
 import { useWallet, WalletProvider } from "./state/wallet";
 import { ErrorNotice } from "./components/ErrorNotice";
 import { Frame } from "./components/Frame";
@@ -116,7 +116,6 @@ const NAV: { name: "dashboard" | "receive" | "send" | "history" | "contacts" | "
   { name: "send", label: "Send" },
   { name: "history", label: "History" },
   { name: "contacts", label: "Contacts" },
-  { name: "assistant", label: "Assistant" },
   { name: "settings", label: "Settings" },
 ];
 
@@ -169,10 +168,47 @@ function Main() {
       {route.name === "send" && <Send go={go} initialTo={route.to} />}
       {route.name === "history" && <History go={go} />}
       {route.name === "contacts" && <Contacts go={go} />}
-      {route.name === "assistant" && <Assistant go={go} />}
+      <AssistantLauncher go={go} />
       {route.name === "settings" && <SettingsScreen />}
       {route.name === "tx" && <TxDetail key={route.txid} txid={route.txid} sent={route.sent} go={go} />}
     </Frame>
+  );
+}
+
+/** The assistant: a floating chat button on every screen that opens a side panel. */
+function AssistantLauncher({ go }: { go: Go }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+  return (
+    <>
+      {open && (
+        <aside className="assistant-panel" aria-label="Assistant">
+          <button type="button" className="assistant-panel__close btn btn--quiet" onClick={() => setOpen(false)} aria-label="Close assistant">
+            <Icon name="close" />
+          </button>
+          <Assistant
+            go={(next) => {
+              setOpen(false);
+              go(next);
+            }}
+          />
+        </aside>
+      )}
+      <button
+        type="button"
+        className="assistant-fab"
+        aria-label={open ? "Close assistant" : "Open assistant"}
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <Icon name={open ? "close" : "chat"} size={24} />
+      </button>
+    </>
   );
 }
 

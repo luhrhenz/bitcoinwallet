@@ -23,7 +23,7 @@ async function openAssistant(options: { unlocked?: boolean; enabled?: boolean; k
     if (options.enabled ?? true) await enableAssistant(mock, options.key === undefined ? KEY : options.key);
   });
   await waitForDashboard();
-  nav("Assistant");
+  fireEvent.click(screen.getByRole("button", { name: "Open assistant" }));
   await screen.findByRole("heading", { name: "Assistant" });
   return rendered;
 }
@@ -37,7 +37,7 @@ describe("assistant screen", () => {
   it("is off until set up, and points to Settings", async () => {
     await openAssistant({ enabled: false });
     expect(screen.getByText("The assistant is off.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Set up the assistant" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn it on in Settings" }));
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(screen.getByRole("form", { name: "Assistant" })).toBeInTheDocument();
   });
@@ -54,9 +54,9 @@ describe("assistant screen", () => {
 
   it("shows a missing key as a friendly error", async () => {
     await openAssistant({ key: null });
-    expect(screen.getByText("Add your Groq API key in Settings → Assistant.")).toBeInTheDocument();
+    expect(screen.getByText(/set GROQ_API_KEY in the project's \.env file/)).toBeInTheDocument();
     ask("balance");
-    expect(await screen.findByRole("alert")).toHaveTextContent("Add your Groq API key in Settings → Assistant.");
+    expect(await screen.findByRole("alert")).toHaveTextContent(/GROQ_API_KEY/);
     // The text stays, to send again.
     expect(screen.getByLabelText("Message")).toHaveValue("balance");
   });
@@ -127,7 +127,7 @@ describe("assistant settings", () => {
     await waitForDashboard();
     nav("Settings");
     const form = await screen.findByRole("form", { name: "Assistant" });
-    await within(form).findByLabelText("API key");
+    await within(form).findByLabelText("Turn on the assistant");
     return { ...rendered, form: within(form) };
   }
 
@@ -148,33 +148,10 @@ describe("assistant settings", () => {
     expect(form.queryByRole("note", { name: "Data notice" })).not.toBeInTheDocument();
   });
 
-  it("keeps the API key write-only", async () => {
-    const { mock, form } = await openSettings();
-    type(form.getByLabelText("API key"), KEY);
-    fireEvent.click(form.getByRole("button", { name: "Save assistant settings" }));
-    await screen.findByText("Assistant settings saved.");
-    // The field empties and the key never comes back from the backend.
-    expect(form.getByLabelText("API key")).toHaveValue("");
-    expect(form.getByLabelText("API key")).toHaveAttribute("type", "password");
-    expect(form.getByText("A key is saved.")).toBeInTheDocument();
-    const view = await mock.getAssistantSettings();
-    expect(JSON.stringify(view)).not.toContain(KEY);
-    expect(view.has_api_key).toBe(true);
-    expect(document.body.innerHTML).not.toContain(KEY);
-
-    fireEvent.click(form.getByRole("button", { name: "Remove key" }));
-    await screen.findByText("API key removed.");
-    expect((await mock.getAssistantSettings()).has_api_key).toBe(false);
-  });
-
-  it("fills the preset's URL and model, and refuses plain http", async () => {
+  it("has no provider or API key fields", async () => {
     const { form } = await openSettings();
-    fireEvent.click(form.getByLabelText("Google Gemini"));
-    expect(form.getByLabelText("Provider URL")).toHaveValue("https://generativelanguage.googleapis.com/v1beta/openai");
-    expect(form.getByLabelText("Model")).toHaveValue("gemini-2.5-flash");
-    fireEvent.click(form.getByLabelText("Custom"));
-    type(form.getByLabelText("Provider URL"), "http://llm.example.com/v1");
-    fireEvent.click(form.getByRole("button", { name: "Save assistant settings" }));
-    expect(await form.findByRole("alert")).toHaveTextContent("https://");
+    expect(form.queryByLabelText("API key")).not.toBeInTheDocument();
+    expect(form.queryByLabelText("Provider URL")).not.toBeInTheDocument();
+    expect(form.queryByLabelText("Google Gemini")).not.toBeInTheDocument();
   });
 });

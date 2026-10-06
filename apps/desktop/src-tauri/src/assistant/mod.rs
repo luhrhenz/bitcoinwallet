@@ -115,7 +115,15 @@ impl Assistant {
 // ── Commands ────────────────────────────────────────────────────────────────────────────────
 
 pub fn get_settings(state: &AppState) -> ApiResult<AssistantSettings> {
-    Ok(stored(state).view())
+    Ok(with_env_key(state, stored(state).view()))
+}
+
+/// A key from `GROQ_API_KEY` counts as set (its value still never reaches the UI).
+fn with_env_key(state: &AppState, mut view: AssistantSettings) -> AssistantSettings {
+    view.has_api_key |= state
+        .env_var("GROQ_API_KEY")
+        .is_some_and(|k| !k.trim().is_empty());
+    view
 }
 
 /// Validate and save; the key is kept unless a new one is given (or cleared).
@@ -135,7 +143,7 @@ pub fn set_settings(
     if !updated.enabled || updated.base_url != before.base_url || updated.model != before.model {
         clear(state);
     }
-    Ok(updated.view())
+    Ok(with_env_key(state, updated.view()))
 }
 
 /// The chat so far (empty after a lock or network switch).
@@ -160,13 +168,15 @@ pub fn send(state: &AppState, text: &str) -> ApiResult<ChatItem> {
             message: "the assistant is off; turn it on in Settings → Assistant".into(),
         });
     }
-    let Some(api_key) = settings.api_key.clone() else {
+    // A key saved in settings wins; otherwise `GROQ_API_KEY` from the environment (or `.env`).
+    let Some(api_key) = settings.api_key.clone().or_else(|| {
+        state
+            .env_var("GROQ_API_KEY")
+            .filter(|k| !k.trim().is_empty())
+    }) else {
         return Err(ApiError {
             code: provider::KEY,
-            message: format!(
-                "add your {} API key in Settings → Assistant",
-                settings.provider_label()
-            ),
+            message: "no Groq API key: set GROQ_API_KEY in the project's .env file".into(),
         });
     };
     let text = text.trim();

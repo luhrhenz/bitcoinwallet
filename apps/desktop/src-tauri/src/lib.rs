@@ -34,6 +34,8 @@ const MAIN_WINDOW: &str = "main";
 
 /// Start the app. Logs go to stderr (`RUST_LOG`, default `warn`) and never contain secrets.
 pub fn run() {
+    // Settings from the project's `.env` (never committed); real environment variables win.
+    let _ = dotenvy::dotenv();
     init_logging();
     let state = Arc::new(AppState::from_process_env());
     tracing::info!(datadir = %state.datadir().display(), "starting btcw");

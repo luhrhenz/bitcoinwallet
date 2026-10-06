@@ -25,6 +25,7 @@ mainnet = ["btcw-core/mainnet"]
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
+dotenvy.workspace = true
 btcw-core = { path = "../../../crates/btcw-core" }
 dirs.workspace = true
 # Same minor version as @tauri-apps/api and @tauri-apps/cli in package.json (the CLI checks).

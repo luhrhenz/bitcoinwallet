@@ -484,6 +484,7 @@ dependencies = [
  "btcw-core",
  "clap",
  "comfy-table",
+ "dotenvy",
  "indicatif",
  "owo-colors",
  "rpassword",
@@ -526,6 +527,7 @@ version = "0.1.0"
 dependencies = [
  "btcw-core",
  "dirs 6.0.0",
+ "dotenvy",
  "getrandom 0.3.4",
  "minreq",
  "secrecy",

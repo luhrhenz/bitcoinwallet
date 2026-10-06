@@ -198,13 +198,13 @@ export function Assistant({ go }: { go: Go }) {
         <section className="panel stack">
           <p>The assistant is off.</p>
           <p className="muted small">
-            It uses a cloud AI provider you choose (Groq or Google Gemini have free keys). Turning it on sends your
+            It runs on Groq&apos;s cloud. Turning it on sends your
             balance, history, addresses and contact names to that provider. Your keys, recovery phrase and password never
             leave this computer, and only you can confirm a payment.
           </p>
           <div className="actions actions--start">
             <button type="button" className="btn btn--primary" onClick={() => go({ name: "settings" })}>
-              Set up the assistant
+              Turn it on in Settings
             </button>
           </div>
         </section>
@@ -222,12 +222,7 @@ export function Assistant({ go }: { go: Go }) {
         <div className="notice notice--warning" role="note">
           <Icon name="alert" className="notice__icon" />
           <div className="notice__body">
-            <p className="notice__title">Add your {providerLabel} API key in Settings → Assistant.</p>
-            <div className="notice__actions">
-              <button type="button" className="btn btn--quiet" onClick={() => go({ name: "settings" })}>
-                Open Settings
-              </button>
-            </div>
+            <p className="notice__title">No Groq API key: set GROQ_API_KEY in the project&apos;s .env file and restart.</p>
           </div>
         </div>
       )}
