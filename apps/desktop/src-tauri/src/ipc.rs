@@ -13,6 +13,8 @@ use secrecy::SecretString;
 use tauri::{AppHandle, Emitter as _, State};
 
 use crate::SYNC_PROGRESS_EVENT;
+use crate::assistant::settings::{AssistantSettings, AssistantSettingsUpdate};
+use crate::assistant::{self, ChatItem};
 use crate::commands::{self, AppInfo, MnemonicReply, PreparedSend, SentTx};
 use crate::error::{ApiError, ApiResult};
 use crate::settings::Settings;
@@ -265,6 +267,41 @@ pub async fn verify_backup(
 pub async fn reveal_phrase(state: Shared<'_>, password: SecretString) -> ApiResult<MnemonicReply> {
     blocking("reveal_phrase", &state, move |s| {
         commands::reveal_phrase(s, &password)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_assistant_settings(state: Shared<'_>) -> ApiResult<AssistantSettings> {
+    blocking("get_assistant_settings", &state, assistant::get_settings).await
+}
+
+#[tauri::command]
+pub async fn set_assistant_settings(
+    state: Shared<'_>,
+    settings: AssistantSettingsUpdate,
+) -> ApiResult<AssistantSettings> {
+    blocking("set_assistant_settings", &state, move |s| {
+        assistant::set_settings(s, &settings)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn assistant_send(state: Shared<'_>, text: String) -> ApiResult<ChatItem> {
+    blocking("assistant_send", &state, move |s| assistant::send(s, &text)).await
+}
+
+#[tauri::command]
+pub async fn assistant_history(state: Shared<'_>) -> ApiResult<Vec<ChatItem>> {
+    blocking("assistant_history", &state, assistant::history).await
+}
+
+#[tauri::command]
+pub async fn assistant_clear(state: Shared<'_>) -> ApiResult<()> {
+    blocking("assistant_clear", &state, |s| {
+        assistant::clear(s);
+        Ok(())
     })
     .await
 }

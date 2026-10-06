@@ -53,7 +53,17 @@ pub struct WalletService {
     /// stale.
     labels: HashMap<Txid, String>,
     /// Declared last so the lock is released only after the database connection closes.
-    _lock: File,
+    _lock: WalletLock,
+}
+
+/// The lock file, unlocked explicitly on drop: a child process spawned elsewhere in this
+/// process may still share the open file and would otherwise keep the lock until it execs.
+struct WalletLock(File);
+
+impl Drop for WalletLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl std::fmt::Debug for WalletService {
@@ -370,7 +380,7 @@ impl WalletService {
 /// Take the per-network lock, creating the directory and lock file if needed.
 ///
 /// The lock file is never deleted: that would let two processes lock two different inodes.
-fn acquire_lock(cfg: &Config) -> Result<File> {
+fn acquire_lock(cfg: &Config) -> Result<WalletLock> {
     let dir = cfg.network_dir();
     std::fs::create_dir_all(&dir).map_err(|e| io_err("creating", &dir, e))?;
     let path = cfg.lock_path();
@@ -383,7 +393,7 @@ fn acquire_lock(cfg: &Config) -> Result<File> {
         .open(&path)
         .map_err(|e| io_err("opening lock file", &path, e))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(WalletLock(file)),
         Err(TryLockError::WouldBlock) => Err(WalletError::WalletInUse),
         Err(TryLockError::Error(e)) => Err(io_err("locking", &path, e)),
     }

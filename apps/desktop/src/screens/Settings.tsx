@@ -2,6 +2,7 @@ import { useId, useState, type FormEvent } from "react";
 import { NETWORKS } from "../lib/network";
 import type { AppInfo, NetworkName, Settings } from "../lib/types";
 import { useWallet } from "../state/wallet";
+import { AssistantSettingsPanel } from "../components/AssistantSettings";
 import { ErrorNotice } from "../components/ErrorNotice";
 import { Field, NO_ASSIST } from "../components/Field";
 import { ScreenHeader } from "../components/Frame";
@@ -222,6 +223,7 @@ export function SettingsScreen({
         </div>
       </form>
       {!onboarding && info.wallet_exists && <RecoveryPhrasePanel />}
+      {!onboarding && <AssistantSettingsPanel />}
     </div>
   );
 }

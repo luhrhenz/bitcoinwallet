@@ -610,7 +610,7 @@ pub fn get_settings(state: &AppState) -> ApiResult<Settings> {
 /// to the old network's wallet.
 pub fn set_settings(state: &AppState, next: &Settings) -> ApiResult<()> {
     state.touch(Activity::User);
-    let (stored, network) = settings::validate(next)?;
+    let (mut stored, network) = settings::validate(next)?;
     // The whole configuration must still resolve, or every later command would fail.
     let cfg = state.config_with(&stored)?;
     if cfg.network != network {
@@ -619,6 +619,8 @@ pub fn set_settings(state: &AppState, next: &Settings) -> ApiResult<()> {
         ));
     }
     let mut current = state.settings_guard();
+    // The assistant has its own command; keep what it saved.
+    stored.assistant = current.assistant.clone();
     let previous = state.config_with(&current).map(|c| c.network).ok();
     settings::save(&state.settings_path(), &stored)?;
     *current = stored;

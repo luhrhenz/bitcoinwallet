@@ -2068,3 +2068,61 @@ fieldset.panel {
     transition: none !important;
   }
 }
+
+/* Assistant chat */
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.chat__msg {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 100%;
+}
+
+.chat__msg--user {
+  align-items: flex-end;
+}
+
+.chat__bubble {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: min(640px, 100%);
+}
+
+.chat__msg--user .chat__bubble {
+  background: var(--accent-soft);
+}
+
+.chat__tools,
+.chat__closed,
+.chat__thinking,
+.chat__empty {
+  margin: 0;
+}
+
+.chat__form {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.chat__input {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 520px) {
+  .chat__form {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

@@ -15,7 +15,10 @@ import type {
   AddressRow,
   ApiError,
   AppInfo,
+  AssistantCard,
+  AssistantSettings,
   BalanceView,
+  ChatItem,
   Contact,
   Keychain,
   NetworkName,
@@ -28,6 +31,7 @@ import type {
   UtxoRow,
 } from "./types";
 import { DUST_LIMIT_SAT, formatBtc } from "./amount";
+import { DEFAULT_ASSISTANT, PRESETS } from "./assistant";
 import { BIP39_ENGLISH } from "./mock-wordlist";
 
 export interface MockOptions {
@@ -776,6 +780,94 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     });
   }
 
+  // --- scripted assistant ------------------------------------------------------------------
+  // No model: a few phrases map to the same tools the real one has. It never sends.
+
+  let assistant: AssistantSettings = { ...DEFAULT_ASSISTANT };
+  let assistantKey: string | null = null;
+  let chat: ChatItem[] = [];
+
+  function assistantReply(text: string): ChatItem {
+    if (!assistant.enabled || !assistant.consented) {
+      throw fail("assistant_off", "the assistant is off; turn it on in Settings → Assistant");
+    }
+    const label = assistant.provider === "custom" ? "your provider" : PRESETS[assistant.provider].label.replace("Google ", "");
+    if (assistantKey === null) throw fail("assistant_key", `add your ${label} API key in Settings → Assistant`);
+    if (assistantKey === "invalid") throw fail("assistant_key", `the ${label} API key was refused; check it in Settings → Assistant`);
+    if (assistantKey === "ratelimited") {
+      throw fail("assistant_rate_limit", `${label} is rate limiting this key (free tier); wait a minute and try again`);
+    }
+    const { chain, wallet } = requireWallet();
+    const tools: string[] = [];
+    const cards: AssistantCard[] = [];
+    const lower = text.toLowerCase();
+    const reply = (answer: string): ChatItem => ({ role: "assistant", text: answer, cards, tools });
+
+    const pay = /(?:pay|send)\s+([\d_,]+)\s*sat(?:s)?\s+to\s+(.+?)\s*$/i.exec(text);
+    if (pay) {
+      tools.push("prepare_payment");
+      const amount = Number((pay[1] ?? "").replace(/[_,]/g, ""));
+      const to = pay[2] ?? "";
+      if (!wallet.unlocked) {
+        cards.push({ kind: "needs_unlock", request: { action: "payment", to, amount_sat: amount, fee_rate_sat_vb: null } });
+        return reply("The wallet is locked. Unlock it to review this payment.");
+      }
+      try {
+        const prepared = prepare(to, amount, null);
+        cards.push({ kind: "payment", id: prepared.id, preview: prepared.preview });
+        return reply("Here is the payment. Check the address and amounts, then confirm it yourself.");
+      } catch (e) {
+        return reply(`I couldn't prepare that: ${(e as ApiError).message}.`);
+      }
+    }
+    const bump = /(?:speed up|bump)\s+([0-9a-f]{64})/i.exec(text);
+    if (bump) {
+      const txid = bump[1] ?? "";
+      tools.push("prepare_fee_bump");
+      if (!wallet.unlocked) {
+        cards.push({ kind: "needs_unlock", request: { action: "fee_bump", txid, fee_rate_sat_vb: null } });
+        return reply("The wallet is locked. Unlock it to review the faster version.");
+      }
+      try {
+        const prepared = prepareBump(txid, null);
+        cards.push({ kind: "fee_bump", id: prepared.id, preview: prepared.preview });
+        return reply("Here is the faster replacement. Confirm it if it looks right.");
+      } catch (e) {
+        return reply(`I couldn't speed that up: ${(e as ApiError).message}.`);
+      }
+    }
+    if (/balance|how much/.test(lower)) {
+      tools.push("get_balance");
+      const b = balanceOf(chain, wallet);
+      return reply(`You have ${formatBtc(b.total_sat)} BTC (${b.total_sat} sat), ${b.unconfirmed_sat} sat of it unconfirmed.`);
+    }
+    if (/history|transactions|recent/.test(lower)) {
+      tools.push("list_transactions");
+      const rows = historyOf(chain, wallet).slice(0, 5);
+      if (rows.length === 0) return reply("There are no transactions yet.");
+      const lines = rows.map((r) => `${r.net_sat > 0 ? "+" : ""}${r.net_sat} sat${r.label ? ` (${r.label})` : ""}`);
+      return reply(`Your latest transactions: ${lines.join("; ")}.`);
+    }
+    if (/address|receive/.test(lower)) {
+      tools.push("new_receive_address");
+      const index = nextUnusedIndex(chain, wallet);
+      wallet.revealed.external = Math.max(wallet.revealed.external, index + 1);
+      return reply(`You can receive at ${addressOf(chain, wallet, "external", index)}.`);
+    }
+    if (/contact/.test(lower)) {
+      tools.push("list_contacts");
+      return reply(
+        wallet.contacts.length === 0 ? "You have no contacts yet." : `Your contacts: ${wallet.contacts.map((c) => c.name).join(", ")}.`,
+      );
+    }
+    if (/fee/.test(lower)) {
+      tools.push("estimate_fee");
+      requireNode();
+      return reply(`The node suggests about ${defaultFeeRate} sat/vB right now.`);
+    }
+    return reply('I can tell you your balance, recent transactions, a receive address, your contacts or the fee rate, and prepare a payment ("pay 5000 sat to Alice") for you to confirm.');
+  }
+
   async function answer<T>(fn: () => T, extraMs = 0): Promise<T> {
     await delay(latency + extraMs);
     return clone(fn());
@@ -865,8 +957,9 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       answer(() => {
         const chain = active();
         if (chain.wallet) chain.wallet.unlocked = false;
-        // Locking drops the prepared payment with the keys.
+        // Locking drops the prepared payment with the keys, and the assistant's chat.
         for (const [id, entry] of pending) if (entry.network === chain.network) release(id);
+        chat = [];
       }),
 
     keepAlive: () => answer(() => undefined),
@@ -1038,6 +1131,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
           const old = active();
           if (old.wallet) old.wallet.unlocked = false;
           for (const [id, entry] of pending) if (entry.network === old.network) release(id);
+          chat = [];
         }
         settings = clone(next);
       }),
@@ -1080,6 +1174,46 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         checkPassword(wallet, password);
         return { mnemonic: [...wallet.words] };
       }, latency * 3),
+
+    getAssistantSettings: () => answer(() => assistant),
+
+    setAssistantSettings: (next) =>
+      answer(() => {
+        if (!next.base_url.trim().toLowerCase().startsWith("https://") || /\s/.test(next.base_url.trim())) {
+          throw fail("config", "configuration error: the provider URL must be a full https:// URL, like https://api.groq.com/openai/v1");
+        }
+        if (next.model.trim() === "") throw fail("config", "configuration error: enter the model name your provider lists");
+        const consented = assistant.consented || next.consent;
+        if (next.enabled && !consented) {
+          throw fail("config", "configuration error: turning the assistant on needs your agreement to send wallet data to the provider");
+        }
+        if (next.clear_api_key) assistantKey = null;
+        else if (next.api_key !== null && next.api_key.trim() !== "") assistantKey = next.api_key.trim();
+        assistant = {
+          enabled: next.enabled,
+          consented,
+          provider: next.provider,
+          base_url: next.base_url.trim().replace(/\/+$/, ""),
+          model: next.model.trim(),
+          has_api_key: assistantKey !== null,
+          live_price: next.live_price,
+        };
+        if (!assistant.enabled) chat = [];
+        return assistant;
+      }),
+
+    assistantSend: (text) =>
+      answer(() => {
+        const item = assistantReply(text.trim());
+        chat.push({ role: "user", text: text.trim(), cards: [], tools: [] }, item);
+        return item;
+      }, latency * 2),
+
+    assistantHistory: () => answer(() => chat),
+    assistantClear: () =>
+      answer(() => {
+        chat = [];
+      }),
 
     // --- controls ----------------------------------------------------------------------------
 

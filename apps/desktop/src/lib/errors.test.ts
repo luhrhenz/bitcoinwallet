@@ -104,3 +104,16 @@ describe("describeError", () => {
     expect(toApiError("plain")).toEqual({ code: "unknown", message: "plain" });
   });
 });
+
+describe("assistant errors", () => {
+  it("say what to do for a missing key, a rate limit or an unreachable provider", () => {
+    expect(describeError({ code: "assistant_key", message: "add your Gemini API key in Settings → Assistant" }).title).toBe(
+      "Add your Gemini API key in Settings → Assistant.",
+    );
+    expect(describeError({ code: "assistant_rate_limit", message: "Groq is rate limiting" }).title).toMatch(/Wait a minute/);
+    const down = describeError({ code: "assistant_unreachable", message: "can't reach Groq" });
+    expect(down.title).toMatch(/can't be reached/);
+    expect(down.detail).toBe("Can't reach Groq");
+    expect(describeError({ code: "assistant_off", message: "" }).title).toMatch(/Settings → Assistant/);
+  });
+});

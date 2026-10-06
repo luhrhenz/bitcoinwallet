@@ -17,6 +17,8 @@ use btcw_core::config::{self, Overrides};
 use btcw_core::{Result, WalletError};
 use serde::{Deserialize, Serialize};
 
+pub use crate::assistant::settings::StoredAssistant;
+
 pub const SETTINGS_FILE: &str = "desktop.json";
 pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 5;
 pub const AUTO_LOCK_MINUTES: RangeInclusive<u32> = 1..=60;
@@ -37,6 +39,9 @@ pub struct StoredSettings {
     pub auto_lock_minutes: u32,
     #[serde(default)]
     pub mainnet_opt_in: bool,
+    /// The assistant's provider settings; the API key never leaves Rust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<StoredAssistant>,
 }
 
 fn default_auto_lock() -> u32 {
@@ -51,6 +56,7 @@ impl Default for StoredSettings {
             rpc_cookie: None,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             mainnet_opt_in: false,
+            assistant: None,
         }
     }
 }
@@ -64,6 +70,7 @@ impl std::fmt::Debug for StoredSettings {
             .field("rpc_cookie", &self.rpc_cookie)
             .field("auto_lock_minutes", &self.auto_lock_minutes)
             .field("mainnet_opt_in", &self.mainnet_opt_in)
+            .field("assistant", &self.assistant)
             .finish()
     }
 }
@@ -144,6 +151,7 @@ impl StoredSettings {
         }
         self.rpc_url = self.rpc_url.and_then(non_empty);
         self.rpc_cookie = self.rpc_cookie.and_then(non_empty);
+        self.assistant = self.assistant.and_then(StoredAssistant::sanitized);
         self
     }
 }
@@ -199,6 +207,7 @@ pub fn validate(next: &Settings) -> Result<(StoredSettings, Network)> {
             rpc_cookie,
             auto_lock_minutes: next.auto_lock_minutes,
             mainnet_opt_in: next.mainnet_opt_in,
+            assistant: None,
         },
         network,
     ))
@@ -375,6 +384,7 @@ mod tests {
             rpc_cookie: None,
             auto_lock_minutes: 7,
             mainnet_opt_in: false,
+            assistant: None,
         };
         save(&path, &stored).unwrap();
         assert_eq!(load(&path), stored);

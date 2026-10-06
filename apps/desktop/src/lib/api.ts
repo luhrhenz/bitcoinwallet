@@ -9,7 +9,10 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AddressRow,
   AppInfo,
+  AssistantSettings,
+  AssistantSettingsUpdate,
   BalanceView,
+  ChatItem,
   Contact,
   PreparedSend,
   Settings,
@@ -74,6 +77,16 @@ export interface WalletApi {
   verifyBackup(password: string, answers: [number, string][]): Promise<void>;
   /** The recovery phrase again, with the password, at any time. */
   revealPhrase(password: string): Promise<{ mnemonic: string[] }>;
+
+  // Assistant: the model runs behind Rust; it can prepare payments as cards, never send them.
+  getAssistantSettings(): Promise<AssistantSettings>;
+  /** The key is write-only: the reply says only whether one is saved. */
+  setAssistantSettings(update: AssistantSettingsUpdate): Promise<AssistantSettings>;
+  /** One message → the assistant's answer. Cards confirm through `confirmSend` like a payment. */
+  assistantSend(text: string): Promise<ChatItem>;
+  /** The chat so far; empty after a lock or a network switch. */
+  assistantHistory(): Promise<ChatItem[]>;
+  assistantClear(): Promise<void>;
 }
 
 // Command names are snake_case to match #[tauri::command] fns; args are camelCase (Tauri default).
@@ -116,6 +129,12 @@ export const tauriApi: WalletApi = {
   backupChallenge: (password) => invoke("backup_challenge", { password }),
   verifyBackup: (password, answers) => invoke("verify_backup", { password, answers }),
   revealPhrase: (password) => invoke("reveal_phrase", { password }),
+
+  getAssistantSettings: () => invoke("get_assistant_settings"),
+  setAssistantSettings: (settings) => invoke("set_assistant_settings", { settings }),
+  assistantSend: (text) => invoke("assistant_send", { text }),
+  assistantHistory: () => invoke("assistant_history"),
+  assistantClear: () => invoke("assistant_clear"),
 };
 
 let selected: WalletApi = tauriApi;

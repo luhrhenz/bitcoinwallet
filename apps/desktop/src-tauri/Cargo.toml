@@ -31,6 +31,8 @@ dirs.workspace = true
 # No plugins: no shell, fs, http or dialog access for the webview.
 tauri = { version = "2.12", features = [] }
 getrandom.workspace = true
+# The assistant's HTTPS calls: the same minreq + rustls stack the RPC client uses.
+minreq.workspace = true
 secrecy = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true

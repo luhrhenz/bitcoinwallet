@@ -57,6 +57,7 @@ pub struct AppState {
     session: Mutex<Session>,
     gates: Mutex<HashMap<Network, Arc<Mutex<()>>>>,
     synced: Mutex<HashMap<Network, u32>>,
+    assistant: crate::assistant::Assistant,
 }
 
 impl std::fmt::Debug for AppState {
@@ -80,6 +81,7 @@ impl AppState {
             session: Mutex::new(Session::new(now)),
             gates: Mutex::new(HashMap::new()),
             synced: Mutex::new(HashMap::new()),
+            assistant: crate::assistant::Assistant::default(),
         }
     }
 
@@ -176,6 +178,10 @@ impl AppState {
         Arc::clone(lock(&self.gates).entry(network).or_default())
     }
 
+    pub(crate) fn assistant(&self) -> &crate::assistant::Assistant {
+        &self.assistant
+    }
+
     pub(crate) fn remember_synced(&self, network: Network, height: u32) {
         lock(&self.synced).insert(network, height);
     }
@@ -195,6 +201,8 @@ pub(crate) struct Session {
     unlocked: Option<UnlockedSigner>,
     last_activity: Instant,
     pending: Option<PendingSend>,
+    /// Bumped on every lock, so state tied to the session (the assistant's chat) can tell.
+    epoch: u64,
 }
 
 struct UnlockedSigner {
@@ -231,6 +239,7 @@ impl Session {
             unlocked: None,
             last_activity: now,
             pending: None,
+            epoch: 0,
         }
     }
 
@@ -238,6 +247,11 @@ impl Session {
     pub fn lock(&mut self) {
         self.unlocked = None;
         self.pending = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Keep `signer` for `network`, replacing (and wiping) any previous one. A prepared payment

@@ -8,6 +8,7 @@ export type Route =
   | { name: "send"; to?: string }
   | { name: "history" }
   | { name: "contacts" }
+  | { name: "assistant" }
   | { name: "settings" }
   /** `sent` is set when arriving straight from a confirmed send. */
   | { name: "tx"; txid: string; sent?: SendPreview };

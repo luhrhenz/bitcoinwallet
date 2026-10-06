@@ -124,6 +124,21 @@ const DESCRIPTIONS: Record<string, Describe> = {
           : null,
     };
   },
+  // Assistant. The backend's message names the provider and never holds the key.
+  assistant_off: () => ({ title: "The assistant is off. Turn it on in Settings → Assistant." }),
+  assistant_key: (message) => ({ title: `${sentence(message)}.` }),
+  assistant_rate_limit: () => ({
+    title: "The provider's free tier is busy for this key. Wait a minute, then try again.",
+  }),
+  assistant_unreachable: (message) => ({
+    title: "The assistant's provider can't be reached right now.",
+    detail: sentence(message),
+  }),
+  assistant_reply: (message) => ({
+    title: "The assistant's provider couldn't answer.",
+    detail: sentence(message),
+  }),
+  assistant_busy: () => ({ title: "The assistant is still answering your last message." }),
   internal: (message) => ({
     title: "Something went wrong inside btcw. Try again; if it keeps happening, restart the app.",
     detail: message,

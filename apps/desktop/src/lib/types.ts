@@ -112,3 +112,51 @@ export interface ApiError {
   code: string;
   message: string;
 }
+
+// ---- Assistant (src-tauri/src/assistant) ----
+
+export type AssistantProvider = "groq" | "gemini" | "custom";
+
+/** What the UI may know about the assistant's setup. The API key itself never comes back. */
+export interface AssistantSettings {
+  enabled: boolean;
+  /** The user agreed, once, that wallet data goes to the provider. */
+  consented: boolean;
+  provider: AssistantProvider;
+  base_url: string;
+  model: string;
+  has_api_key: boolean;
+  /** `get_btc_price` (CoinGecko) is offered to the model. */
+  live_price: boolean;
+}
+
+export interface AssistantSettingsUpdate {
+  enabled: boolean;
+  provider: AssistantProvider;
+  base_url: string;
+  model: string;
+  /** A new key, or null to keep the saved one. */
+  api_key: string | null;
+  clear_api_key: boolean;
+  live_price: boolean;
+  /** The user accepted the data notice just now. */
+  consent: boolean;
+}
+
+/** What to prepare once the wallet is unlocked. */
+export type PrepareRequest =
+  | { action: "payment"; to: string; amount_sat: number; fee_rate_sat_vb: number | null }
+  | { action: "fee_bump"; txid: string; fee_rate_sat_vb: number | null };
+
+export type AssistantCard =
+  | { kind: "payment"; id: string; preview: SendPreview }
+  | { kind: "fee_bump"; id: string; preview: SendPreview }
+  | { kind: "needs_unlock"; request: PrepareRequest };
+
+export interface ChatItem {
+  role: "user" | "assistant";
+  text: string;
+  cards: AssistantCard[];
+  /** Tools the assistant used for this answer. */
+  tools: string[];
+}

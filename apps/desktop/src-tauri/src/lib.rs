@@ -12,6 +12,7 @@
 //! The window is locked down: strict CSP, no plugins, only event permissions, and navigation
 //! limited to the app's own pages.
 
+pub mod assistant;
 pub mod commands;
 pub mod error;
 mod ipc;
@@ -69,6 +70,11 @@ pub fn run() {
             ipc::backup_challenge,
             ipc::verify_backup,
             ipc::reveal_phrase,
+            ipc::get_assistant_settings,
+            ipc::set_assistant_settings,
+            ipc::assistant_send,
+            ipc::assistant_history,
+            ipc::assistant_clear,
         ])
         .setup(|app| {
             create_main_window(app)?;
