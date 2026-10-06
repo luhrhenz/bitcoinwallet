@@ -12,6 +12,7 @@ either your own or a hosted endpoint.
 > needs both a build feature and an explicit opt-in. Testnet coins have no value.
 
 - Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Presentation demo script: [`docs/DEMO.md`](docs/DEMO.md)
 - Plan, algorithms and pseudocode: [`docs/PLAN.md`](docs/PLAN.md)
 - How it was built, step by step: [`WALKTHROUGH.md`](WALKTHROUGH.md)
 
