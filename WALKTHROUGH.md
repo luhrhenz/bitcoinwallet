@@ -294,6 +294,11 @@ wallet created at height 871 234 downloads block 871 234 onwards and never touch
 it. After the first sync our checkpoint is above the birthday, so the birthday stops mattering. The
 test proves both sides: a wallet whose birthday is the tip scans exactly **1** block, while a restore
 (birthday 0) of the same seed scans every block from 1 to the tip and ends up with the same balance.
+A birthday *above* the node's tip (the birthday block was reorged away, a restore was given a
+height the chain hasn't reached, or the node is still catching up) means there
+is nothing to scan yet: `sync` skips the blocks with a warning, still reads the mempool, and scans
+once the chain gets there. (Before Agent H's e2e tests found it, the Emitter asked for the birthday
+block by height and the sync failed with "Block height out of range"; §10.)
 
 **Persisting every 100 blocks.** BDK only writes on `persist()`. The first sync of a restored testnet4
 wallet can run for a long time, so we save every 100 blocks: if it's interrupted, the next run resumes
@@ -1505,7 +1510,8 @@ prepare_send(to, amountSat, feeRate)               confirm_send(id)
   locked? → "locked"                                 locked? → "locked"
   address, dust, fee rate (no node, no lock yet)     take the PSBT for id (gone either way)
   drop any earlier preview                           unknown, used or > 10 min old → tx_build
-  open wallet → sync → tx::prepare_send              open wallet → node
+  open wallet → sync → tx::prepare_send              open wallet → tx::check_prepared (§10)
+                                                     node
   persist (the change address must survive)          sign (holding the session) → tx::sign_psbt
   id = 16 random bytes (OS RNG), keep {id, PSBT}     broadcast → tx::broadcast_signed
   → { id, preview }                                  → { txid }
@@ -1519,6 +1525,12 @@ wallet is closed in between; without it, the change address BDK revealed for the
 unknown to the wallet that signs. Signing is `tx::complete_send` split into its two halves: the
 signature is made while holding the session, so `lock` can't wipe the key in the middle of it,
 and the broadcast happens after letting go, so "Lock" never waits for a slow node.
+Because the wallet is closed while the preview is on screen, `btcw send` in a terminal can spend
+the same coin, or take the same revealed-but-unused change address, in between. So `confirm_send`
+first runs `tx::check_prepared` on the reopened wallet: every input must still be an unspent coin,
+and no change address may have been paid since; otherwise `tx_build` ("review the payment again").
+Without it, a stale PSBT at a higher fee *replaced* the CLI's payment by RBF (found by the e2e
+tests, §10).
 `cancel_send(id)` drops the PSBT and runs `tx::cancel`. Since BDK keeps "used" marks only in memory,
 a reopened wallet has nothing left to release, but `tx::cancel` still runs, so cancelling stays
 correct if that ever changes.
@@ -1646,6 +1658,128 @@ scripts/regtest.sh reset
 BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-desktop   # the bridge's tests
 ```
 
-## 10. End-to-end tests, Phase 2 / Agent H — _pending_
+## 10. End-to-end tests, Phase 2 / Agent H
+
+**What we built:** tests that use the wallet the way a person does: many commands in a row, each
+one a new process, two wallets, two frontends on one wallet, a reorg, a double-spend. Every other
+test in the repo checks one piece. These check that the pieces agree with each other and with
+Bitcoin Core, and they found two real bugs.
+
+```text
+crates/btcw-cli/tests/e2e.rs                   3 journeys through the real `btcw` binary,
+                                               each against its own regtest bitcoind
+apps/desktop/src-tauri/src/commands_tests.rs   2 journeys: the desktop commands on a wallet the
+                                               CLI created, and a payment prepared in the app
+                                               while the CLI spends
+```
+
+### What a journey checks that a unit test can't
+- **Agreement, not just output.** The wallet's fee is the fee in Core's mempool entry
+  (`getmempoolentry`). Its outputs are the ones Core decodes (`getrawtransaction`). The change
+  address is `m/84'/1'/0'/1/0` derived from the phrase by a separate in-memory BDK wallet. The
+  balance is received − sent − fee to the satoshi. Two wallets agree on every txid, block and
+  amount between them.
+- **Persistence on every line.** Each `btcw` call is a new process that opens the SQLite file,
+  so R11 is exercised by every step. To prove the numbers come from the database and not the
+  node, the views are run once more with `--rpc-url http://127.0.0.1:1`, where nothing listens:
+  the JSON is identical.
+- **Boundaries between processes.** Two datadirs, two wallets, one chain. A `btcw send` paused at
+  its `Send? [y/N]` prompt in a pseudo-terminal holds the wallet lock, and a second `btcw` gets
+  `wallet_in_use`. The test process also holds the wallet through the core API, the way the desktop
+  app does for each command.
+
+### The journeys
+
+| Journey | What happens | PRD |
+|---|---|---|
+| **Money cycle, restart, restore** (`money_cycle_survives_restarts_and_restores_exactly`) | `create` (birthday = tip; address #0 = the BIP84 derivation) → `backup verify` with the phrase on stdin, after which the reminder stops → `address new` (the same address until it's paid) → the faucet pays → `sync`: unconfirmed, 1 mempool tx → mine → 1 confirmation, then 2 → `send --yes`: same fee as Core, change to `…/1/0` → `status` unconfirmed → mine 2 → `status --watch --until 2` → `history`: exact net, fee, sent and received for both txs → `balance` = 1 000 000 − 250 000 − fee → `utxos` = only the change, `internal` #0, not a receive address → every view the same in a new process and with no node → `restore --birthday <height before the payment>` into a new datadir and `restore` from genesis: identical balance, history (txids, net, fee, status, block time), coins and used flags → all three wallets hand out #1 next | R1–R11 |
+| **Two wallets, two processes** (`two_wallets_pay_each_other_and_lock_out_a_second_process`) | Alice pays Bob twice, Bob pays some back. Bob sees the first payment unconfirmed, then confirmed. Both histories agree on txid and block, and the two nets of each tx add up to minus the payer's fee. Balances are exact and equal the sum of the coins. The three change addresses are distinct, never a receive address of either wallet, and Alice's second payment moves her change from internal #0 to #1. Then the lock: a `send` waiting at its prompt makes `balance` (CLI) and `open_watch_only` (core) fail with `wallet_in_use`, while Alice's wallet stays usable. With the test holding Bob's wallet, `balance`, `history`, `address new`, `sync` and `send` all fail with `wallet_in_use` and the exact message, while `status --watch` retries ("trying again in 1 s") and finishes once the wallet is free. | R4–R10, PLAN §4.2 lock |
+| **Reorgs and the mempool cache** (`reorgs_and_the_mempool_cache_through_the_cli`) | A birthday above the tip: a wallet whose birthday block is invalidated before its first sync (and again after it scanned the replacement), and a `restore --birthday <tip+1>`. Both sync fine, watch the mempool while they wait, and scan once the chain gets there (bug 1). Incoming reorg: confirmed → `invalidateblock` → `sync` warns "shorter than the wallet's" → `generateblock` with no transactions → `sync`: 1 block, the payment unconfirmed, balance moved to unconfirmed → mine → confirmed one block higher. Outgoing reorg: our payment un-confirms, the spent coin stays spent, the change is unconfirmed, then it re-confirms. Mempool cache: a proxy counts `getrawtransaction` calls (below). 5 new mempool txs → 5 downloads; the next sync → **0**, and `mempool-cache.txt` holds exactly the node's mempool. Strangers' txs never reach the history or the database. Then both coins are double-spent at a higher fee: a stranger's tx is replaced, and so is a payment *to* the wallet. The next sync downloads only the 2 replacements, and the evicted payment disappears from history, balance and `status` (`tx_not_found`). | R5, R6, R7, R10 |
+| **Desktop on a CLI wallet** (`desktop_and_cli_share_one_wallet_end_to_end`) | The CLI side (the `btcw_core` calls `btcw create` makes) creates the wallet in the app's datadir → the app finds it locked and unverified, with the CLI's address → fund, `sync` from the CLI's birthday → `backup_challenge` + `verify_backup` with the CLI's phrase, and the CLI's flag reads verified too → `prepare_send` fails `locked`, wrong password, unlock, lock, `locked` again, unlock → `prepare_send` (the CLI can open the wallet meanwhile) → `confirm_send` → `tx_status` unconfirmed, and the CLI's `history`/`status` see it with the same fee before any sync → mine → 1 confirmation → the CLI sends from the same wallet while the app stays unlocked (the app gets `wallet_in_use` while the CLI holds it) → the app's history and balance include the CLI's payment | R1, R4–R11, shared datadir |
+| **Stale preview** (`a_payment_prepared_in_the_app_is_refused_after_the_cli_spent_its_coin`) | The app prepares a payment; the CLI spends the only coin; the app's `confirm_send` is refused (`tx_build`, "review the payment again"); the CLI's payment is still the one in the mempool; a new review goes through (bug 2) | R8, R9 |
+
+The CLI journeys use `--json` for assertions and integer satoshis throughout: no float parsing of
+our own amounts. Core's amounts (BTC with 8 decimals) go through `Amount::from_btc`.
+
+### Counting downloads instead of timing them
+"The second sync doesn't download the mempool again" could be tested with a stopwatch, but a
+stopwatch is flaky on a loaded CI machine, and on a local node the difference is milliseconds (we
+measured about 85 ms with 5 new transactions and 50 ms with 5 cached). So the test puts a
+20-line TCP proxy between `btcw` and bitcoind. It forwards bytes both ways and counts how often
+`"getrawtransaction"` appears in the requests. The Emitter makes one such call per mempool
+transaction it doesn't already hold, so the count is exactly "what this sync downloaded", whatever
+the timing. The needle can be split across two reads, so the proxy keeps the last 18 bytes of
+each chunk.
+
+Deterministic double-spends need coins nobody else touches. The test sends two 0.05 BTC coins to
+the faucet, `lockunspent`s them so Core's own `sendtoaddress` calls can't pick them, and spends
+them with `createrawtransaction` / `signrawtransactionwithwallet` / `sendrawtransaction`. Spending
+the same outpoint again at a higher fee is a replacement (Core 28+ allows full RBF).
+
+### Two things we learned that aren't bugs
+- **A payee often knows the fee.** The fee is inputs − outputs, so whoever holds the transactions
+  the inputs came from can work it out. Bob doesn't know the fee of Alice's first payment (it spends
+  her funding coin, which Bob never saw). He does know the fee of her second payment, which spends
+  her change from the first, and Bob has that transaction. The test now asserts exactly that.
+- **BDK keeps a conflicting stranger.** When a payment to us is double-spent away, BDK stores the
+  replacement in the wallet database even though it pays someone else
+  (`is_tx_or_conflict_relevant`). It's how the wallet knows its payment lost. It never appears in
+  history or the balance. Unrelated strangers are never stored.
+
+### Bugs found and fixed
+1. **`sync` failed when the birthday was above the node's tip** (`chain.rs`). The Emitter jumps
+   to the birthday by *height* (`getblockhash(start_height)`), and Core answers
+   `Block height out of range` when that height doesn't exist yet. This happens when a new
+   wallet's birthday block (the tip at `create`) is reorged away, before or after the wallet
+   scanned it, while the node has nothing at that height yet, when
+   `restore --birthday` gets a height the chain hasn't reached, or when the node is still catching
+   up after switching nodes. Every `sync` and `send` failed, and `restore` and `status` could
+   only report "not synced", until the chain grew past it. The fix: when the birthday is above the node's tip, skip the block scan
+   (log a warning), still apply the mempool, and scan on a later sync; a birthday block that comes
+   back as a different block is then an ordinary reorg. The regression is the first part of the
+   reorg journey (both cases); it failed with
+   `rpc: fetching the next block: Block height out of range (code -8)` before the fix.
+2. **The desktop app could sign a stale payment and replace a CLI payment** (`tx.rs`,
+   `commands.rs`). `prepare_send` keeps the PSBT and *closes* the wallet (by design, so `btcw`
+   keeps working). If `btcw send` spent the same coin before the user pressed Send, `confirm_send`
+   signed and broadcast the old PSBT anyway. At a higher fee rate, Core accepted it as an RBF
+   replacement, and the CLI's payment, already reported as sent, vanished from the mempool. Two
+   payments approved, one made. The same gap let both payments share one change address when
+   they used different coins. The fix is `tx::check_prepared(wallet, psbt)`, which `confirm_send`
+   runs on the reopened wallet before signing. Every input must still be an unspent wallet coin
+   (`get_utxo`), and no change output may pay a script the wallet has already seen paid
+   (`list_output`). Otherwise the result is `tx_build` with "review the payment again", and the
+   change address is released. The reopened wallet knows the CLI's payment without a sync,
+   because `send` records its broadcast in the shared database (§7). Tests: the desktop regtest
+   journey above (it failed with the CLI's payment replaced before the fix), and two offline unit
+   tests in `tx.rs`, one for each branch.
+
+### Open issues (not fixed here)
+- **A coin spent from another copy of the wallet** (the same phrase restored on a second
+  computer) isn't caught by `check_prepared`: the shared database never hears about it, and
+  `confirm_send` doesn't sync before signing. A sync there would close the gap at the cost of one
+  more node round trip per send.
+- **A reorg with no competing block yet** leaves transactions confirmed until the node has a
+  block at that height again (the known limitation in §3). The reorg journey only checks the
+  warning.
+
+### Running them
+```bash
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-cli --test e2e          # the 3 CLI journeys
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-desktop end_to_end       # desktop on a CLI wallet
+BITCOIND_EXE=~/.local/bin/bitcoind cargo test -p btcw-desktop a_payment_prepared
+cargo test -p btcw-core --lib a_prepared_payment                               # offline, bug 2
+```
+Without bitcoind they print `skipping: no bitcoind` and pass. With `BITCOIND_EXE` set but broken,
+they fail instead, so a broken setup can't pass as green. Each test starts its own node: about 20 s
+to start it and mine 101 blocks, and the three CLI journeys run in parallel. On this machine (debug
+build) the e2e file takes **44–51 s** (once 84 s on a busy machine), the desktop crate's 23 tests
+**38–48 s**, and the whole workspace (`cargo test --workspace`, 141 tests, all node tests running)
+**5 min 16 s**. The mempool-cache journey also prints the timings the proxy makes unnecessary to
+assert: about 85 ms for a sync with 5 new mempool transactions and 50 ms with all 5 cached.
+Everything is cleaned up even when an assertion fails. Datadirs are `TempDir`s, `TestNode` stops
+its bitcoind on drop, and a spawned `btcw` (the watcher, the prompt) is wrapped in a guard that
+kills it on drop.
+
 ## 11. Running the demo (regtest and testnet4) — _pending_
 ## 12. Lessons learned — _pending_

@@ -714,3 +714,279 @@ fn send_flow_against_a_regtest_node() {
     assert!(history.iter().any(|row| row.txid == sent.txid
         && row.net_sat == -i64::try_from(third.preview.total_sat).unwrap()));
 }
+
+// ── End to end: one wallet, two frontends ───────────────────────────────────────────────────
+
+/// A regtest fixture plus the CLI's view of the same datadir: the `Config` that
+/// `btcw --network regtest --datadir <dir> --rpc-url .. --rpc-cookie ..` resolves.
+fn regtest_fixture(node: &TestNode) -> (Fixture, Config) {
+    let rpc = node.rpc_config();
+    let RpcAuth::Cookie(cookie) = &rpc.auth else {
+        panic!("TestNode uses cookie auth");
+    };
+    let fx = with_env(
+        tempfile::tempdir().unwrap(),
+        vec![
+            ("BTCW_NETWORK", "regtest".to_owned()),
+            ("BTCW_RPC_URL", rpc.url.clone()),
+            (
+                "BTCW_RPC_COOKIE",
+                PathBuf::from(cookie).display().to_string(),
+            ),
+        ],
+    );
+    let cli = Config::load_with(
+        config::Overrides {
+            network: Some("regtest".into()),
+            datadir: Some(fx.dir.path().to_path_buf()),
+            rpc_url: Some(rpc.url.clone()),
+            rpc_cookie: Some(cookie.clone()),
+            ..config::Overrides::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    (fx, cli)
+}
+
+/// The desktop app picks up a wallet the CLI created (same datadir, same files): it verifies the
+/// CLI's backup, refuses to prepare a payment while locked, unlocks, sends and follows the
+/// payment; then the CLI spends from the same wallet while the app stays unlocked, and each side
+/// sees the other's transactions. The CLI side runs the same `btcw_core` calls `btcw create` and
+/// `btcw send` make (this crate can't spawn the `btcw` binary; `crates/btcw-cli/tests/e2e.rs`
+/// drives that).
+#[test]
+fn desktop_and_cli_share_one_wallet_end_to_end() {
+    if !TestNode::available() {
+        eprintln!("skipping: no bitcoind (set BITCOIND_EXE to run this test)");
+        return;
+    }
+    let node = TestNode::start().unwrap();
+    let (fx, cli) = regtest_fixture(&node);
+    let state = &fx.state;
+
+    // `btcw create`: birthday from the node, phrase shown once, first receive address.
+    let birthday = Node::connect(&cli.rpc, Network::Regtest)
+        .unwrap()
+        .tip_height()
+        .unwrap();
+    let CreatedWallet {
+        mnemonic,
+        unlocked: Unlocked { mut wallet, signer },
+    } = api::create_wallet(&cli, WordCount::Words12, &secret(PASSWORD), Some(birthday)).unwrap();
+    drop(signer);
+    let receive = wallet.new_address().unwrap();
+    drop(wallet);
+    let phrase: Vec<String> = mnemonic
+        .phrase()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    drop(mnemonic);
+
+    // The app finds it: there, locked, backup not verified yet, never synced.
+    let found = info(&fx);
+    assert!(found.wallet_exists);
+    assert!(!found.unlocked);
+    assert_eq!(found.backup_verified, Some(false));
+    assert_eq!(found.synced_height, Some(0));
+    assert_eq!(list_addresses(state).unwrap(), vec![receive.clone()]);
+
+    // Paid and mined; the app syncs from the CLI's birthday.
+    let receive_address = receive
+        .address
+        .parse::<Address<NetworkUnchecked>>()
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap();
+    node.fund(&receive_address, Amount::from_sat(1_000_000))
+        .unwrap();
+    node.mine(1).unwrap();
+    let report = sync(state, &mut |_| {}).unwrap();
+    assert_eq!(
+        report.blocks_scanned, 2,
+        "the birthday block and the new one"
+    );
+    assert_eq!(balance(state).unwrap().confirmed_sat, 1_000_000);
+    assert!(list_addresses(state).unwrap()[0].used);
+
+    // Verify backup in the app, answering from the phrase the CLI showed; both frontends read
+    // the same flag (the CLI's reminder stops too).
+    let positions = backup_challenge(state, &secret(PASSWORD)).unwrap();
+    assert_eq!(positions.len(), 3);
+    let answers = positions
+        .iter()
+        .map(|&p| (p, phrase[p - 1].clone()))
+        .collect();
+    verify_backup(state, &secret(PASSWORD), answers).unwrap();
+    assert_eq!(info(&fx).backup_verified, Some(true));
+    assert_eq!(
+        WalletService::read_backup_verified(&cli).unwrap(),
+        Some(true)
+    );
+
+    // Locked: no payment can be prepared. The CLI's password unlocks the app.
+    let to = node.faucet_address().unwrap().to_string();
+    assert_eq!(code(prepare_send(state, &to, 100_000, Some(2.0))), "locked");
+    assert_eq!(
+        code(unlock(state, &secret("not the password"))),
+        "wrong_password"
+    );
+    unlock(state, &secret(PASSWORD)).unwrap();
+    assert!(info(&fx).unlocked);
+    lock(state).unwrap();
+    assert!(!info(&fx).unlocked);
+    assert_eq!(code(prepare_send(state, &to, 100_000, Some(2.0))), "locked");
+    unlock(state, &secret(PASSWORD)).unwrap();
+
+    // Prepare → confirm. The wallet isn't held while the preview is on screen.
+    let prepared = prepare_send(state, &to, 100_000, Some(2.0)).unwrap();
+    assert_eq!(
+        api::open_watch_only(&cli).unwrap().balance().confirmed_sat,
+        1_000_000
+    );
+    let sent = confirm_send(state, &prepared.id).unwrap();
+    let mempool = node.call("getrawmempool", &[]).unwrap();
+    assert_eq!(mempool, json!([sent.txid]));
+    assert!(matches!(
+        tx_status(state, &sent.txid).unwrap(),
+        Some(TxStatus::Unconfirmed { .. })
+    ));
+    // `btcw history` / `btcw status` see the app's payment at once, without a sync.
+    let txid1 = Txid::from_str(&sent.txid).unwrap();
+    let total1 = prepared.preview.total_sat;
+    {
+        let wallet = api::open_watch_only(&cli).unwrap();
+        let row = wallet
+            .history()
+            .into_iter()
+            .find(|row| row.txid == sent.txid)
+            .unwrap();
+        assert_eq!(row.net_sat, -i64::try_from(total1).unwrap());
+        assert_eq!(row.fee_sat, Some(prepared.preview.fee_sat));
+        assert!(matches!(
+            tx::tx_status(&wallet, txid1),
+            Some(TxStatus::Unconfirmed { .. })
+        ));
+    }
+    node.mine(1).unwrap();
+    let tip = node.tip_height().unwrap();
+    let Some(TxStatus::Confirmed {
+        height,
+        confirmations,
+        ..
+    }) = tx_status(state, &sent.txid).unwrap()
+    else {
+        panic!("not confirmed after a block");
+    };
+    assert_eq!((height, confirmations), (tip, 1));
+
+    // `btcw send` from the same wallet while the app stays unlocked. While the CLI holds the
+    // wallet the app gets `wallet_in_use`; afterwards it sees the CLI's payment.
+    let mut unlocked = api::unlock_wallet(&cli, &secret(PASSWORD)).unwrap();
+    assert_eq!(code(balance(state)), "wallet_in_use");
+    let cli_node = Node::connect(&cli.rpc, Network::Regtest).unwrap();
+    cli_node.sync(&mut unlocked.wallet, &mut |_| {}).unwrap();
+    let (psbt, preview) = tx::prepare_send(
+        &mut unlocked.wallet,
+        &cli_node,
+        &to,
+        50_000,
+        Some(FeeRate::from_sat_per_vb_u32(2)),
+    )
+    .unwrap();
+    let txid2 = tx::complete_send(&mut unlocked.wallet, &unlocked.signer, &cli_node, psbt).unwrap();
+    drop(unlocked);
+    let rows = history(state).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.txid == txid2.to_string())
+        .unwrap();
+    assert_eq!(row.net_sat, -i64::try_from(preview.total_sat).unwrap());
+    assert!(matches!(row.status, TxStatus::Unconfirmed { .. }));
+    let after = balance(state).unwrap();
+    assert_eq!(after.confirmed_sat, 0);
+    assert_eq!(
+        after.unconfirmed_sat,
+        1_000_000 - total1 - preview.total_sat
+    );
+    assert!(info(&fx).unlocked, "the CLI's use doesn't lock the app");
+    node.mine(1).unwrap();
+    assert!(matches!(
+        tx_status(state, &txid2.to_string()).unwrap(),
+        Some(TxStatus::Confirmed {
+            confirmations: 1,
+            ..
+        })
+    ));
+}
+
+/// A payment prepared in the app waits for "Send" with the wallet closed, so `btcw send` can
+/// spend the same coin in between. Signing the stale PSBT anyway would *replace* the CLI's
+/// payment (RBF, at a higher fee) or reuse its change address: the user approved two payments
+/// and one silently disappears. The app must refuse it and ask for a new review instead.
+#[test]
+fn a_payment_prepared_in_the_app_is_refused_after_the_cli_spent_its_coin() {
+    if !TestNode::available() {
+        eprintln!("skipping: no bitcoind (set BITCOIND_EXE to run this test)");
+        return;
+    }
+    let node = TestNode::start().unwrap();
+    let (fx, cli) = regtest_fixture(&node);
+    let state = &fx.state;
+    create(&fx);
+    let receive = new_address(state)
+        .unwrap()
+        .address
+        .parse::<Address<NetworkUnchecked>>()
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap();
+    node.fund(&receive, Amount::from_sat(1_000_000)).unwrap();
+    node.mine(1).unwrap();
+    sync(state, &mut |_| {}).unwrap();
+
+    let to = node.faucet_address().unwrap().to_string();
+    let prepared = prepare_send(state, &to, 100_000, Some(5.0)).unwrap();
+
+    // Meanwhile, `btcw send` (at a lower fee rate). There is one coin, so it spends that one.
+    let mut unlocked = api::unlock_wallet(&cli, &secret(PASSWORD)).unwrap();
+    let cli_node = Node::connect(&cli.rpc, Network::Regtest).unwrap();
+    cli_node.sync(&mut unlocked.wallet, &mut |_| {}).unwrap();
+    let (psbt, cli_preview) = tx::prepare_send(
+        &mut unlocked.wallet,
+        &cli_node,
+        &to,
+        50_000,
+        Some(FeeRate::from_sat_per_vb_u32(2)),
+    )
+    .unwrap();
+    let cli_txid = tx::complete_send(&mut unlocked.wallet, &unlocked.signer, &cli_node, psbt)
+        .unwrap()
+        .to_string();
+    drop(unlocked);
+
+    let refused = confirm_send(state, &prepared.id).unwrap_err();
+    assert_eq!(refused.code, "tx_build", "{}", refused.message);
+    assert!(refused.message.contains("review"), "{}", refused.message);
+    // The CLI's payment is untouched, and the app shows it.
+    assert_eq!(node.call("getrawmempool", &[]).unwrap(), json!([cli_txid]));
+    sync(state, &mut |_| {}).unwrap();
+    assert!(
+        history(state)
+            .unwrap()
+            .iter()
+            .any(|row| row.txid == cli_txid)
+    );
+    assert_eq!(
+        balance(state).unwrap().unconfirmed_sat,
+        1_000_000 - cli_preview.total_sat
+    );
+    // A new review builds on the wallet as it is now, and goes through.
+    let again = prepare_send(state, &to, 100_000, Some(5.0)).unwrap();
+    let sent = confirm_send(state, &again.id).unwrap();
+    let mempool = node.call("getrawmempool", &[]).unwrap();
+    let mempool = mempool.as_array().unwrap();
+    assert_eq!(mempool.len(), 2);
+    assert!(mempool.contains(&json!(sent.txid)) && mempool.contains(&json!(cli_txid)));
+}

@@ -181,10 +181,28 @@ impl Node {
             expected,
         );
 
+        // A birthday above the node's tip: the birthday block was reorged away (before or after
+        // we scanned it), a restore was given a height the chain hasn't reached, or the node is
+        // still catching up. No block on the node's chain can hold our transactions, so there is
+        // nothing to scan; the Emitter would ask for the birthday block by height and fail
+        // ("Block height out of range"). Skip the blocks, still read the mempool, and scan once
+        // the chain gets there (a replaced birthday block is then handled like any reorg).
+        let birthday = wallet.birthday_height();
+        let waiting_for_birthday = birthday > tip_height;
+        if waiting_for_birthday {
+            tracing::warn!(
+                birthday,
+                node_height = tip_height,
+                "the wallet's birthday is above the node's tip; no blocks to scan until the \
+                 node reaches it"
+            );
+        }
+
         let mut blocks_scanned: u32 = 0;
-        while let Some(event) = emitter
-            .next_block()
-            .map_err(|e| self.rpc_error("fetching the next block", e))?
+        while !waiting_for_birthday
+            && let Some(event) = emitter
+                .next_block()
+                .map_err(|e| self.rpc_error("fetching the next block", e))?
         {
             let height = event.block_height();
             // `connected_to` is the previous emitted block, or the agreement point after a

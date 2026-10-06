@@ -251,6 +251,46 @@ pub fn cancel(wallet: &mut WalletService, psbt: &Psbt) {
     }
 }
 
+/// For a PSBT built earlier and signed later, after the wallet was closed in between (the
+/// desktop app's prepared payment): check the wallet hasn't moved on. Every input must still be
+/// an unspent coin of this wallet, and no change output may pay an address another transaction
+/// has paid since. `TxBuild` otherwise.
+///
+/// Another process (`btcw send` in a terminal) can spend those coins, or take the same
+/// revealed-but-unused change address, while the preview is on screen. Signing anyway would
+/// replace that payment by RBF (if this one pays more) or reuse an address.
+pub fn check_prepared(wallet: &WalletService, psbt: &Psbt) -> Result<()> {
+    let bdk = wallet.bdk();
+    for input in &psbt.unsigned_tx.input {
+        if bdk.get_utxo(input.previous_output).is_none() {
+            return Err(WalletError::TxBuild(format!(
+                "coin {} was spent after this payment was prepared (by another payment, \
+                 perhaps from btcw in a terminal); review the payment again",
+                input.previous_output
+            )));
+        }
+    }
+    for out in &psbt.unsigned_tx.output {
+        let is_change = matches!(
+            bdk.derivation_of_spk(out.script_pubkey.clone()),
+            Some((KeychainKind::Internal, _))
+        );
+        // Outputs the wallet already holds, spent or not: was this address paid meanwhile?
+        if is_change
+            && bdk
+                .list_output()
+                .any(|output| output.txout.script_pubkey == out.script_pubkey)
+        {
+            return Err(WalletError::TxBuild(
+                "the change address of this payment was used by another payment after it was \
+                 prepared; review the payment again"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── Sign, extract, record ───────────────────────────────────────────────────────────────────
 
 /// `signer.sign_psbt` then BDK's `finalize_psbt` (builds the witnesses).
@@ -954,6 +994,83 @@ mod tests {
             expect_err(extract_tx(malformed))?,
             WalletError::TxBuild(_)
         ));
+        Ok(())
+    }
+
+    /// What another process's payment looks like to a reopened wallet: a recorded transaction
+    /// spending `input` and paying `to` (signatures don't matter to the wallet's bookkeeping).
+    fn record_other_payment(wallet: &mut WalletService, input: OutPoint, to: &Address) {
+        let other = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: input,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(20_000),
+                script_pubkey: to.script_pubkey(),
+            }],
+        };
+        wallet
+            .bdk_mut()
+            .apply_unconfirmed_txs([(other, 1_700_000_100)]);
+    }
+
+    #[test]
+    fn a_prepared_payment_is_refused_once_its_coin_is_spent() -> TestResult {
+        let Funded {
+            mut wallet, _dir, ..
+        } = funded(&[100_000])?;
+        let to = stranger_p2wpkh()?;
+        let psbt = build_psbt(&mut wallet, &to, Amount::from_sat(10_000), rate(2)?)?;
+        check_prepared(&wallet, &psbt)?;
+
+        // Another payment spends the same coin before this one is signed.
+        let coin = psbt.unsigned_tx.input[0].previous_output;
+        record_other_payment(&mut wallet, coin, &to);
+        let e = expect_err(check_prepared(&wallet, &psbt))?;
+        assert_eq!(e.code(), "tx_build");
+        assert!(
+            e.to_string().contains(&format!("coin {coin} was spent")),
+            "{e}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_prepared_payment_is_refused_once_its_change_address_is_used() -> TestResult {
+        let Funded {
+            mut wallet, _dir, ..
+        } = funded(&[100_000, 100_000])?;
+        let to = stranger_p2wpkh()?;
+        let psbt = build_psbt(&mut wallet, &to, Amount::from_sat(10_000), rate(2)?)?;
+        let change_out = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .find(|out| out.script_pubkey != to.script_pubkey())
+            .ok_or("no change output")?;
+        let change = Address::from_script(&change_out.script_pubkey, Network::Regtest)?;
+
+        // Another payment, from the *other* coin, sends its change to the same address (as a
+        // second process does: the address was revealed, saved and never paid).
+        let used: Vec<OutPoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect();
+        let other_coin = wallet
+            .bdk()
+            .list_unspent()
+            .map(|utxo| utxo.outpoint)
+            .find(|op| !used.contains(op))
+            .ok_or("no second coin")?;
+        record_other_payment(&mut wallet, other_coin, &change);
+        let e = expect_err(check_prepared(&wallet, &psbt))?;
+        assert_eq!(e.code(), "tx_build");
+        assert!(e.to_string().contains("change address"), "{e}");
         Ok(())
     }
 

@@ -390,6 +390,12 @@ pub fn confirm_send(state: &AppState, id: &str) -> ApiResult<SentTx> {
 
     let mut psbt = pending.psbt;
     let txid = with_wallet(state, &cfg, |wallet| {
+        // The wallet was closed while the preview was on screen: `btcw send` may have spent
+        // these coins or used this change address since. Don't sign a stale payment.
+        if let Err(e) = tx::check_prepared(wallet, &psbt) {
+            release(wallet, &psbt);
+            return Err(e.into());
+        }
         let node = match Node::connect(&cfg.rpc, cfg.network) {
             Ok(node) => node,
             Err(e) => {
