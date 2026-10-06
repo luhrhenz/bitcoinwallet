@@ -1,6 +1,5 @@
-//! Agent C: `WalletService` lifecycle through the public API: create, open, the lock, and
-//! every way opening can fail. Offline; the receive/confirm paths are in-module tests in
-//! `src/wallet.rs` because they need the crate-private `bdk_mut()`.
+//! `WalletService` lifecycle through the public API: create, open, the lock, and every way
+//! opening can fail. Offline; receive/confirm tests are in `src/wallet.rs`.
 
 use std::error::Error;
 use std::path::Path;

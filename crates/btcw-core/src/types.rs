@@ -1,8 +1,7 @@
 //! Plain, serializable views of wallet state.
 //!
-//! These are the *only* shapes that cross into the CLI's `--json` output and the desktop
-//! UI (mirrored by hand in `apps/desktop/src/lib/types.ts`; keep both in sync).
-//! Amounts are integer satoshis so JSON consumers never deal with floating-point BTC.
+//! The only shapes in the CLI's `--json` output and the desktop UI; mirrored by hand in
+//! `apps/desktop/src/lib/types.ts`. Amounts are integer satoshis.
 
 use serde::{Deserialize, Serialize};
 
@@ -101,12 +100,10 @@ pub struct SendPreview {
     pub change_sat: Option<u64>,
     /// `amount + fee`, what leaves the wallet.
     pub total_sat: u64,
-    /// The address-book name the user typed instead of an address, if any. Always shown *next
-    /// to* the full address in `to`, never instead of it.
+    /// The contact name the user typed, if any. Shown next to `to`, never instead of it.
     #[serde(default)]
     pub contact: Option<String>,
-    /// For a fee bump (`tx::prepare_fee_bump`): the txid of the unconfirmed payment this
-    /// transaction replaces. `None` for an ordinary payment.
+    /// For a fee bump: the txid of the payment this transaction replaces.
     #[serde(default)]
     pub replaces: Option<String>,
 }
@@ -115,7 +112,7 @@ pub struct SendPreview {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contact {
     pub name: String,
-    /// Validated for the wallet's network when it was saved; stored in canonical form.
+    /// Validated for the wallet's network; canonical form.
     pub address: String,
     pub note: Option<String>,
 }

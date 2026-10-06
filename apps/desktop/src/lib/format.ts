@@ -4,10 +4,7 @@ import type { TxRow, TxStatus } from "./types";
 
 const pad = (n: number) => n.toString().padStart(2, "0");
 
-/**
- * Unix seconds → `"2026-10-03 14:05"`, the CLI's date format. The CLI prints UTC (its column
- * says so); a desktop app shows the computer's local time, and `utc: true` gives the CLI form.
- */
+/** Unix seconds → `"2026-10-03 14:05"` in local time, or UTC like the CLI with `utc: true`. */
 export function formatDateTime(unixSecs: number, opts: { utc?: boolean } = {}): string {
   const d = new Date(unixSecs * 1000);
   if (opts.utc) {
@@ -44,10 +41,7 @@ export function txTime(tx: TxRow): number | null {
   return tx.status.state === "confirmed" ? tx.status.block_time : tx.status.first_seen;
 }
 
-/**
- * Newest first: unconfirmed (most recently seen first), then confirmed by height. The core
- * already sorts this way (PLAN §5.7); sorting again keeps the UI right whatever arrives.
- */
+/** Newest first: unconfirmed (most recently seen first), then confirmed by height. */
 export function sortNewestFirst(rows: readonly TxRow[]): TxRow[] {
   const rank = (tx: TxRow): [number, number] =>
     tx.status.state === "unconfirmed"

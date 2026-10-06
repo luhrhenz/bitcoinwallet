@@ -20,9 +20,8 @@ const key = (name: string) => name.toLowerCase();
 const sentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`);
 
 /**
- * The address book of the active network: list, add, rename, remove (with confirmation), and
- * "Pay", which opens Send with the contact's name filled in. Everything here is watch-only: no
- * password needed. Addresses are checked for the network by Rust when saved.
+ * The address book of the active network: list, add, rename, remove, and "Pay" (opens Send
+ * with the name filled in). Watch-only: no password needed.
  */
 export function Contacts({ go }: { go: Go }) {
   const { info, notify } = useWallet();

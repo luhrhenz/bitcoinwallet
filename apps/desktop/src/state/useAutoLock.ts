@@ -6,12 +6,9 @@ const ACTIVITY_EVENTS = ["pointerdown", "pointermove", "keydown", "wheel", "touc
 export const KEEP_ALIVE_MS = 30_000;
 
 /**
- * Calls `onIdle` once nobody has touched the window for `minutes` minutes, while `enabled`
- * (the wallet is unlocked). Any key, click, pointer move or scroll restarts the countdown.
- *
- * `onActive` reports that activity, at most every `KEEP_ALIVE_MS`: the Rust side keeps its own
- * auto-lock as a backstop (it locks a minute after this timer would) and counts only real use,
- * not the background polls, so it needs to hear that the user is still there.
+ * Calls `onIdle` once nobody has touched the window for `minutes` minutes while `enabled`.
+ * `onActive` reports activity at most every `KEEP_ALIVE_MS` to Rust's own auto-lock, which
+ * ignores background polls.
  */
 export function useAutoLock(enabled: boolean, minutes: number, onIdle: () => void, onActive?: () => void): void {
   const idle = useRef(onIdle);

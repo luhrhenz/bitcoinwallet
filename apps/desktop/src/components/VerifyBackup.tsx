@@ -8,12 +8,8 @@ import { Modal } from "./Modal";
 import { RevealPhrase } from "./RevealPhrase";
 
 /**
- * "Verify backup": password, then three words from the user's paper copy at positions Rust picks.
- * The words are typed like passwords (anyone watching the screen would learn part of the
- * phrase), with a toggle to show them. On success Rust marks the backup verified.
- *
- * The password stays in this dialog's state between the two steps (both commands need it)
- * and is gone when the dialog closes.
+ * "Verify backup": password, then three words at positions Rust picks, typed hidden. The
+ * password stays in this dialog's state between the two steps (both commands need it).
  */
 export function VerifyBackupDialog({ onClose, onShowWords }: { onClose: () => void; onShowWords: () => void }) {
   const { refreshInfo, notify } = useWallet();

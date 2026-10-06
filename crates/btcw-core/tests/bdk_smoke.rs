@@ -1,6 +1,5 @@
-//! Phase 0 de-risking: proves bdk_wallet + bdk_bitcoind_rpc work against the local
-//! Bitcoin Core version (sync, balance, build/sign/broadcast, confirmation).
-//! Uses BDK directly with a fixed test descriptor, independent of the stubbed modules.
+//! Smoke test: bdk_wallet + bdk_bitcoind_rpc against the local Bitcoin Core (sync, balance,
+//! build/sign/broadcast, confirmation), using BDK directly with a fixed descriptor.
 
 #![allow(clippy::unwrap_used)]
 
@@ -63,7 +62,7 @@ fn bdk_syncs_and_spends_against_local_core() {
     sync(&mut wallet, &client);
     assert_eq!(wallet.balance().confirmed, Amount::from_btc(1.0).unwrap());
 
-    // Send back to the faucet via PSBT, broadcast with the typed helper Agent B would use.
+    // Send back to the faucet via PSBT and broadcast with the typed helper.
     let to = node.faucet_address().unwrap();
     let mut builder = wallet.build_tx();
     builder
@@ -91,7 +90,7 @@ fn bdk_syncs_and_spends_against_local_core() {
         wallet.balance().confirmed,
         Amount::from_btc(1.0).unwrap() - Amount::from_sat(50_000) - fee
     );
-    // Typed helpers that `chain.rs` may want: check they parse Core v31 responses.
+    // Check these typed helpers parse Core v31 responses.
     client.get_block_count().unwrap();
     client.estimate_smart_fee(6, None).unwrap();
     client.get_blockchain_info().unwrap();

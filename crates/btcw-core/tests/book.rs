@@ -1,8 +1,5 @@
-//! Agent I: the address book through the public API: add / list / rename / remove, every rule
-//! a name, address or note must follow, names unique ignoring case, persistence across a reopen,
-//! and `resolve_recipient` (address first, then a contact name). Offline. Labels need
-//! transactions in the wallet, so they are tested in `src/book.rs`; the regtest fee-bump journey
-//! is in `tests/tx.rs`.
+//! The address book through the public API: add / list / rename / remove, the rules for names,
+//! addresses and notes, persistence, and `resolve_recipient`. Labels are tested in `src/book.rs`.
 
 use std::error::Error;
 use std::path::Path;
@@ -159,8 +156,7 @@ fn names_addresses_and_notes_are_checked() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut wallet = new_wallet(&config(dir.path())?)?;
 
-    // Names: 1 to 40 characters after trimming (characters, not bytes), no control characters,
-    // and nothing that could be read as an address.
+    // Names: 1 to 40 characters (not bytes), no control characters, nothing address-like.
     wallet.add_contact(&"é".repeat(MAX_NAME_CHARS), REGTEST_ADDRESS, None)?;
     for (name, expected) in [
         ("", "a contact name can't be empty".to_owned()),

@@ -26,13 +26,11 @@ export function pickPositions(count: number, total: number): number[] {
 }
 
 /**
- * Create → write the phrase down → check three words. The phrase lives in this component's state
- * from `createWallet` until the check passes, and is never written to storage, the URL or a log.
- * (Later it can only be shown again through Settings, with the password: `revealPhrase`.)
+ * Create → write the phrase down → check three words. The phrase lives only in this component's
+ * state until the check passes; never in storage, the URL or a log.
  *
- * A passed check is recorded in Rust with `verifyBackup`, so the backup reminder doesn't ask the
- * user to prove again what they just proved. That needs the password once more: it is kept in a
- * ref (never rendered) for exactly as long as the phrase itself is held here, and cleared with it.
+ * The passed check is recorded with `verifyBackup`, which needs the password: it is kept in a
+ * ref (never rendered) for as long as the phrase, and cleared with it.
  */
 export function CreateWallet({ onBack, onFinished }: { onBack: () => void; onFinished: () => void }) {
   const { refreshInfo, notify } = useWallet();

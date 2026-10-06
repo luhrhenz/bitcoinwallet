@@ -1,12 +1,10 @@
 //! End-to-end tests of the `btcw` binary: spawn it, read stdout/stderr and the exit code.
 //!
-//! Every run gets a temp `--datadir`, `--network regtest`, `NO_COLOR=1`, `BTCW_PASSWORD`, a cwd
-//! inside the temp dir, and *no* inherited `BTCW_*` variables, so the developer's own setup
-//! (e.g. `eval "$(scripts/regtest.sh env)"`) can't leak in.
+//! Every run gets a temp `--datadir`, `--network regtest`, `NO_COLOR=1`, `BTCW_PASSWORD`, and
+//! no inherited `BTCW_*` variables, so the developer's own setup can't leak in.
 //!
-//! "Offline" tests point `--rpc-url` at port 1, where nothing listens, so every node call is
-//! refused at once. The one node test needs `bitcoind` (`BITCOIND_EXE` or `PATH`) and is
-//! skipped, not failed, without it.
+//! Offline tests point `--rpc-url` at port 1, so every node call is refused at once. The node
+//! test is skipped without `bitcoind`.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -94,9 +92,8 @@ impl Env {
         cmd
     }
 
-    /// The same on regtest, but inside a pseudo-terminal: `script` runs the command with a pty
-    /// as its controlling terminal and copies our stdin into it, which is exactly what someone
-    /// typing at a prompt looks like. Its stdout is everything the command wrote to the pty.
+    /// The same on regtest, but inside a pseudo-terminal (`script`), with our stdin typed into
+    /// it as at a prompt. Its stdout is everything the command wrote to the pty.
     fn command_in_pty(&self, args: &[&str]) -> Command {
         let mut inner = Command::new(env!("CARGO_BIN_EXE_btcw"));
         self.configure(&mut inner, "regtest", args);
@@ -188,10 +185,8 @@ fn in_groups_of_four(text: &str) -> String {
         .join(" ")
 }
 
-/// `TestNode::available()` runs `bitcoind -version`, and Core v31 rewrites
-/// `~/.bitcoin/settings.json` even for that: two probes at once (another test binary, another
-/// checkout) can fail on the rename and read as "no bitcoind", silently skipping the node test.
-/// Retry, so it only skips when bitcoind really is missing.
+/// Core v31 rewrites `settings.json` even for `bitcoind -version`, so concurrent probes can fail
+/// and look like "no bitcoind". Retry, so the test only skips when it is missing.
 fn bitcoind_available() -> bool {
     (0..3).any(|_| TestNode::available())
 }
@@ -290,8 +285,7 @@ fn phrase_from_grid(text: &str) -> TestResult<String> {
     Ok(words.join(" "))
 }
 
-/// BIP84 receive address #0 for `phrase` on regtest, derived without the CLI: the core's key
-/// derivation fed into a plain, in-memory BDK wallet.
+/// BIP84 receive address #0 for `phrase` on regtest, derived without the CLI.
 fn expected_first_address(phrase: &str) -> TestResult<String> {
     let mnemonic = keys::parse_mnemonic(phrase)?;
     let (descriptors, _signer) = keys::derive_account(&mnemonic, "", Network::Regtest, 0)?;
@@ -658,8 +652,7 @@ fn send_and_status_fail_fast_without_a_node() -> TestResult {
     assert_eq!(code, "cli");
     assert!(message.starts_with("--json needs --yes"), "{message}");
 
-    // Bad payments are refused before the password is read: each of these runs with a wrong
-    // password, which would otherwise be the error.
+    // Bad payments are refused before the password is read (each runs with a wrong password).
     let existing = env.root.path().join("existing.psbt");
     std::fs::write(&existing, "keep me")?;
     let existing_str = existing.to_str().ok_or("non-UTF-8 temp path")?;
@@ -709,8 +702,8 @@ fn send_and_status_fail_fast_without_a_node() -> TestResult {
     }
     assert_eq!(std::fs::read_to_string(&existing)?, "keep me");
 
-    // The password isn't asked until a payment has been previewed and approved, so without a
-    // node the next stop is the connection, whatever the password.
+    // The password is only asked after the preview, so without a node the error is the
+    // connection, whatever the password.
     for password in ["not the password", PASSWORD] {
         let out = env
             .command_on(
@@ -766,7 +759,7 @@ fn send_and_status_fail_fast_without_a_node() -> TestResult {
     Ok(())
 }
 
-/// Agent I: the address book, labels and `bump`, as far as they go without a node.
+/// The address book, labels and `bump`, as far as they go without a node.
 #[test]
 fn contacts_labels_and_bump_without_a_node() -> TestResult {
     let env = Env::offline()?;
@@ -983,8 +976,8 @@ fn restore_from_stdin_without_a_node_matches_bip84() -> TestResult {
     Ok(())
 }
 
-/// Against a real regtest node: create → fund → sync (mempool) → mine → sync → views →
-/// restore the phrase from genesis. One test, because each node takes ~20 s to start.
+/// Against a real regtest node: create → fund → sync → mine → sync → views → restore. One test,
+/// because each node takes ~20 s to start.
 #[test]
 fn regtest_round_trip_with_a_node() -> TestResult {
     if !bitcoind_available() {
@@ -1230,8 +1223,7 @@ fn send_and_follow(node: &TestNode, env: &Env) -> TestResult {
         describe(&out)
     );
 
-    // The PSBT file: private, unsigned, the very transaction that was broadcast, and Core agrees
-    // with our fee.
+    // The PSBT file: private, unsigned, the transaction that was broadcast, with Core's fee.
     let text = std::fs::read_to_string(&psbt_path)?;
     let psbt: Psbt = text.trim_end().parse()?;
     assert_eq!(psbt.unsigned_tx.compute_txid().to_string(), txid);
@@ -1318,8 +1310,8 @@ fn send_and_follow(node: &TestNode, env: &Env) -> TestResult {
         )),
         "{text}"
     );
-    // A line per change and never the same line twice. (Whether the first check still saw the
-    // transaction unconfirmed depends on timing, so that line isn't required.)
+    // A line per change, never the same line twice. (The first, unconfirmed line depends on
+    // timing, so it isn't required.)
     let lines: Vec<&str> = text.lines().skip(1).collect();
     assert!(lines.windows(2).all(|pair| pair[0] != pair[1]), "{text}");
     assert!(
@@ -1390,10 +1382,8 @@ fn send_and_follow(node: &TestNode, env: &Env) -> TestResult {
     contacts_labels_and_bump(node, env)
 }
 
-/// Agent I, on the same wallet and node: pay a contact by name (the preview shows the full
-/// address), label the payment, speed it up with `bump` (declined once at a real prompt, then
-/// sent), bump the replacement again as JSON, and the refusals: too low, `--json` without
-/// `--yes`, already confirmed.
+/// On the same wallet and node: pay a contact by name, label the payment, `bump` it (declined
+/// once at a real prompt, then sent), bump again as JSON, and the refusals.
 fn contacts_labels_and_bump(node: &TestNode, env: &Env) -> TestResult {
     let faucet = node.faucet_address()?.to_string();
     // Start from confirmed coins only, so the payments below have no unconfirmed parent.

@@ -1,10 +1,8 @@
-// The desktop command contract. The UI talks ONLY to `api`, never to `invoke` directly.
-// `npm run dev:mock` swaps in the in-memory mock (src/lib/mock.ts, Agent E) so the whole UI
-// can be built and tested without Rust; the Tauri build uses the real commands (Agent G).
+// The desktop commands. The UI talks only to `api`, never to `invoke` directly; `npm run
+// dev:mock` swaps in the in-memory mock (lib/mock.ts).
 //
-// Security rule: recovery words cross into JS only as the return value of `create_wallet` (for
-// the backup screen) and of `reveal_phrase` (the user asked to see them, with the password).
-// Nothing else returns secrets: the keys and the PSBT of a prepared payment stay in Rust.
+// Recovery words reach JS only from `create_wallet` and `reveal_phrase`. Keys and prepared
+// PSBTs stay in Rust.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -28,10 +26,7 @@ export interface WalletApi {
   restoreWallet(phrase: string, password: string, birthday: number | null): Promise<void>;
   unlock(password: string): Promise<void>;
   lock(): Promise<void>;
-  /**
-   * The user is active (key press, click) while unlocked. Rust runs its own auto-lock as a
-   * backstop for the UI's timer and counts only user actions, not background polls.
-   */
+  /** The user is active while unlocked; Rust's own auto-lock backs up the UI's timer. */
   keepAlive(): Promise<void>;
 
   newAddress(): Promise<AddressRow>;
@@ -49,16 +44,11 @@ export interface WalletApi {
   cancelSend(id: string): Promise<void>;
   txStatus(txid: string): Promise<TxStatus | null>;
 
-  /**
-   * "Speed up": the lowest fee rate (sat/vB, rounded up to the hundredth) that can replace the
-   * wallet's unconfirmed payment `txid`. Rejects with the reason when it can't be replaced.
-   * Watch-only.
-   */
+  /** The lowest fee rate (sat/vB, rounded up) that can replace `txid`, or why it can't. */
   minFeeBumpRate(txid: string): Promise<number>;
   /**
-   * Build the replacement of `txid` and keep it like a prepared payment (same slot, expiry,
-   * `confirmSend` / `cancelSend`); `preview.replaces` is `txid`. Needs the wallet unlocked.
-   * `null` = the node's estimate, raised to the minimum.
+   * Build the replacement of `txid` and keep it like a prepared payment. `null` = the node's
+   * estimate, raised to the minimum.
    */
   prepareFeeBump(txid: string, feeRateSatVb: number | null): Promise<PreparedSend>;
 
@@ -76,15 +66,11 @@ export interface WalletApi {
   setSettings(s: Settings): Promise<void>;
 
   /**
-   * Word positions (1-based, ascending; three of them) to ask for in a backup check. Needs the
-   * password: only the encrypted keystore knows how many words the phrase has, and a wrong
-   * password is caught before the user types any words.
+   * Three word positions (1-based, ascending) to ask for in a backup check. Needs the password:
+   * only the keystore knows the phrase length.
    */
   backupChallenge(password: string): Promise<number[]>;
-  /**
-   * Compare `[position, word]` pairs with the phrase; marks the backup verified on success.
-   * Rejects with `backup_mismatch` naming the wrong positions (never words).
-   */
+  /** Check `[position, word]` pairs and mark the backup verified; errors name positions only. */
   verifyBackup(password: string, answers: [number, string][]): Promise<void>;
   /** The recovery phrase again, with the password, at any time. */
   revealPhrase(password: string): Promise<{ mnemonic: string[] }>;

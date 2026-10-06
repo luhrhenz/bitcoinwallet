@@ -1,9 +1,8 @@
-//! Everything that decides how output looks: the network badge, colors, amounts, dates,
-//! tables, `--json` values and errors.
+//! How output looks: the network badge, colors, amounts, dates, tables, `--json` values and
+//! errors.
 //!
-//! Streams: results go to **stdout** (human text, or exactly one JSON value with `--json`).
-//! Prompts, warnings, progress bars and logs go to **stderr** (prompts actually go to the TTY),
-//! so `btcw --json balance | jq` always sees clean JSON.
+//! Results go to stdout (exactly one JSON value with `--json`); prompts, warnings, progress
+//! and logs go to stderr or the TTY, so `--json` output stays clean.
 
 use std::fmt::Display;
 use std::io::{IsTerminal, Write};
@@ -63,7 +62,7 @@ impl Painter {
     }
 
     /// `[testnet4]`, `[signet]`, `[regtest]`, `[mainnet]`: on every human-readable result so
-    /// test coins are never mistaken for real ones (PLAN §4.1).
+    /// test coins are never mistaken for real ones.
     pub fn badge(self, network: Network) -> Styled<String> {
         let (name, style) = match network {
             Network::Bitcoin => ("mainnet".to_owned(), Style::new().red().bold()),
@@ -133,7 +132,6 @@ impl Ui {
 
     /// `warning: ...` on stderr, in both human and JSON mode.
     pub fn warn(&self, message: impl Display) {
-        // Best effort: there is nowhere left to report a failing stderr.
         let _ = self.eprintln(&format!("{} {message}", self.err.warning("warning:")));
     }
 
@@ -157,8 +155,7 @@ impl Ui {
         }
     }
 
-    /// A sync progress bar on stderr, or a hidden one in `--json` mode or when stderr is not
-    /// a terminal (then nothing is drawn at all).
+    /// A sync progress bar on stderr; hidden with `--json` or when stderr is not a terminal.
     pub fn sync_progress_bar(&self) -> ProgressBar {
         if !self.progress {
             return ProgressBar::hidden();
@@ -216,8 +213,8 @@ pub fn error_code(e: &anyhow::Error) -> &'static str {
         .map_or(CLI_ERROR_CODE, WalletError::code)
 }
 
-/// clap failed to parse the command line. `--help`/`--version` are "errors" in clap's API
-/// and are printed as usual; real usage errors exit with 2, as JSON when `--json` was given.
+/// clap failed to parse the command line. `--help`/`--version` print as usual; usage errors
+/// exit with 2, as JSON with `--json`.
 pub fn usage_error(e: &clap::Error) -> ExitCode {
     let wants_json = std::env::args_os()
         .skip(1)
@@ -274,9 +271,8 @@ pub fn signed_amount(sat: i64) -> String {
     )
 }
 
-/// `"tb1qw508d6qe…"` → `"tb1q w508 d6qe …"`: the full address in groups of four, so it can be
-/// checked group by group against the recipient's copy. Shortening it (`tb1qw5…pjzsx`) would hide
-/// exactly the middle part that clipboard-swapping malware changes.
+/// `"tb1qw508d6qe…"` → `"tb1q w508 d6qe …"`: the full address in groups of four. Never
+/// shortened: clipboard-swapping malware changes the middle.
 pub fn grouped(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + text.len() / 4);
     for (i, c) in text.chars().enumerate() {
@@ -299,8 +295,8 @@ pub fn utc_datetime(unix_secs: u64) -> String {
     )
 }
 
-/// Days since 1970-01-01 → proleptic Gregorian (year, month, day). Howard Hinnant's
-/// `civil_from_days`, restricted to non-negative days so it needs no signed arithmetic.
+/// Days since 1970-01-01 → (year, month, day). Howard Hinnant's `civil_from_days`, for
+/// non-negative days only.
 fn civil_from_days(days: u64) -> (u64, u64, u64) {
     // Shift the epoch to 0000-03-01 so the leap day is the last day of a "year".
     let z = days + 719_468;

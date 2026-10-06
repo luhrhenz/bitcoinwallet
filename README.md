@@ -15,7 +15,7 @@ either your own or a hosted endpoint.
 
 ## Features
 
-| PRD requirement | How btcw does it |
+| Requirement | How btcw does it |
 |---|---|
 | Create a wallet | 12 or 24 BIP39 words from the OS random generator, shown once, encrypted at rest |
 | Restore from a mnemonic | Phrase plus optional `--birthday` height; full rescan otherwise |
@@ -29,10 +29,12 @@ either your own or a hosted endpoint.
 | Poll transaction status | `btcw status <txid> --watch`; live in the desktop app |
 | Persist between runs | SQLite (BDK) plus an encrypted seed file |
 
-Beyond the PRD:
+Beyond the requirements:
 - **Encrypted recovery phrase:** Argon2id + XChaCha20-Poly1305, bound to its network.
 - **Backup check:** btcw reminds you until you prove your paper copy is right with 3 random words, and can show the phrase again with your password.
 - **Watch-only by default:** balance and history need no password, and sending asks for it only after you've confirmed the preview.
+- **Address book and labels:** pay a saved contact by name (the full address is always shown), and label transactions.
+- **Speed up (RBF):** replace a stuck unconfirmed payment with one paying a higher fee (`btcw bump`, or "Speed up" in the app).
 - **Desktop app with auto-lock:** the private key never reaches the UI, and the window is locked down with a strict CSP and no plugins.
 - **Hosted nodes over HTTPS** (e.g. Alchemy), with the API key cut out of every message and log.
 

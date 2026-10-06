@@ -1,22 +1,13 @@
 //! [`Node`]: everything that talks to Bitcoin Core over JSON-RPC.
 //!
-//! OWNER: Agent B (Phase 1). Contract: PLAN §4, §5.5.
+//! - `bitcoincore-rpc` 0.19 predates Core v28, and some typed helpers fail on newer responses,
+//!   so those RPCs use raw `client.call::<Value>`.
+//! - Its default HTTP transport times out after 15 s; the client is built with a 120 s timeout.
+//! - `sync` drives `bdk_bitcoind_rpc::Emitter` from the latest checkpoint (or the birthday),
+//!   persisting every 100 blocks, then applies the mempool.
 //!
-//! - `connect` checks `getblockchaininfo.chain` matches the wallet network (`NetworkMismatch`).
-//!   Prefer raw `client.call::<serde_json::Value>(..)` for RPCs whose response shape changed in
-//!   recent Core versions; `bitcoincore-rpc` 0.19 predates Core v28+ and some typed helpers
-//!   fail to parse newer responses.
-//! - `bitcoincore-rpc`'s default HTTP transport times out after 15 s. Build the client with
-//!   `jsonrpc::simple_http::Builder` + `Client::from_jsonrpc` and a 120 s timeout, because
-//!   `generatetoaddress` is ~200 ms/block on Core v31 and large blocks take a while too.
-//! - `sync` uses `bdk_bitcoind_rpc::Emitter`: start from `wallet.latest_checkpoint()` with
-//!   `start_height = wallet.birthday_height()`, apply each
-//!   block with `apply_block_connected_to`, persist every 100 blocks, then apply the mempool
-//!   (`apply_unconfirmed_txs`, `apply_evicted_txs`) and persist.
-//!
-//! Every RPC error becomes `WalletError::Rpc` with what we were doing, the node's URL (with any
-//! `user:pass@` removed) and, for connection problems, a hint about what to check. Credentials
-//! never appear in errors or logs.
+//! RPC errors become `WalletError::Rpc` with what failed, the redacted node URL and a hint.
+//! Credentials never appear in errors or logs.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -39,13 +30,11 @@ use crate::wallet::WalletService;
 /// Used when the node has no fee estimate (always the case on a fresh regtest chain).
 pub const FALLBACK_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_u32(2);
 
-/// Per-request HTTP timeout. `bitcoincore-rpc`'s default is 15 s, which a single
-/// `generatetoaddress` call or a large block on a slow disk can exceed (PLAN §4, Phase 0
-/// finding #3).
+/// Per-request HTTP timeout. `bitcoincore-rpc`'s default of 15 s is too short for a
+/// `generatetoaddress` call or a large block on a slow disk.
 const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Write sync progress to SQLite this often, so an interrupted first sync of a long chain
-/// resumes close to where it stopped instead of at the birthday.
+/// Persist sync progress this often, so an interrupted long sync resumes near where it stopped.
 const PERSIST_EVERY_BLOCKS: u32 = 100;
 
 /// Blocks per `generatetoaddress` call: ~5 s on Core v31, far below [`RPC_TIMEOUT`].
@@ -71,9 +60,7 @@ impl Node {
             RpcAuth::None => None,
         };
         let client = if config::is_https(&rpc.url) {
-            // Hosted providers and remote nodes: TLS via minreq (rustls, Mozilla's root store).
-            // simple_http only speaks plain HTTP, which would send credentials and the API key
-            // in the URL unencrypted.
+            // TLS via minreq (rustls); simple_http would send credentials and API keys in clear.
             let mut builder = minreq_http::Builder::new()
                 .timeout(RPC_TIMEOUT)
                 .url(&rpc.url)
@@ -98,12 +85,11 @@ impl Node {
             url,
         };
 
-        // The first request is what actually opens the TCP connection, so this is also where
-        // "bitcoind isn't running" and "wrong credentials" surface.
+        // The first request opens the connection, so "not running" and "wrong credentials"
+        // surface here.
         let info = node.blockchain_info()?;
         let chain = json_str(&info, "chain", "getblockchaininfo")?;
-        // Core says "main"/"test"; report those as our names ("bitcoin"/"testnet"), and an
-        // unknown chain verbatim.
+        // Core says "main"/"test"; report our names, or an unknown chain verbatim.
         let found = Network::from_core_arg(chain).ok();
         if found != Some(network) {
             return Err(WalletError::NetworkMismatch {
@@ -135,9 +121,6 @@ impl Node {
     }
 
     /// Bring the wallet up to the node's tip and mempool. Calls `on_progress` per block.
-    ///
-    /// `SyncReport::mempool_txs` is the number of the wallet's transactions that are still
-    /// unconfirmed after the sync, i.e. waiting in the node's mempool.
     pub fn sync(
         &self,
         wallet: &mut WalletService,
@@ -150,27 +133,18 @@ impl Node {
             });
         }
 
-        // One call gives both the tip for progress reporting and the pruning state.
         let info = self.blockchain_info()?;
         let mut tip_height = json_u32(&info, "blocks", "getblockchaininfo")?;
         let first_needed = first_needed_height(wallet.synced_height(), wallet.birthday_height());
         check_pruned(&info, first_needed, tip_height)?;
 
-        // How the Emitter picks its first block (bdk_bitcoind_rpc 0.22, `poll_once`):
-        // 1. It walks `last_cp` (our latest checkpoint) backwards until it finds a block that is
-        //    still on the node's best chain: the "agreement point". Checkpoints above it were
-        //    reorged out.
-        // 2. If the agreement point is below `start_height`, it jumps straight to
-        //    `start_height` and emits *that* block (so the birthday block itself is scanned).
-        //    Otherwise it follows `nextblockhash` from the agreement point.
-        // So the birthday only matters until the first sync; after that the persisted
-        // checkpoint is above it and sync resumes right after the last block we saw.
+        // The Emitter (bdk_bitcoind_rpc 0.22) walks our latest checkpoint back to the last
+        // block still on the node's chain; if that is below `start_height` it jumps to
+        // `start_height` and emits that block. So the birthday only matters for the first sync.
         //
-        // The wallet's unconfirmed txs are passed in so the Emitter can report the ones that
-        // have since disappeared from the mempool (replaced, expired) as evicted.
-        // Plus every mempool transaction a previous sync already downloaded (see
-        // `mempool_cache`): the Emitter only fetches txids it doesn't hold yet, one
-        // `getrawtransaction` round trip each, which is most of a sync against a remote node.
+        // Unconfirmed wallet txs are passed in so the Emitter can report evictions. Cached
+        // mempool txs are passed too: it fetches only txids it doesn't hold, one
+        // `getrawtransaction` each, which dominates a sync against a remote node.
         let cache_path = wallet.mempool_cache_path();
         let mut expected = unconfirmed_txs(wallet);
         expected.extend(mempool_cache::load(&cache_path));
@@ -181,12 +155,9 @@ impl Node {
             expected,
         );
 
-        // A birthday above the node's tip: the birthday block was reorged away (before or after
-        // we scanned it), a restore was given a height the chain hasn't reached, or the node is
-        // still catching up. No block on the node's chain can hold our transactions, so there is
-        // nothing to scan; the Emitter would ask for the birthday block by height and fail
-        // ("Block height out of range"). Skip the blocks, still read the mempool, and scan once
-        // the chain gets there (a replaced birthday block is then handled like any reorg).
+        // A birthday above the node's tip (reorg, a restore height the chain hasn't reached, or
+        // a node still catching up): the Emitter would fail with "Block height out of range".
+        // Skip the blocks, still read the mempool, and scan once the chain gets there.
         let birthday = wallet.birthday_height();
         let waiting_for_birthday = birthday > tip_height;
         if waiting_for_birthday {
@@ -205,9 +176,8 @@ impl Node {
                 .map_err(|e| self.rpc_error("fetching the next block", e))?
         {
             let height = event.block_height();
-            // `connected_to` is the previous emitted block, or the agreement point after a
-            // reorg. BDK's `LocalChain` uses it to drop our checkpoints above that point that
-            // conflict with this block, which un-confirms the transactions anchored in them.
+            // `connected_to` lets `LocalChain` drop reorged checkpoints, which un-confirms the
+            // transactions anchored in them.
             wallet
                 .bdk_mut()
                 .apply_block_connected_to(&event.block, height, event.connected_to())
@@ -232,10 +202,8 @@ impl Node {
         mempool_cache::save(&cache_path, mempool.update.iter().map(|(tx, _)| tx));
         let bdk = wallet.bdk_mut();
         bdk.apply_unconfirmed_txs(mempool.update);
-        // Empty unless the Emitter has reached the node's tip (it can't tell "evicted" from
-        // "confirmed in a block we haven't fetched yet" before that). Cached strangers' txs show
-        // up here too once they leave the mempool; only the wallet's own evictions matter, and
-        // passing the rest would just add rows for unrelated txids to the database.
+        // Empty until the Emitter reaches the tip. Only the wallet's own evictions matter;
+        // cached strangers' txs would just add unrelated rows to the database.
         let evicted: Vec<(Txid, u64)> = mempool
             .evicted
             .into_iter()
@@ -246,11 +214,8 @@ impl Node {
 
         let synced = wallet.synced_height();
         if synced > tip_height {
-            // The node's chain got shorter (`invalidateblock`, or we switched to a node that is
-            // still catching up). The Emitter only reports blocks that *connect*, and BDK has no
-            // public way to drop checkpoints without a replacement block, so the wallet keeps its
-            // higher tip until the node has a block at that height again; that block then
-            // replaces ours like any other reorg.
+            // The node's chain got shorter. BDK can't drop checkpoints without a replacement
+            // block, so the wallet keeps its higher tip until the node has a block there again.
             tracing::warn!(
                 wallet_height = synced,
                 node_height = tip_height,
@@ -275,7 +240,7 @@ impl Node {
 
     /// `estimatesmartfee` for `target_blocks`, else [`FALLBACK_FEE_RATE`] (logged at warn).
     pub fn estimate_fee_rate(&self, target_blocks: u16) -> Result<FeeRate> {
-        // Raw call: the typed helper's result struct has changed shape across Core versions.
+        // Raw call: the typed result has changed shape across Core versions.
         let estimate: Value = self
             .client
             .call("estimatesmartfee", &[json!(target_blocks)])
@@ -332,9 +297,8 @@ impl Node {
     }
 }
 
-/// Mempool transactions already downloaded by a previous sync, so the next one only fetches new
-/// ones. Public data (it's the node's mempool), so a plain file next to the wallet database.
-/// Best effort both ways: an unreadable or missing cache just means a slower sync.
+/// Mempool transactions downloaded by a previous sync, so the next one only fetches new ones.
+/// Public data, so a plain file; a missing or unreadable cache just means a slower sync.
 mod mempool_cache {
     use std::io::Write;
     use std::path::Path;
@@ -391,14 +355,13 @@ fn unconfirmed_txs(wallet: &WalletService) -> Vec<Arc<Transaction>> {
         .collect()
 }
 
-/// Lowest block height the next sync will download (ignoring reorgs, which only reach a few
-/// blocks back and stay well inside the 288 blocks a pruned node always keeps).
+/// Lowest block height the next sync will download (reorgs stay well inside the 288 blocks a
+/// pruned node keeps).
 fn first_needed_height(synced_height: u32, birthday: u32) -> u32 {
     synced_height.saturating_add(1).max(birthday)
 }
 
-/// A pruned node has deleted old blocks. If we need one of them, `getblock` fails with an
-/// obscure "Block not available (pruned data)"; say what is going on instead.
+/// Explain a pruned node up front instead of `getblock`'s "Block not available (pruned data)".
 fn check_pruned(info: &Value, first_needed: u32, tip_height: u32) -> Result<()> {
     let pruned = info.get("pruned").and_then(Value::as_bool) == Some(true);
     if !pruned || first_needed > tip_height {
@@ -436,22 +399,16 @@ fn fee_rate_from_estimate(estimate: &Value) -> std::result::Result<FeeRate, Stri
     }
 }
 
-/// Core quotes fee rates in BTC per 1000 *virtual* bytes; `FeeRate` counts sat per 1000
-/// *weight units*, and 1 vB = 4 WU. So sat/kwu = BTC/kvB × 1e8 / 4.
-///
-/// Rounded **up**, and never below 1 sat/vB (the default minimum relay fee): rounding down could
-/// put us just under the rate the node asked for, or under the relay minimum, and the
-/// transaction would be rejected or never confirm. `None` for non-positive or absurd values.
+/// BTC/kvB → sat/kwu (× 1e8 / 4), rounded up and at least 1 sat/vB so we never undercut the
+/// estimate or the relay minimum. `None` for non-positive or absurd values.
 fn fee_rate_from_btc_per_kvb(btc_per_kvb: f64) -> Option<FeeRate> {
     const SAT_PER_BTC: f64 = 100_000_000.0;
     if !btc_per_kvb.is_finite() || btc_per_kvb <= 0.0 {
         return None;
     }
-    // Core prints amounts with exactly 8 decimals, so this is a whole number of satoshis up to
-    // float error (0.29 BTC × 1e8 = 28999999.999999996): `round` recovers it exactly.
+    // Core prints 8 decimals; `round` undoes float error (0.29 × 1e8 = 28999999.999999996).
     let sat_per_kvb = (btc_per_kvb * SAT_PER_BTC).round();
-    // More than all bitcoin per kvB is nonsense. The bound also keeps the cast below exact:
-    // 2.1e15 < 2^53, so every value up to it is an integer an f64 represents exactly.
+    // Also keeps the cast exact: 2.1e15 < 2^53.
     if sat_per_kvb > Amount::MAX_MONEY.to_sat() as f64 {
         return None;
     }
@@ -462,9 +419,8 @@ fn fee_rate_from_btc_per_kvb(btc_per_kvb: f64) -> Option<FeeRate> {
     ))
 }
 
-/// Bitcoin Core's `.cookie` file: one line `__cookie__:<random password>`, rewritten each time
-/// bitcoind starts. The password is a secret, so it lives in a wiped buffer and never appears
-/// in an error.
+/// Bitcoin Core's `.cookie` file (`__cookie__:<password>`). The password is kept in a zeroizing
+/// buffer and never appears in an error.
 fn read_cookie(path: &Path, network: Network) -> Result<(String, Zeroizing<String>)> {
     let contents = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
         WalletError::Rpc(format!(
@@ -484,9 +440,7 @@ fn read_cookie(path: &Path, network: Network) -> Result<(String, Zeroizing<Strin
 }
 
 /// `https://user:pass@host:port/v2/<API key>?x=y` → `https://host:port/…`, for messages and logs.
-///
-/// Both the userinfo *and* the path go: hosted providers (Alchemy, …) put the API key in the
-/// path, and Core's own `/wallet/<name>` paths are no help in an error message anyway.
+/// The path goes too: hosted providers put the API key there.
 fn redact_url(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((scheme, rest)) => (Some(scheme), rest),
@@ -525,8 +479,7 @@ fn rpc_error(url: &str, network: Network, what: &str, e: bitcoincore_rpc::Error)
     use bitcoincore_rpc::Error as RpcError;
 
     let detail = match &e {
-        // Core answered with an error: its message is the useful part (e.g. "insufficient fee",
-        // "bad-txns-inputs-missingorspent", "Block not found").
+        // Core's own message is the useful part (e.g. "bad-txns-inputs-missingorspent").
         RpcError::JsonRpc(jsonrpc::Error::Rpc(rejection)) => {
             format!("{} (code {})", rejection.message, rejection.code)
         }
@@ -736,8 +689,7 @@ mod tests {
         Ok(())
     }
 
-    /// Broadcasting needs a real signed transaction, and building one needs `bdk_mut()`, which
-    /// integration tests can't reach; so this lives here. Skipped when no `bitcoind` exists.
+    /// Here rather than in `tests/` because it needs `bdk_mut()`. Skipped without `bitcoind`.
     #[cfg(feature = "test-utils")]
     mod node {
         use bdk_wallet::SignOptions;
@@ -809,8 +761,7 @@ mod tests {
             node.sync(&mut wallet, &mut |_| {})?;
             assert_eq!(wallet.balance().confirmed_sat, 1_000_000);
 
-            // Two payments spending that same coin. The wallet doesn't learn about the first
-            // before building the second, so both select it.
+            // Two payments spending that same coin (the wallet doesn't record the first).
             let faucet = test_node.faucet_address()?;
             let first = signed_payment(&mut wallet, &signer, &faucet, 100_000)?;
             let second = signed_payment(&mut wallet, &signer, &faucet, 200_000)?;
@@ -829,8 +780,7 @@ mod tests {
                 "{txid} not in the node's mempool: {mempool}"
             );
 
-            // Same fee rate, so Core refuses it as a replacement (full RBF is on by default
-            // since Core 28; it would need a higher fee).
+            // Same fee rate, so Core refuses it as a replacement.
             let msg = rpc_message(node.broadcast(&second))?;
             assert!(msg.contains("insufficient fee"), "{msg}");
             assert!(msg.contains(&second.compute_txid().to_string()), "{msg}");

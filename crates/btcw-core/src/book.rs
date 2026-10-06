@@ -1,29 +1,22 @@
 //! The address book (contacts) and transaction labels: two more of btcw's own tables in
-//! `wallet.sqlite`, next to `btcw_meta`.
-//!
-//! OWNER: Agent I (v2). Contract: PLAN-v2 §1.
+//! `wallet.sqlite`.
 //!
 //! ```sql
 //! CREATE TABLE btcw_contacts (name TEXT PRIMARY KEY COLLATE NOCASE, address TEXT NOT NULL, note TEXT);
 //! CREATE TABLE btcw_labels   (txid TEXT PRIMARY KEY, label TEXT NOT NULL);
 //! ```
 //!
-//! Each network has its own `wallet.sqlite`, so contacts are per network by construction, and an
-//! address is validated for the wallet's network (`tx::parse_address`) before it is saved.
+//! Contacts are per network (each network has its own database), and addresses are validated
+//! for it before saving.
 //!
-//! Rules:
 //! - Contact names are trimmed, 1–[`MAX_NAME_CHARS`] characters, unique ignoring case, and never
-//!   look like an address ([`looks_like_address`]). So whatever the user types as a recipient is
-//!   either an address or a name, never both, and a mistyped address can't match a contact.
-//! - [`WalletService::resolve_recipient`] tries the input as an address first and only then as a
-//!   name. A contact name is a shortcut for typing; frontends always show the full address next
-//!   to it (`SendPreview::to`), never the name instead.
-//! - Labels are trimmed, 1–[`MAX_LABEL_CHARS`] characters, one per txid, and only for
-//!   transactions this wallet knows.
-//! - No control characters anywhere (a newline or an escape sequence would break the CLI's tables
-//!   or repaint the terminal).
+//!   [`looks_like_address`], so a mistyped address can't match a contact.
+//! - [`WalletService::resolve_recipient`] tries an address first, then a name. Frontends always
+//!   show the full address, not just the name.
+//! - Labels are trimmed, 1–[`MAX_LABEL_CHARS`] characters, one per known txid.
+//! - No control characters anywhere (they would break the CLI's tables or the terminal).
 //!
-//! Writes go straight to SQLite (not staged with BDK's changes), like the backup flag.
+//! Writes go straight to SQLite, not staged with BDK's changes.
 
 use std::collections::HashMap;
 
@@ -62,12 +55,8 @@ pub struct Recipient {
     pub contact: Option<String>,
 }
 
-/// True if `input` is an address on any network, or looks like an attempt at one: it starts
-/// with a SegWit prefix (`bc1`, `tb1`, `bcrt1`), or it is longer than a contact name can be.
-///
-/// Such input is never looked up in the address book, so a mistyped address is reported as an
-/// invalid address and can't silently resolve to a contact. Contact names that would pass this
-/// test are refused for the same reason.
+/// True if `input` is an address on any network, starts with a SegWit prefix, or is longer than
+/// a contact name can be. Such input is never looked up as a contact name.
 pub fn looks_like_address(input: &str) -> bool {
     let input = input.trim();
     let lower = input.to_ascii_lowercase();
@@ -78,7 +67,7 @@ pub fn looks_like_address(input: &str) -> bool {
         || input.parse::<Address<NetworkUnchecked>>().is_ok()
 }
 
-/// Both tables, if missing (databases from before v2 don't have them).
+/// Both tables, if missing (older databases don't have them).
 pub(crate) fn create_tables(db: &Connection) -> Result<()> {
     db.execute(CREATE_CONTACTS_TABLE, [])
         .and_then(|_| db.execute(CREATE_LABELS_TABLE, []))
@@ -133,10 +122,8 @@ impl WalletService {
         Ok(contacts)
     }
 
-    /// Save a new contact. The address must be valid for this wallet's network
-    /// (`InvalidAddress` / `NetworkMismatch`) and is stored in its canonical form; the name must
-    /// follow the rules in the module docs and not be taken, ignoring case (`Contact`). A blank
-    /// note is no note.
+    /// Save a new contact. The address must be valid for this network and is stored canonically;
+    /// the name follows the module rules. A blank note is no note.
     pub fn add_contact(
         &mut self,
         name: &str,
@@ -175,8 +162,7 @@ impl WalletService {
         Ok(contact)
     }
 
-    /// Rename a contact (`old` matched ignoring case). The new name follows the same rules as in
-    /// [`WalletService::add_contact`]; changing only its case is allowed.
+    /// Rename a contact (`old` matched ignoring case); changing only the case is allowed.
     pub fn rename_contact(&mut self, old: &str, new: &str) -> Result<Contact> {
         let contact = self.existing_contact(old)?;
         let new = contact_name(new)?;
@@ -200,13 +186,8 @@ impl WalletService {
         })
     }
 
-    /// What the user typed as a payment's destination: an address, or else a contact's name.
-    ///
-    /// 1. A valid address for this network is used as is (`contact: None`), even if a contact
-    ///    has that address.
-    /// 2. An address for another network is `NetworkMismatch`, and anything that
-    ///    [`looks_like_address`] is `InvalidAddress`: never looked up as a name.
-    /// 3. Otherwise it is a contact name, matched ignoring case; an unknown name is `Contact`.
+    /// A payment's destination as typed: an address for this network, or else a contact name
+    /// (ignoring case). Anything that [`looks_like_address`] is never looked up as a name.
     pub fn resolve_recipient(&self, input: &str) -> Result<Recipient> {
         let input = input.trim();
         match tx::parse_address(input, self.network()) {
@@ -222,7 +203,7 @@ impl WalletService {
                         "no contact is named `{input}`, and it is not a valid address either"
                     )));
                 };
-                // Checked when it was saved; checked again in case the file was edited since.
+                // Checked again in case the file was edited since it was saved.
                 let address = tx::parse_address(&contact.address, self.network())?;
                 Ok(Recipient {
                     address,
@@ -238,8 +219,7 @@ impl WalletService {
         self.labels().get(&txid).map(String::as_str)
     }
 
-    /// Label a transaction this wallet knows (one that appears in `history()`; `TxNotFound`
-    /// otherwise), replacing any earlier label. Returns the label as stored (trimmed).
+    /// Label a transaction this wallet knows, replacing any earlier label. Returns it trimmed.
     pub fn set_label(&mut self, txid: Txid, label: &str) -> Result<String> {
         let label = checked_text("a label", label, MAX_LABEL_CHARS)?;
         if self.bdk().get_tx(txid).is_none() {
@@ -249,8 +229,7 @@ impl WalletService {
         Ok(label)
     }
 
-    /// Remove a transaction's label. `Ok(false)` if it had none; `TxNotFound` if it had none and
-    /// the wallet doesn't know the transaction either (a mistyped txid).
+    /// Remove a transaction's label. `Ok(false)` if it had none; `TxNotFound` for an unknown txid.
     pub fn clear_label(&mut self, txid: Txid) -> Result<bool> {
         if !self.labels().contains_key(&txid) {
             return match self.bdk().get_tx(txid) {
@@ -268,9 +247,8 @@ impl WalletService {
         Ok(true)
     }
 
-    /// After a fee bump: the replacement takes over the label of the payment it replaced, so the
-    /// history keeps saying what the payment was for. Never overwrites a label of its own.
-    /// Best effort (logged): the payment has been sent either way.
+    /// After a fee bump, the replacement takes over the replaced payment's label (never
+    /// overwriting its own). Best effort: the payment has been sent either way.
     pub(crate) fn inherit_label(&mut self, txid: Txid, replaced: &[Txid]) {
         if self.labels().contains_key(&txid) {
             return;
@@ -372,8 +350,8 @@ fn contact_write_err(name: &str, action: &str, e: bdk_wallet::rusqlite::Error) -
     }
 }
 
-/// Labels need transactions the wallet knows, which needs the crate-private `bdk_mut()` to fund
-/// it without a node. The contact rules are tested through the public API in `tests/book.rs`.
+/// Label tests need `bdk_mut()` to fund a wallet without a node; contacts are tested in
+/// `tests/book.rs`.
 #[cfg(test)]
 mod tests {
     use std::error::Error;

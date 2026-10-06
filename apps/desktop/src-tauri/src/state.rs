@@ -1,15 +1,10 @@
-//! What the app remembers between commands: the settings, the unlocked session, and one gate
-//! per network that serializes wallet access inside this process.
+//! What the app remembers between commands; the wallet itself is opened per command.
 //!
-//! The wallet itself is **not** kept open. Each command opens it, uses it and drops it (see
-//! `commands.rs`), so the wallet's lock file is held only for that moment and the CLI keeps
-//! working while the app is open. What survives between commands:
-//!
-//! - [`Session`]: the [`Signer`] (master private key) while unlocked, the time of the last user
-//!   activity, and at most one prepared payment (its PSBT stays here, behind a random id).
+//! - [`Session`]: the [`Signer`] while unlocked, the last user activity, and at most one
+//!   prepared payment.
 //! - The settings from `desktop.json`.
-//! - A cache of each network's synced height, so `app_info` can answer while a long sync holds
-//!   the wallet.
+//! - Each network's last synced height, so `app_info` can answer during a long sync.
+//! - One gate per network that serializes wallet access inside this process.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,9 +21,8 @@ use crate::settings::{self, SETTINGS_FILE, StoredSettings};
 /// How long a prepared payment can wait for "Send" before it has to be reviewed again.
 pub const PENDING_SEND_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// The Rust-side auto-lock is a backstop for the UI's own timer, which runs on every key press
-/// and mouse move. The UI reports activity with `keep_alive` at most every 30 s, so this margin
-/// makes sure the UI's timer always fires first (and can tell the user why) when it works.
+/// The Rust-side auto-lock backs up the UI's timer. The UI reports activity at most every 30 s,
+/// so this margin lets the UI's timer fire first and tell the user why.
 pub const AUTO_LOCK_GRACE: Duration = Duration::from_secs(60);
 
 /// Source of "now", injectable so tests can move time forward.
@@ -47,11 +41,8 @@ impl Clock for SystemClock {
 /// Reads an environment variable (`BTCW_*`); injectable so tests don't see the developer's shell.
 pub type EnvLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
-/// Whether a command counts as the user doing something with the wallet.
-///
-/// Reads (`app_info`, `balance`, `tx_status`, `sync`, …) are also issued by timers and
-/// follow-up refreshes (the transaction screen polls every 10 s), so they must not keep the
-/// signing key alive. They still check the deadline and lock first if it has passed.
+/// Whether a command counts as user activity. Reads are also issued by timers, so they must not
+/// keep the signing key alive; they still lock if the deadline has passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
     User,
@@ -93,7 +84,7 @@ impl AppState {
     }
 
     /// The real app: `BTCW_DATADIR` if set, else btcw's default data directory, so the CLI and
-    /// the app share wallets. The process environment is read on every command, like the CLI.
+    /// the app share wallets.
     pub fn from_process_env() -> Self {
         let env = |key: &str| std::env::var(key).ok();
         let datadir = env("BTCW_DATADIR")
@@ -179,9 +170,8 @@ impl AppState {
         lock(&self.session)
     }
 
-    /// One gate per network: commands that open a network's wallet take turns, because the
-    /// wallet's file lock is per open file, so two commands of this process opening it at once
-    /// would refuse each other (`wallet_in_use`). Different networks never wait for each other.
+    /// One gate per network: the wallet's file lock is per open file, so two commands of this
+    /// process opening it at once would refuse each other (`wallet_in_use`).
     pub(crate) fn gate(&self, network: Network) -> Arc<Mutex<()>> {
         Arc::clone(lock(&self.gates).entry(network).or_default())
     }
@@ -195,8 +185,7 @@ impl AppState {
     }
 }
 
-/// A poisoned mutex only means another command panicked while holding it; the data inside is
-/// still consistent (every update is a plain assignment), so keep going rather than wedge the app.
+/// Ignore poisoning: every update is a plain assignment, so the data stays consistent.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -220,9 +209,7 @@ pub(crate) struct PendingSend {
     pub network: Network,
     pub psbt: Psbt,
     pub created: Instant,
-    /// A fee bump ("Speed up"): the unconfirmed payment this one replaces. `confirm_send`
-    /// checks a bump with `tx::check_prepared_bump` instead of `tx::check_prepared`, which would
-    /// refuse it (the original already spends the same coins and paid the same change address).
+    /// For a fee bump: the unconfirmed payment this one replaces.
     pub replaces: Option<Txid>,
 }
 

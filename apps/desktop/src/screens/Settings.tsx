@@ -80,7 +80,7 @@ export function SettingsScreen({
         rpc_url: url === "" ? null : url,
         rpc_cookie: draft.cookie.trim() === "" ? null : draft.cookie.trim(),
         auto_lock_minutes: minutes,
-        // Typing MAINNET above is the opt-in (the second mainnet gate); it stays given.
+        // Typing MAINNET above is the runtime opt-in; it stays given.
         mainnet_opt_in: settings.mainnet_opt_in || (networkChanged && chosen.real),
       });
       setSaving(false);

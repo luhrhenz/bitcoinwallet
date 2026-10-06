@@ -1,5 +1,5 @@
-//! `btcw label TXID TEXT` / `btcw label TXID --clear` (PLAN-v2 §1). Watch-only, offline: the
-//! label is stored in the wallet file next to the transaction and shown by `btcw history`.
+//! `btcw label TXID TEXT` / `btcw label TXID --clear`. Watch-only and offline; shown by
+//! `btcw history`.
 
 use anyhow::Result;
 use btcw_core::api;

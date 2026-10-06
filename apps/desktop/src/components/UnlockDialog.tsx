@@ -3,10 +3,7 @@ import { describeError } from "../lib/errors";
 import { Field, NO_ASSIST } from "./Field";
 import { Modal } from "./Modal";
 
-/**
- * Asks for the wallet password. The password goes straight to the `unlock` command (Rust
- * decrypts the keystore and keeps the keys); the UI keeps nothing once the dialog closes.
- */
+/** Asks for the wallet password and passes it straight to `unlock`; the UI keeps nothing. */
 export function UnlockDialog({
   onUnlock,
   onDone,

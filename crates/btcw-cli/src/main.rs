@@ -1,19 +1,13 @@
 //! `btcw`: terminal interface over `btcw-core`.
 //!
-//! OWNER: Agent D (Phase 1; `send`/`status` by Agent F in Phase 2; `contacts`/`label`/`bump` by
-//! Agent I in v2). Contract: PLAN §4 "CLI surface", PLAN-v2 §1–2.
-//! The clap surface below is the contract; keep flag names stable (the demo script and e2e
-//! tests use them). Human-readable output by default, `--json` prints `btcw_core::types`
-//! values (errors as `{"error": {"code", "message"}}` with a non-zero exit).
+//! Keep flag names stable: scripts and the e2e tests use them. `--json` prints
+//! `btcw_core::types` values, and errors as `{"error": {"code", "message"}}` with a non-zero
+//! exit.
 //!
-//! This crate holds no wallet logic. Each command opens the wallet through `btcw_core::api`,
-//! calls one or two core functions and renders the result:
+//! No wallet logic lives here:
 //! - [`commands`]: one module per command family.
 //! - [`output`]: the network badge, colors, amounts, tables, JSON and error rendering.
-//! - [`prompt`]: passwords and the recovery phrase (hidden TTY prompts, stdin, `BTCW_PASSWORD`).
-//!
-//! Passwords: prompted with `rpassword`. `BTCW_PASSWORD` is honoured for scripted demos and
-//! tests only (documented as insecure).
+//! - [`prompt`]: passwords and the recovery phrase.
 
 mod commands;
 mod output;
@@ -259,12 +253,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Core warnings (fee fallback, node still syncing, shortened chain) go to stderr at `warn`, so
-/// they are visible but never mix with stdout or `--json`. `RUST_LOG` overrides the level.
+/// Core warnings go to stderr at `warn`, never mixing with stdout or `--json`. `RUST_LOG`
+/// overrides the level.
 fn init_logging(ui: &Ui) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    // `try_init` only fails if a subscriber is already installed, which can't happen here.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

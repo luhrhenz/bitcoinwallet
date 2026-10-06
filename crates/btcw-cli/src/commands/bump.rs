@@ -1,21 +1,16 @@
-//! `btcw bump TXID --fee-rate N`: speed up an unconfirmed payment by replacing it (RBF, BIP125)
-//! with one that pays the same recipient the same amount and a higher fee (PLAN-v2 §2).
+//! `btcw bump TXID --fee-rate N`: replace an unconfirmed payment (RBF, BIP125) with one paying
+//! the same recipient the same amount and a higher fee.
 //!
 //! Same order as `send`:
-//! 1. Checks that need neither the password nor the node: `--json` needs `--yes`, the txid,
-//!    `--fee-rate` (1 to 25 000 sat/vB), the wallet exists, a terminal to confirm on.
-//! 2. Open the wallet **watch-only**.
-//! 3. `Node::connect` + sync: a payment that confirmed meanwhile can't be replaced, and the
-//!    extra fee may need a coin that arrived since the last sync.
-//! 4. `tx::prepare_fee_bump`: every rule (ours, unconfirmed, signals RBF, no unconfirmed child,
-//!    rate high enough), the replacement PSBT, and the same preview as a payment, which starts
-//!    with "Replaces <txid>". The desktop bridge calls the same function.
-//! 5. The preview, what changes, warnings for unusual fees; `Send the replacement? [y/N]`.
-//! 6. Only now the password → `api::load_signer`; sign, drop the signer, `tx::broadcast_signed`
-//!    (extract → broadcast → record: the replaced payment leaves the wallet's history at once).
+//! 1. Checks that need neither the password nor the node.
+//! 2. Open the wallet watch-only.
+//! 3. Connect and sync: the payment may have confirmed, or the extra fee may need a new coin.
+//! 4. `tx::prepare_fee_bump`, as the desktop app does.
+//! 5. Preview, fee warnings, `Send the replacement? [y/N]`.
+//! 6. Only now the password; sign, drop the signer, broadcast.
 //!
-//! From step 4 on, every way out except a successful broadcast releases any change address the
-//! replacement reserved (`send::release`).
+//! From step 4 on, every way out except a successful broadcast releases any reserved change
+//! address.
 
 use anyhow::{Result, bail};
 use btcw_core::WalletError;
@@ -38,7 +33,6 @@ struct BumpJson {
     network: String,
     /// The replacement's txid.
     txid: String,
-    /// `preview.replaces` is the txid of the payment that was replaced.
     preview: SendPreview,
 }
 
@@ -74,14 +68,14 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
     let mut wallet = api::open_watch_only(cfg)?;
     let node = Node::connect(&cfg.rpc, cfg.network)?;
     sync_with_progress(ui, &node, &mut wallet)?;
-    // For "the fee rises from … to …": the wallet knows the fee of its own payments.
+    // For "the fee rises from … to …".
     let old_fee = wallet
         .history()
         .into_iter()
         .find(|row| row.txid == txid.to_string())
         .and_then(|row| row.fee_sat);
 
-    // 4. Same function as the desktop app's "Speed up".
+    // 4. Build the replacement and preview it.
     let (mut psbt, preview) = tx::prepare_fee_bump(&mut wallet, &node, txid, Some(fee_rate))?;
 
     // 5. Declined or failed: give back any change address the replacement reserved.
@@ -138,7 +132,7 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
         release(ui, &mut wallet, &psbt);
         return Err(e.into());
     }
-    // Releases the change address itself if the extract or the broadcast fails.
+    // Releases the change address itself if extract or broadcast fails.
     let replacement = tx::broadcast_signed(&mut wallet, &node, psbt)?;
     drop(wallet);
 

@@ -1,19 +1,13 @@
 //! High-level wallet lifecycle shared by the CLI and the desktop app.
 //!
-//! These functions only orchestrate `keys`, `keystore` and `wallet`; they hold no logic of
-//! their own. Syncing is left to the caller (it needs a [`crate::chain::Node`] and progress UI).
+//! Orchestrates `keys`, `keystore` and `wallet`; syncing is left to the caller.
 //!
-//! Two ways in:
-//! - [`open_watch_only`]: no password. Balance, history, addresses, sync. Cannot sign.
-//! - [`unlock_wallet`]: password → decrypt seed → [`Unlocked`] with a [`Signer`] for sending.
-//!   [`load_signer`] does the same for a wallet that is already open watch-only, so a frontend
-//!   can show a payment preview first and ask for the password only once the user says "send".
+//! - [`open_watch_only`]: no password; can't sign.
+//! - [`unlock_wallet`]: password → [`Unlocked`] with a [`Signer`]. [`load_signer`] does the same
+//!   for a wallet already open watch-only, so the password is asked only at "send".
 //!
-//! Backup (the recovery phrase on paper is the only real backup):
-//! - a new wallet starts *unverified*; frontends remind the user until [`verify_backup`] passes
-//!   (a restored wallet is verified: the user just typed the phrase in)
-//! - [`backup_challenge`] picks the word positions to ask for
-//! - [`reveal_phrase`] shows the phrase again, with the password, at any time
+//! A new wallet starts with its backup unverified until [`verify_backup`] passes; a restored
+//! one is verified.
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -29,8 +23,7 @@ pub const ACCOUNT: u32 = 0;
 /// Words asked for in the backup check.
 pub const BACKUP_CHECK_WORDS: usize = 3;
 
-/// Minimum length for a new wallet password, enforced here so the CLI and desktop app agree.
-/// Argon2id makes each guess expensive, but it can't save a 4-character password.
+/// Minimum length for a new wallet password.
 pub const MIN_PASSWORD_LEN: usize = 8;
 
 /// A wallet that can spend. Drop it (or just the signer) to lock.
@@ -40,8 +33,7 @@ pub struct Unlocked {
     pub signer: Signer,
 }
 
-/// Returned once from [`create_wallet`]: the caller must show `mnemonic` to the user for
-/// backup and then drop it. It is never stored unencrypted.
+/// Returned once from [`create_wallet`]: show `mnemonic` for backup, then drop it.
 #[derive(Debug)]
 pub struct CreatedWallet {
     pub mnemonic: Mnemonic,
@@ -77,7 +69,7 @@ pub fn restore_wallet(
     check_new_password(password)?;
     let mnemonic = keys::parse_mnemonic(phrase)?;
     let mut unlocked = init(cfg, &mnemonic, password, birthday)?;
-    // The user just typed the whole phrase in: that is the backup, and it's correct.
+    // The user just typed the phrase in, so the backup is known to be correct.
     unlocked.wallet.set_backup_verified(true)?;
     Ok(unlocked)
 }
@@ -103,8 +95,8 @@ pub fn check_new_password(password: &SecretString) -> Result<()> {
     Ok(())
 }
 
-/// The [`Signer`] for a wallet that is already open (e.g. watch-only, to show a preview first).
-/// Fails with `Persist` if the decrypted seed doesn't belong to `wallet`.
+/// The [`Signer`] for a wallet that is already open. Fails with `Persist` if the seed doesn't
+/// belong to `wallet`.
 pub fn load_signer(
     cfg: &Config,
     wallet: &WalletService,
@@ -120,8 +112,7 @@ pub fn load_signer(
     Ok(signer)
 }
 
-/// The recovery phrase, decrypted with the password. The caller shows it and drops it; it must
-/// never be logged, stored or put in machine-readable output.
+/// The recovery phrase, decrypted. Never log, store or put it in machine-readable output.
 pub fn reveal_phrase(cfg: &Config, password: &SecretString) -> Result<Mnemonic> {
     keystore::load(&cfg.keystore_path(), cfg.network, password)
 }
@@ -140,12 +131,9 @@ pub fn backup_challenge(word_count: usize) -> Result<Vec<usize>> {
     Ok(positions)
 }
 
-/// Check words the user read from their paper copy against the encrypted phrase; on success the
-/// wallet is marked verified. `answers` are `(1-based position, word)`; give at least
-/// [`BACKUP_CHECK_WORDS`] (or every word). Comparison ignores case and surrounding spaces.
-///
-/// `BackupMismatch` lists the wrong positions (never the words); `WrongPassword` if the password
-/// is wrong. A failed check leaves the flag unchanged.
+/// Check `(1-based position, word)` answers against the encrypted phrase and mark the wallet
+/// verified. Needs at least [`BACKUP_CHECK_WORDS`] answers (or every word); ignores case and
+/// surrounding spaces. `BackupMismatch` lists wrong positions, never words.
 pub fn verify_backup(
     cfg: &Config,
     wallet: &mut WalletService,
@@ -210,7 +198,7 @@ fn random_below(n: usize) -> Result<usize> {
         })?;
         let value = u32::from_le_bytes(bytes);
         if value < zone {
-            // `value % n < n ≤ u32::MAX`, and usize is at least 32 bits on every target we build.
+            // `value % n < n ≤ u32::MAX`, and usize is at least 32 bits on our targets.
             return Ok((value % n) as usize);
         }
     }

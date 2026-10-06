@@ -1,9 +1,6 @@
-//! The mnemonic, encrypted at rest.
+//! The mnemonic, encrypted at rest (BDK persists only public descriptors).
 //!
-//! OWNER: Agent A (Phase 1). Contract: PLAN §5.10.
-//!
-//! BDK persists only *public* descriptors, so the seed has to be stored separately.
-//! File format (JSON, mode 0600, written atomically via temp file + rename):
+//! JSON, mode 0600, written atomically via temp file + rename:
 //! ```json
 //! { "version": 1, "network": "testnet4",
 //!   "kdf": { "alg": "argon2id", "m_kib": 65536, "t": 3, "p": 1, "salt": "<b64 16B>" },
@@ -36,22 +33,21 @@ const CIPHER_ALG: &str = "xchacha20poly1305";
 /// Prefix of the AEAD associated data; the network name is appended.
 const AAD_PREFIX: &str = "btcw-keystore-v1|";
 
-/// Argon2id cost for new keystores: 64 MiB, 3 passes, 1 lane (the RFC 9106 "second
-/// recommended" profile). Roughly half a second per unlock on a laptop.
+/// Argon2id cost for new keystores: 64 MiB, 3 passes, 1 lane (RFC 9106's second recommended
+/// profile), about half a second per unlock.
 const DEFAULT_M_KIB: u32 = 64 * 1024;
 const DEFAULT_T: u32 = 3;
 const DEFAULT_P: u32 = 1;
 
-/// Upper bounds for costs read from a file. The file is untrusted input: without these a
-/// crafted keystore could make `load` allocate terabytes or spin for hours before the
-/// password is even checked.
+/// Upper bounds for costs read from the (untrusted) file, so a crafted keystore can't make
+/// `load` allocate terabytes or spin for hours.
 const MAX_M_KIB: u32 = 1024 * 1024; // 1 GiB
 const MAX_T: u32 = 10;
 const MAX_P: u32 = 16;
 
 const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
-/// XChaCha20's 192-bit nonce is large enough to pick at random with no risk of reuse.
+/// XChaCha20's 192-bit nonce is safe to pick at random.
 const NONCE_LEN: usize = 24;
 
 /// A real keystore is well under 1 KiB; refuse to read anything absurdly large.
@@ -85,8 +81,7 @@ struct CipherSection {
     ciphertext: String,
 }
 
-/// Read before the full parse so a future version reports "unsupported version" rather than
-/// a confusing "unknown field" error.
+/// Read first so a newer file reports "unsupported version", not "unknown field".
 #[derive(Deserialize)]
 struct VersionProbe {
     version: u32,
@@ -103,8 +98,7 @@ pub fn save(
     if password.is_empty() {
         return Err(WalletError::Keystore("password must not be empty".into()));
     }
-    // Checked up front so an existing wallet is reported before spending time on Argon2;
-    // `write_new_file` checks again right before publishing the file.
+    // Report an existing wallet before Argon2 runs; `write_new_file` checks again.
     ensure_absent(path)?;
 
     let mut salt = [0u8; SALT_LEN];
@@ -178,8 +172,7 @@ pub fn load(path: &Path, network: Network, password: &SecretString) -> Result<Mn
         )));
     }
 
-    // A friendly early error. The real protection is the AAD: editing this field to match
-    // the requested network makes decryption fail below.
+    // A friendly early error; the AAD is what actually binds the network.
     let found: Network = file
         .network
         .parse()
@@ -205,8 +198,8 @@ pub fn load(path: &Path, network: Network, password: &SecretString) -> Result<Mn
 
     let key = derive_key(password.expose_secret().as_bytes(), &salt, m_kib, t, p)?;
     let aad = aad(network);
-    // The Poly1305 tag authenticates the ciphertext *and* the AAD, so a wrong password, a
-    // flipped byte and a relabelled network all fail here the same way.
+    // The tag covers ciphertext and AAD: a wrong password, a flipped byte and a relabelled
+    // network all fail here the same way.
     let plaintext = Zeroizing::new(
         cipher(&key)?
             .decrypt(
@@ -254,8 +247,7 @@ fn fill_random(buf: &mut [u8]) -> Result<()> {
         .map_err(|e| WalletError::Keystore(format!("OS random number generator failed: {e}")))
 }
 
-/// Base64 field that must decode to exactly `N` bytes (a wrong length would otherwise only
-/// surface as a confusing decryption failure, or not at all for the salt).
+/// Base64 field that must decode to exactly `N` bytes.
 fn decode_exact<const N: usize>(field: &str, value: &str) -> Result<[u8; N]> {
     B64.decode(value)
         .ok()
@@ -287,7 +279,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn ensure_absent(path: &Path) -> Result<()> {
-    // `symlink_metadata` so that even a dangling symlink at `path` counts as "exists".
+    // `symlink_metadata` so a dangling symlink counts as existing.
     match fs::symlink_metadata(path) {
         Ok(_) => Err(WalletError::WalletExists(path.to_path_buf())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -295,12 +287,8 @@ fn ensure_absent(path: &Path) -> Result<()> {
     }
 }
 
-/// Write `contents` to `path` so that readers only ever see no file or the complete file.
-///
-/// The data goes to a fresh temp file in the same directory (created with `create_new`, so
-/// nothing is ever overwritten, and mode 0600 from the start, so the ciphertext is never
-/// world-readable, not even briefly), is flushed to disk, and is then renamed into place.
-/// Rename is atomic within one filesystem, which is why the temp file lives next to the target.
+/// Write `contents` so readers only ever see no file or the complete file: a `create_new` temp
+/// file in the same directory, mode 0600 from the start, synced, then renamed into place.
 fn write_new_file(path: &Path, contents: &[u8]) -> Result<()> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -331,15 +319,13 @@ fn write_new_file(path: &Path, contents: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         file.write_all(contents)?;
         file.sync_all()?;
-        // `rename` replaces an existing target, so re-check right before it. The window left
-        // between this check and the rename is only reachable by two concurrent creates of the
-        // same wallet, which the caller already prevents by checking first (see `api.rs`).
+        // `rename` replaces an existing target, so re-check. The remaining race needs two
+        // concurrent creates of the same wallet, which `api.rs` checks for first.
         ensure_absent(path)?;
         fs::rename(&tmp, path)?;
         Ok(())
     })();
     if result.is_err() {
-        // Don't leave a stray temp file behind; the original error is what matters.
         let _ = fs::remove_file(&tmp);
     }
     result?;
@@ -348,9 +334,8 @@ fn write_new_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Make the rename itself durable across a power cut by syncing the directory entry.
-/// Best effort: the file is already complete and in place, so failing here would only make
-/// the caller report an error for a keystore that was in fact written.
+/// Sync the directory so the rename survives a power cut. Best effort: the file is already in
+/// place.
 fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     {

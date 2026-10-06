@@ -8,11 +8,8 @@ import { PhraseGrid, PhraseWarning } from "./Phrase";
 export const REVEAL_TIMEOUT_MS = 60_000;
 
 /**
- * "Show recovery phrase": password → the words, still hidden → "Reveal" → numbered grid.
- *
- * The words live only in this component's state: they are dropped after
- * `REVEAL_TIMEOUT_MS`, on "Hide", and when the component unmounts (leaving the screen or
- * closing the dialog). They are never copyable and never stored.
+ * "Show recovery phrase": password → "Reveal" → numbered grid. The words live only in this
+ * component's state and are dropped after `REVEAL_TIMEOUT_MS`, on "Hide", or on unmount.
  */
 export function RevealPhrase({ onClose }: { onClose?: () => void }) {
   const [password, setPassword] = useState("");

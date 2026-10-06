@@ -3,11 +3,7 @@ import { useWallet } from "../state/wallet";
 import { Icon } from "./Icon";
 import { RevealPhraseDialog, VerifyBackupDialog } from "./VerifyBackup";
 
-/**
- * Shown on the dashboard and the send screen until the user has proved their paper copy of the
- * recovery phrase is right (`AppInfo.backup_verified === false`). Calm, not alarming: it says
- * why it matters and offers the two ways forward.
- */
+/** Shown on the dashboard and the send screen until the backup has been verified. */
 export function BackupReminder() {
   const { info } = useWallet();
   const titleId = useId();

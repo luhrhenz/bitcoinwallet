@@ -1,14 +1,10 @@
 //! The one error shape that crosses into JS: `ApiError { code, message }` (`types.ts`).
 //!
-//! `code` is [`WalletError::code`] for every core error, plus two of the bridge's own:
-//! - `"locked"`: the command needs the signer and the wallet is locked (the UI asks for the
-//!   password and tries again);
-//! - `"internal"`: anything else, i.e. a bug or an unexpected failure in the bridge itself
-//!   (a panicked command, the OS random number generator failing).
+//! `code` is [`WalletError::code`] for core errors, plus `"locked"` (the command needs the
+//! signer) and `"internal"` (a bug or unexpected failure in the bridge).
 //!
-//! `message` is the core's `Display` text, which never contains secrets (`error.rs` rule in
-//! btcw-core), or a fixed sentence written here. Nothing user-supplied that could be secret
-//! (passwords, phrases, words) is ever formatted into a message.
+//! `message` is the core's `Display` text or a fixed sentence; nothing that could be secret is
+//! ever formatted into it.
 
 use btcw_core::WalletError;
 use serde::Serialize;

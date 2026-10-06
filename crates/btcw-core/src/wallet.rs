@@ -1,20 +1,13 @@
 //! [`WalletService`]: a BDK wallet persisted to SQLite, plus read-only views of its state.
 //!
-//! OWNER: Agent C (Phase 1). Contract: PLAN §4, §5.3–5.7.
-//!
 //! - One wallet per `<datadir>/<network>/wallet.sqlite`.
-//! - While open, holds an exclusive `File::try_lock` on `cfg.lock_path()` so the CLI and the
-//!   desktop app can't write the same wallet at once (`WalletInUse`).
-//! - The wallet holds **public descriptors only**; signing lives in `keys::Signer`. So `open`
-//!   needs no password: it loads descriptors from the database, checks the network
-//!   (`.check_network(..)`), and, if `expected` is given, checks they match
-//!   (`.descriptor(keychain, Some(..))`).
-//! - Stores a *birthday height* in its own SQLite table (`btcw_meta`, same file). `Node::sync`
-//!   starts scanning there, so a new wallet never rescans the whole chain.
-//! - Confirmation counts come from the wallet's own latest checkpoint (the synced tip),
-//!   so the views work offline.
-//! - The address book and transaction labels (v2, `book.rs`) are two more tables of ours in the
-//!   same file; labels are cached in memory so `history()` stays infallible.
+//! - While open, holds an exclusive lock on `cfg.lock_path()` so the CLI and the desktop app
+//!   can't write the same wallet at once (`WalletInUse`).
+//! - Public descriptors only; signing lives in `keys::Signer`, so `open` needs no password.
+//! - A birthday height in our own `btcw_meta` table tells `Node::sync` where to start scanning.
+//! - Confirmations count from the wallet's synced tip, so the views work offline.
+//! - Contacts and labels (`book.rs`) are two more tables in the same file; labels are cached in
+//!   memory so `history()` stays infallible.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -42,9 +35,8 @@ pub const LOOKAHEAD: u32 = 25;
 const CREATE_META_TABLE: &str =
     "CREATE TABLE IF NOT EXISTS btcw_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
 const BIRTHDAY_KEY: &str = "birthday_height";
-/// `"1"` once the user proved they wrote the recovery phrase down (see `api::verify_backup`).
-/// A missing row means *not verified*, so a crash can only cause an extra reminder, never a
-/// missing one.
+/// `"1"` once the user has verified the recovery phrase. A missing row means not verified, so a
+/// crash can only cause an extra reminder, never a missing one.
 const BACKUP_KEY: &str = "backup_verified";
 
 pub struct WalletService {
@@ -53,16 +45,14 @@ pub struct WalletService {
     network: Network,
     /// `<datadir>/<network>/`, for files that live next to the database (the mempool cache).
     network_dir: PathBuf,
-    /// Read once at open time: `birthday_height()` is infallible, and the value never changes.
+    /// Read once at open time; it never changes.
     birthday: u32,
-    /// Cached copy of the `backup_verified` row; [`WalletService::set_backup_verified`] keeps
-    /// both in step.
+    /// Cached `backup_verified` row.
     backup_verified: bool,
-    /// Copy of the `btcw_labels` table, loaded at open time. Only this process can write the
-    /// file while it holds the lock, and `book.rs` updates both together, so it never goes stale.
+    /// Copy of `btcw_labels`. Only this process writes while it holds the lock, so it can't go
+    /// stale.
     labels: HashMap<Txid, String>,
-    /// Declared last so it is dropped last: the lock is released only after the database
-    /// connection has been closed.
+    /// Declared last so the lock is released only after the database connection closes.
     _lock: File,
 }
 
@@ -79,7 +69,7 @@ impl WalletService {
     /// `birthday`: first block height that can contain our transactions (`None` = genesis).
     pub fn create(cfg: &Config, descriptors: &Descriptors, birthday: Option<u32>) -> Result<Self> {
         let lock = acquire_lock(cfg)?;
-        // Checked under the lock, so another btcw process can't create the file in between.
+        // Checked under the lock, so another process can't create the file in between.
         let db_path = cfg.wallet_db_path();
         if db_path.exists() {
             return Err(WalletError::WalletExists(cfg.network_dir()));
@@ -99,8 +89,7 @@ impl WalletService {
                 _lock: lock,
             }),
             Err(e) => {
-                // `create_db` owned the connection, so it is closed by now. Remove the partial
-                // file, otherwise every retry would fail with `WalletExists`.
+                // Remove the partial file, or every retry would fail with `WalletExists`.
                 remove_partial_db(&db_path);
                 Err(e)
             }
@@ -111,15 +100,13 @@ impl WalletService {
     /// belongs to another network; `Persist` if `expected` descriptors don't match.
     pub fn open(cfg: &Config, expected: Option<&Descriptors>) -> Result<Self> {
         let db_path = cfg.wallet_db_path();
-        // Fail before creating the network directory or lock file: opening a wallet that isn't
-        // there should leave no trace (e.g. `btcw balance --network signet` by mistake).
+        // Fail before creating the directory or lock file, so a missing wallet leaves no trace.
         if !db_path.exists() {
             return Err(WalletError::WalletNotFound(cfg.network_dir()));
         }
         let lock = acquire_lock(cfg)?;
 
-        // No SQLITE_OPEN_CREATE: if the file vanished after the check above, SQLite must fail
-        // rather than silently create an empty database.
+        // No SQLITE_OPEN_CREATE: if the file vanished since the check, fail rather than create it.
         let mut db = Connection::open_with_flags(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -149,7 +136,7 @@ impl WalletService {
         restore_first_seen(&mut wallet, &db)?;
         let birthday = read_birthday(&db)?;
         let backup_verified = read_meta(&db, BACKUP_KEY)?.as_deref() == Some("1");
-        // Wallets created before v2 have no address-book tables yet.
+        // Older wallets have no address-book tables yet.
         book::create_tables(&db)?;
         let labels = book::load_labels(&db)?;
         Ok(Self {
@@ -193,9 +180,8 @@ impl WalletService {
         Ok(())
     }
 
-    /// The backup flag without opening the wallet: no lock, no BDK load, read-only SQLite.
-    /// For reminders shown next to other commands (and while another process has the wallet
-    /// open). `None` if there is no wallet for this network.
+    /// The backup flag without opening the wallet (no lock, read-only), so it works while
+    /// another process has it open. `None` if there is no wallet.
     pub fn read_backup_verified(cfg: &Config) -> Result<Option<bool>> {
         let db_path = cfg.wallet_db_path();
         if !db_path.exists() {
@@ -235,9 +221,8 @@ impl WalletService {
     /// Next unused receive address (reuses a revealed-but-unused one). Persists the reveal.
     pub fn new_address(&mut self) -> Result<AddressRow> {
         let info = self.wallet.next_unused_address(KeychainKind::External);
-        // Persist before handing the address out, as BDK's docs require: otherwise, after a
-        // restart the revealed index would go backwards and `addresses()` would no longer list
-        // an address the user may already have shared.
+        // Persist before handing it out (as BDK requires), or after a restart the revealed
+        // index could go backwards and forget an address the user already shared.
         self.persist()?;
         Ok(AddressRow {
             index: info.index,
@@ -302,8 +287,7 @@ impl WalletService {
                     received_sat,
                     sent_sat,
                     net_sat: net_sat(received_sat, sent_sat),
-                    // Errors when an input's previous output is unknown to the wallet, which is
-                    // normal for incoming payments: the sender's coins aren't ours.
+                    // Unknown for incoming payments: the sender's inputs aren't ours.
                     fee_sat: self.wallet.calculate_fee(tx).ok().map(|fee| fee.to_sat()),
                     status: tx_status(&wtx.chain_position, tip),
                     label: self.labels.get(&txid).cloned(),
@@ -336,10 +320,8 @@ impl WalletService {
             .map_err(|e| persist_err("saving wallet changes", e))
     }
 
-    /// True if `descriptors` are this wallet's (both keychains), e.g. to check that a decrypted
-    /// seed belongs to the wallet before signing with it.
+    /// True if `descriptors` are this wallet's (both keychains).
     pub fn matches(&self, descriptors: &Descriptors) -> bool {
-        // Both sides are miniscript's `Display` of the same public descriptor, checksum included.
         self.wallet
             .public_descriptor(KeychainKind::External)
             .to_string()
@@ -387,8 +369,7 @@ impl WalletService {
 
 /// Take the per-network lock, creating the directory and lock file if needed.
 ///
-/// The lock file is never deleted: removing it while another process waits on it would let
-/// two processes hold "the" lock on two different inodes.
+/// The lock file is never deleted: that would let two processes lock two different inodes.
 fn acquire_lock(cfg: &Config) -> Result<File> {
     let dir = cfg.network_dir();
     std::fs::create_dir_all(&dir).map_err(|e| io_err("creating", &dir, e))?;
@@ -408,8 +389,7 @@ fn acquire_lock(cfg: &Config) -> Result<File> {
     }
 }
 
-/// Everything in `create` that touches the database file. On error the caller deletes the
-/// file, so nothing here needs its own cleanup.
+/// Everything in `create` that touches the database file; the caller deletes it on error.
 fn create_db(
     cfg: &Config,
     db_path: &Path,
@@ -435,8 +415,8 @@ fn create_db(
             WalletError::Config(format!("invalid wallet descriptors: {e}"))
         }
     })?;
-    // Written after the wallet on purpose: if we crash between the two, the wallet opens with a
-    // missing birthday, which reads as 0 (scan from genesis). Slow, but it can't miss funds.
+    // Written after the wallet: a crash in between leaves no birthday, which reads as 0
+    // (scan from genesis). Slow, but it can't miss funds.
     write_birthday(&db, birthday)?;
     book::create_tables(&db)?;
     Ok((wallet, db))
@@ -466,12 +446,10 @@ fn read_birthday(db: &Connection) -> Result<u32> {
     }
 }
 
-/// Workaround for bdk_chain 0.23.3: `TxGraph::apply_changeset` (which `Wallet::load` uses)
-/// replays `last_seen` but drops the stored `first_seen`, so after every reopen a transaction
-/// looks "first seen" at its latest mempool sighting. The column is still correct on disk, so
-/// read it back and feed it in as a sighting: BDK only ever *lowers* `first_seen` and never moves
-/// `last_seen` backwards, so this restores the original value and changes nothing else. (It
-/// stages the same values the database already holds; the next `persist` rewrites them as-is.)
+/// Workaround for bdk_chain 0.23.3: `TxGraph::apply_changeset` (used by `Wallet::load`) drops
+/// the stored `first_seen`, so after a reopen a transaction looks first seen at its latest
+/// sighting. Feed the on-disk value back in: BDK only ever lowers `first_seen` and never moves
+/// `last_seen` backwards, so nothing else changes.
 fn restore_first_seen(wallet: &mut PersistedWallet<Connection>, db: &Connection) -> Result<()> {
     let mut statement = db
         .prepare("SELECT txid, first_seen FROM bdk_txs WHERE first_seen IS NOT NULL")
@@ -503,8 +481,7 @@ fn restore_first_seen(wallet: &mut PersistedWallet<Connection>, db: &Connection)
 
 /// One `btcw_meta` value (`None` if the row is missing).
 fn read_meta(db: &Connection, key: &str) -> Result<Option<String>> {
-    // Create-if-missing instead of querying `sqlite_master`: databases from a crashed `create`
-    // (see `create_db`) may lack the table, and an empty table answers the query the same way.
+    // A database from a crashed `create` may lack the table; an empty one answers the same.
     db.execute(CREATE_META_TABLE, [])
         .and_then(|_| {
             db.query_row("SELECT value FROM btcw_meta WHERE key = ?1", [key], |row| {
@@ -583,8 +560,7 @@ fn keychain_view(k: KeychainKind) -> Keychain {
     }
 }
 
-/// `received - sent` without `as` casts. Real amounts are far below `i64::MAX` (21M BTC is
-/// about 2^51 sat), so saturation is a guard, never a visible result.
+/// `received - sent` without `as` casts; 21M BTC is about 2^51 sat, so saturation never shows.
 fn net_sat(received: u64, sent: u64) -> i64 {
     let net = i128::from(received) - i128::from(sent);
     i64::try_from(net).unwrap_or(if net < 0 { i64::MIN } else { i64::MAX })
@@ -596,13 +572,11 @@ pub(crate) fn tx_status(
     tip: u32,
 ) -> TxStatus {
     match pos {
-        // `transitively` confirmed means a descendant confirmed at this anchor, so our tx is at
-        // or below it; the count is then a lower bound, which is the safe direction.
+        // If confirmed `transitively` (via a descendant), the count is a lower bound: safe.
         ChainPosition::Confirmed { anchor, .. } => {
             let height = anchor.block_id.height;
             TxStatus::Confirmed {
                 height,
-                // The anchor is in our chain, so tip >= height; saturating keeps it >= 1 anyway.
                 confirmations: tip.saturating_sub(height).saturating_add(1),
                 block_time: anchor.confirmation_time,
             }
@@ -614,7 +588,7 @@ pub(crate) fn tx_status(
 }
 
 /// Unconfirmed first (newest `first_seen` first, unknown last), then confirmed by height
-/// descending. Ties break on txid so the output never depends on BDK's iteration order.
+/// descending; ties break on txid so the order is deterministic.
 fn sort_history(rows: &mut [TxRow]) {
     fn rank(s: &TxStatus) -> (u8, std::cmp::Reverse<Option<u64>>) {
         match s {
@@ -666,8 +640,7 @@ mod tests {
         Ok(descriptors)
     }
 
-    /// A made-up unconfirmed transaction paying `sat` to `to`. BDK doesn't need the parent of
-    /// the dummy outpoint to track the output that pays us.
+    /// A made-up unconfirmed transaction paying `sat` to `to` (BDK doesn't need its parent).
     fn funding_tx(to: &str, sat: u64) -> std::result::Result<Transaction, Box<dyn Error>> {
         let address = to
             .parse::<Address<crate::bitcoin::address::NetworkUnchecked>>()?
@@ -821,9 +794,8 @@ mod tests {
         Ok(())
     }
 
-    /// bdk_chain 0.23.3's `TxGraph::apply_changeset` drops the stored `first_seen` when a wallet
-    /// is loaded and replays only `last_seen`, so without `restore_first_seen` an unconfirmed
-    /// payment would look "first seen" at its *latest* sighting after every reopen.
+    /// Without `restore_first_seen`, bdk_chain 0.23.3 reports `first_seen` as the latest
+    /// sighting after a reopen.
     #[test]
     fn first_seen_survives_reopen_after_later_sightings() -> TestResult {
         let dir = tempfile::tempdir()?;
@@ -849,8 +821,7 @@ mod tests {
 
         let mut reopened = WalletService::open(&cfg, Some(&descriptors))?;
         assert_eq!(unconfirmed(&reopened), expected);
-        // The repair only stages values the database already holds; persisting is harmless and
-        // the next reopen agrees.
+        // The repair only stages values already on disk; persisting is harmless.
         reopened.persist()?;
         drop(reopened);
         assert_eq!(unconfirmed(&WalletService::open(&cfg, None)?), expected);
@@ -858,7 +829,7 @@ mod tests {
     }
 
     /// Against a real regtest node: receive, confirm, count confirmations, reopen.
-    /// Skipped (not failed) when no `bitcoind` is available.
+    /// Skipped when no `bitcoind` is available.
     #[cfg(feature = "test-utils")]
     mod node {
         use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client};
@@ -868,7 +839,7 @@ mod tests {
         use crate::config::RpcAuth;
         use crate::testnode::TestNode;
 
-        /// Minimal stand-in for Agent B's `Node::sync`: blocks from the birthday, then mempool.
+        /// Minimal stand-in for `Node::sync`: blocks from the birthday, then mempool.
         fn sync(wallet: &mut WalletService, client: &Client) -> TestResult {
             let start_height = wallet.birthday_height();
             let bdk = wallet.bdk_mut();

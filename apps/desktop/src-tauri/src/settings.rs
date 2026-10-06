@@ -4,11 +4,8 @@
 //! { "network": "regtest", "rpc_url": null, "rpc_cookie": null,
 //!   "auto_lock_minutes": 5, "mainnet_opt_in": false }
 //! ```
-//! A `null` (or missing) value means "not set here", so `BTCW_*` environment variables,
-//! `<datadir>/btcw.toml` and the built-in defaults still apply underneath, exactly as for the CLI.
-//! The file is written only by [`save`] (mode 0600, temp file + rename) and read once at start-up.
-//! `rpc_url` may carry `user:pass@`, so it is never logged or shown in `Debug`, and the file is
-//! private to the user.
+//! `null` or missing means "not set here", so `BTCW_*`, `btcw.toml` and the defaults apply as
+//! for the CLI. `rpc_url` may carry `user:pass@`, so it is never logged and the file is 0600.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -58,8 +55,7 @@ impl Default for StoredSettings {
     }
 }
 
-/// The URL can hold RPC credentials (`http://user:pass@host`), so `Debug` only says whether it
-/// is set.
+/// The URL can hold RPC credentials, so `Debug` only says whether it is set.
 impl std::fmt::Debug for StoredSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoredSettings")
@@ -81,7 +77,7 @@ pub struct Settings {
     pub rpc_url: Option<String>,
     pub rpc_cookie: Option<String>,
     pub auto_lock_minutes: u32,
-    /// The user typed the mainnet confirmation in Settings (PLAN §4.1, second gate).
+    /// The user typed the mainnet confirmation in Settings (the runtime half of the gate).
     #[serde(default)]
     pub mainnet_opt_in: bool,
 }
@@ -123,9 +119,8 @@ impl StoredSettings {
         }
     }
 
-    /// Drop values that can't be used any more, so a stale or hand-edited file never stops the
-    /// app from starting (e.g. `"bitcoin"` saved by a mainnet build, then opened by a build
-    /// without mainnet). Each fix is logged; the file itself is left alone until the next save.
+    /// Drop values that can't be used any more (e.g. `"bitcoin"` in a build without mainnet), so
+    /// a stale file never stops the app from starting. Logged; the file waits for the next save.
     fn sanitized(mut self) -> Self {
         if let Some(name) = &self.network {
             let usable = config::parse_network(name).is_ok_and(|network| {
@@ -209,9 +204,7 @@ pub fn validate(next: &Settings) -> Result<(StoredSettings, Network)> {
     ))
 }
 
-/// Read `desktop.json`. A missing file means defaults; an unreadable or invalid one is logged
-/// (never its contents) and also gives defaults, so a damaged file can't keep the app from
-/// opening. The next save replaces it.
+/// Read `desktop.json`. Missing or damaged means defaults (logged, never the contents).
 pub fn load(path: &Path) -> StoredSettings {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -224,7 +217,7 @@ pub fn load(path: &Path) -> StoredSettings {
     match serde_json::from_str::<StoredSettings>(&text) {
         Ok(stored) => stored.sanitized(),
         Err(e) => {
-            // serde_json's message gives line, column and the problem, not the file's contents.
+            // serde_json's message has line and column, not the file's contents.
             tracing::warn!(file = %path.display(), error = %e, "invalid desktop settings; using defaults");
             StoredSettings::default()
         }

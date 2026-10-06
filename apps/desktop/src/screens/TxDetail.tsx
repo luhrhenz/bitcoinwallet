@@ -15,7 +15,7 @@ import { ScreenHeader } from "../components/Frame";
 import { Icon } from "../components/Icon";
 import { PaymentPreview } from "../components/PaymentPreview";
 
-/** How often the open screen asks for the status (PLAN §4.2). */
+/** How often the open screen asks for the status. */
 export const POLL_MS = 10_000;
 /** Six blocks is the customary point where a payment is treated as final. */
 const FINAL_CONFIRMATIONS = 6;
@@ -24,10 +24,8 @@ const statusKey = (s: TxStatus | null) =>
   s === null ? "none" : s.state === "confirmed" ? `c${s.height}:${s.confirmations}` : "u";
 
 /**
- * One transaction, with its status polled every 10 s while the screen is open. Its label can be
- * added, edited or removed here, and an unconfirmed outgoing payment can be sped up (replaced by
- * one paying a higher fee: form → unlock if needed → preview → confirm → the replacement's
- * screen).
+ * One transaction, its status polled while the screen is open. Its label can be edited here,
+ * and an unconfirmed outgoing payment can be sped up (RBF).
  */
 export function TxDetail({ txid, sent, go }: { txid: string; sent?: SendPreview; go: Go }) {
   const wallet = useWallet();
@@ -81,8 +79,7 @@ export function TxDetail({ txid, sent, go }: { txid: string; sent?: SendPreview;
   const [bump, setBump] = useState<PreparedSend | null>(null);
   const [bumpBusy, setBumpBusy] = useState(false);
   const [bumpError, setBumpError] = useState<unknown>(null);
-  // The open replacement, readable from cleanup code (as on the Send screen): cleared before
-  // anything that must not cancel it (a successful send).
+  // The open replacement, readable from cleanup code; cleared before a successful send.
   const openBump = useRef<PreparedSend | null>(null);
   const sendingBump = useRef(false);
   const setBumpPreview = (next: PreparedSend | null) => {
@@ -134,8 +131,8 @@ export function TxDetail({ txid, sent, go }: { txid: string; sent?: SendPreview;
         await wallet.refreshInfo().catch(() => undefined);
         return;
       }
-      // Rust drops the prepared replacement after any failed send: back to the transaction,
-      // with its status checked at once (it may have just confirmed: the usual reason).
+      // Rust drops the prepared replacement after any failed send. Check the status at once:
+      // the payment may have just confirmed.
       setBumpPreview(null);
       setBumpError(err);
       void refreshWallet();
@@ -311,9 +308,8 @@ export function TxDetail({ txid, sent, go }: { txid: string; sent?: SendPreview;
 }
 
 /**
- * "Speed up": a button, then a small form with the fee rate, pre-filled with the minimum that
- * can replace the payment (Rust's `min_fee_bump_rate`); lower rates are refused here and in Rust.
- * Review asks for the password first when the wallet is locked.
+ * "Speed up": a button, then a fee-rate form pre-filled with the minimum that can replace the
+ * payment. Review asks for the password first when locked.
  */
 function SpeedUp({
   txid,

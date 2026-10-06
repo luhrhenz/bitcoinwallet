@@ -1,4 +1,4 @@
-// Screens per docs/PLAN.md §4.2, built only against the `api` contract (lib/api.ts).
+// The app shell and screen routing. Screens talk to the backend only through `api` (lib/api.ts).
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./lib/api";
@@ -123,7 +123,7 @@ function Main() {
   const { info } = wallet;
   const [route, setRoute] = useState<Route>({ name: "dashboard" });
 
-  // Open = refresh what's on disk, then sync with the node (PLAN §4.2: auto-sync on open).
+  // On open: refresh what's on disk, then sync with the node.
   const { refreshWallet, runSync } = wallet;
   useEffect(() => {
     void refreshWallet().then(() => runSync());

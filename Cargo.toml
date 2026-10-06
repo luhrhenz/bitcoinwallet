@@ -56,7 +56,7 @@ unsafe_code = "forbid"
 unwrap_used = "warn"
 expect_used = "warn"
 
-# Crypto is painfully slow unoptimized (Argon2 64 MiB; BIP39 PBKDF2 runs on bitcoin_hashes); optimize just these in dev/test.
+# Crypto is very slow unoptimized (Argon2 64 MiB, BIP39 PBKDF2); optimize just these in dev/test.
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]

@@ -1,8 +1,7 @@
 //! Network policy, data directories and node RPC settings.
 //!
-//! Precedence, highest first: explicit [`Overrides`] (CLI flags / desktop settings) →
-//! environment (`BTCW_*`) → `<datadir>/btcw.toml` → built-in defaults.
-//! The library never loads `.env` itself; binaries call `dotenvy::dotenv()` if they want it.
+//! Precedence, highest first: [`Overrides`] (CLI flags / desktop settings) → `BTCW_*`
+//! environment → `<datadir>/btcw.toml` → defaults. Binaries load `.env` themselves if they want.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,7 +37,7 @@ pub fn parse_network(s: &str) -> Result<Network> {
     }
 }
 
-/// Mainnet needs both the `mainnet` cargo feature *and* a runtime opt-in (PLAN §4.1).
+/// Mainnet needs both the `mainnet` cargo feature *and* a runtime opt-in.
 pub fn check_network_allowed(network: Network, mainnet_opt_in: bool) -> Result<()> {
     match network {
         Network::Testnet4 | Network::Signet | Network::Regtest => Ok(()),
@@ -88,8 +87,8 @@ pub enum RpcAuth {
         user: String,
         pass: SecretString,
     },
-    /// No RPC login. The default for `https://` URLs: hosted providers (e.g. Alchemy) put the
-    /// API key in the URL itself and have no `.cookie` file to read.
+    /// No RPC login. The default for `https://` URLs, where hosted providers put the API key in
+    /// the URL.
     None,
 }
 
@@ -215,8 +214,7 @@ impl Config {
                 ));
             }
             (None, None, Some(cookie)) => rpc.auth = RpcAuth::Cookie(cookie),
-            // A remote provider authenticates with the key in its URL; there is no local
-            // `.cookie` file to read for it.
+            // A remote provider authenticates with the key in its URL.
             (None, None, None) if is_https(&rpc.url) => rpc.auth = RpcAuth::None,
             (None, None, None) => {}
         }
@@ -229,7 +227,7 @@ impl Config {
         })
     }
 
-    /// `<datadir>/<network>/`. Each network's wallet lives apart so they can never mix.
+    /// `<datadir>/<network>/`, so networks never mix.
     pub fn network_dir(&self) -> PathBuf {
         self.datadir.join(self.network.to_string())
     }

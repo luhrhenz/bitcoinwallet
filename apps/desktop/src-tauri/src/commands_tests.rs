@@ -1,9 +1,7 @@
 //! Tests for `commands.rs`: the plain functions over a temporary datadir.
 //!
-//! Offline tests point the node settings at a port nothing listens on and a cookie file that
-//! doesn't exist, so every node call fails fast with `rpc`. The one node test runs a throwaway
-//! regtest `bitcoind` (`TestNode`); it is skipped only when no bitcoind is available, and fails
-//! when `BITCOIND_EXE` is set but broken.
+//! Offline tests point at a closed port and a missing cookie, so node calls fail fast with
+//! `rpc`. Node tests run a throwaway regtest `bitcoind` and skip when none is available.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1008,12 +1006,9 @@ fn regtest_fixture(node: &TestNode) -> (Fixture, Config) {
     (fx, cli)
 }
 
-/// The desktop app picks up a wallet the CLI created (same datadir, same files): it verifies the
-/// CLI's backup, refuses to prepare a payment while locked, unlocks, sends and follows the
-/// payment; then the CLI spends from the same wallet while the app stays unlocked, and each side
-/// sees the other's transactions. The CLI side runs the same `btcw_core` calls `btcw create` and
-/// `btcw send` make (this crate can't spawn the `btcw` binary; `crates/btcw-cli/tests/e2e.rs`
-/// drives that).
+/// The app picks up a wallet the CLI created, verifies its backup, unlocks, sends; then the CLI
+/// spends from the same wallet and each side sees the other's transactions. The CLI side runs
+/// the same `btcw_core` calls `btcw` makes.
 #[test]
 fn desktop_and_cli_share_one_wallet_end_to_end() {
     if !TestNode::available() {
@@ -1180,10 +1175,8 @@ fn desktop_and_cli_share_one_wallet_end_to_end() {
     ));
 }
 
-/// A payment prepared in the app waits for "Send" with the wallet closed, so `btcw send` can
-/// spend the same coin in between. Signing the stale PSBT anyway would *replace* the CLI's
-/// payment (RBF, at a higher fee) or reuse its change address: the user approved two payments
-/// and one silently disappears. The app must refuse it and ask for a new review instead.
+/// `btcw send` spends the coin of a payment prepared in the app before "Send". Signing the stale
+/// PSBT would RBF-replace the CLI's payment, so the app must refuse and ask for a new review.
 #[test]
 fn a_payment_prepared_in_the_app_is_refused_after_the_cli_spent_its_coin() {
     if !TestNode::available() {
@@ -1250,11 +1243,9 @@ fn a_payment_prepared_in_the_app_is_refused_after_the_cli_spent_its_coin() {
     assert!(mempool.contains(&json!(sent.txid)) && mempool.contains(&json!(cli_txid)));
 }
 
-/// v2 on the desktop bridge, against a real node: pay a contact by name, label the payment,
-/// speed it up (the minimum, then a new review at 5 sat/vB in the same slot), and check that the
-/// node and the wallet hold only the replacement, which inherits the label. Then a second bump is
-/// prepared and the payment confirms before "Send": `confirm_send` refuses it cleanly, without
-/// broadcasting anything.
+/// Against a real node: pay a contact by name, label the payment, speed it up, and check node
+/// and wallet hold only the replacement, with the label. Then a prepared bump goes stale when
+/// the payment confirms, and `confirm_send` refuses it without broadcasting.
 #[test]
 fn contacts_labels_and_speed_up_against_a_regtest_node() {
     if !TestNode::available() {
@@ -1305,8 +1296,7 @@ fn contacts_labels_and_speed_up_against_a_regtest_node() {
         Some("rent October")
     );
 
-    // The minimum: BDK's old rate + 1 sat/vB, raised to BIP125 rule 4 (751 sat/kWU), shown
-    // rounded up. Anything lower is refused before signing.
+    // The minimum: BDK's old rate + 1 sat/vB, raised to BIP125 rule 4 (751 sat/kWU), rounded up.
     let min = min_fee_bump_rate(state, &original).unwrap();
     assert_eq!(min, 3.01);
     for low in [2.0, 3.0] {

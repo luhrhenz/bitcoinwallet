@@ -1,8 +1,7 @@
-//! `btcw contacts list|add|remove|rename` (PLAN-v2 §1). Watch-only: no password, no node.
+//! `btcw contacts list|add|remove|rename`. Watch-only: no password, no node.
 //!
-//! The rules (name length, uniqueness ignoring case, an address for this network, no names that
-//! look like addresses) live in `btcw_core::book`; this module only renders. Addresses are
-//! printed in full, and in groups of four where the user is meant to check one.
+//! The rules live in `btcw_core::book`; this module only renders. Addresses are printed in
+//! full, in groups of four where the user is meant to check one.
 
 use anyhow::Result;
 use btcw_core::api;

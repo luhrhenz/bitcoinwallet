@@ -1,11 +1,9 @@
 //! A throwaway regtest `bitcoind` for integration tests (feature `test-utils`).
 //!
 //! Binary: `$BITCOIND_EXE`, else `bitcoind` on `PATH`. Each node gets a temp datadir and free
-//! ports and is stopped on drop. Tests that need a node should skip (not fail) when
-//! [`TestNode::available`] is false, so `cargo test` still passes on machines without Core.
+//! ports and stops on drop. Tests skip when [`TestNode::available`] is false.
 //!
-//! All RPCs here use raw `call::<Value>` so they don't depend on `bitcoincore-rpc`'s typed
-//! response structs matching the Core version.
+//! RPCs use raw `call::<Value>` so they don't depend on typed response structs.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -38,9 +36,8 @@ fn bitcoind_exe() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("bitcoind"))
 }
 
-/// Same 120 s transport timeout as `chain::Node`. `bitcoincore-rpc`'s default is 15 s, and with
-/// several test nodes mining in parallel one `generatetoaddress` batch can exceed it (seen as
-/// intermittent "Resource temporarily unavailable" failures in full-workspace runs).
+/// Same 120 s timeout as `chain::Node`: with several nodes mining in parallel, a
+/// `generatetoaddress` batch can exceed the default 15 s ("Resource temporarily unavailable").
 fn client(url: &str, cookie: &std::path::Path) -> Result<Client> {
     let contents = std::fs::read_to_string(cookie)?;
     let (user, pass) = contents
@@ -65,13 +62,11 @@ fn free_port() -> Result<u16> {
 impl TestNode {
     /// True if a `bitcoind` binary can be executed.
     ///
-    /// `-nosettings`: Core v31 rewrites `~/.bitcoin/settings.json` even for `-version`, and two
-    /// test binaries probing at once can collide on that file's rename, making a perfectly good
-    /// node look missing.
+    /// `-nosettings`: Core v31 rewrites `settings.json` even for `-version`, and concurrent
+    /// probes can collide on it.
     ///
     /// # Panics
-    /// When `BITCOIND_EXE` is set explicitly but doesn't run: the caller asked for node tests,
-    /// so silently skipping them would turn a broken setup into a green test run.
+    /// When `BITCOIND_EXE` is set but doesn't run, so a broken setup can't pass silently.
     pub fn available() -> bool {
         let runs = Command::new(bitcoind_exe())
             .args(["-nosettings", "-version"])
@@ -160,8 +155,7 @@ impl TestNode {
             .map_err(rpc_err)
     }
 
-    /// Mine `n` blocks to the faucet. Batched: mining is ~200 ms/block on Core v31 and
-    /// `bitcoincore-rpc`'s HTTP transport times out after 15 s per call.
+    /// Mine `n` blocks to the faucet, in batches (mining is ~200 ms/block on Core v31).
     pub fn mine(&self, n: u64) -> Result<Vec<BlockHash>> {
         let to = self.faucet_address()?.to_string();
         let mut all = Vec::with_capacity(n as usize);

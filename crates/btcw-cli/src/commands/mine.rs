@@ -22,8 +22,7 @@ struct MineJson {
 }
 
 pub fn run(cfg: &Config, ui: &Ui, blocks: u64, to: Option<&str>) -> Result<()> {
-    // `Node::mine` refuses other networks too; checking here first means a mistaken
-    // `--network testnet4 mine` never needs a node or touches the wallet.
+    // `Node::mine` refuses too; checking first avoids the node and the wallet.
     if cfg.network != Network::Regtest {
         return Err(WalletError::Config(format!(
             "mining is only available on regtest (this wallet is on {})",
@@ -31,7 +30,7 @@ pub fn run(cfg: &Config, ui: &Ui, blocks: u64, to: Option<&str>) -> Result<()> {
         ))
         .into());
     }
-    // Parse `--to` before connecting: a typo is reported without needing a node.
+    // Parse `--to` before connecting.
     let explicit = to.map(|s| parse_address(s, cfg.network)).transpose()?;
     let node = Node::connect(&cfg.rpc, cfg.network)?;
     let (address, wallet_address_index) = match explicit {

@@ -12,10 +12,8 @@ export function contactNamed(contacts: readonly Contact[], text: string): Contac
 }
 
 /**
- * The Send screen's recipient: an address, or the name of a contact (WAI-ARIA combobox with a
- * list of matching contacts; ↓/↑ to move, Enter to pick, Escape to close). The "Contacts" button
- * lists every contact. Once the text is a contact's name, the hint shows that contact's full
- * address, so the user sees where the money goes before the review, too.
+ * The Send screen's recipient: an address or a contact's name (a WAI-ARIA combobox). For a
+ * name, the hint shows the contact's full address.
  */
 export function RecipientField({
   value,

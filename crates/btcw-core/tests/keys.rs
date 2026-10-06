@@ -1,5 +1,4 @@
-//! Agent A: BIP39 mnemonics, BIP84 derivation and PSBT signing.
-//! Everything here runs offline; the PSBT test funds a wallet with a hand-made transaction.
+//! BIP39 mnemonics, BIP84 derivation and PSBT signing (offline).
 
 use std::error::Error;
 use std::str::FromStr;
@@ -237,8 +236,7 @@ fn signer_signs_a_wallet_psbt_and_a_stranger_signs_nothing() -> TestResult {
     let (stranger_descriptors, stranger) =
         keys::derive_account(&stranger_mnemonic, "", network, 0)?;
 
-    // Fund the wallet with a made-up unconfirmed transaction. BDK doesn't need to see the
-    // parent of the dummy outpoint to track and spend the output paid to us.
+    // Fund the wallet with a made-up unconfirmed transaction (BDK doesn't need its parent).
     let mut wallet = wallet_for(&descriptors, network)?;
     let receive = wallet.reveal_next_address(KeychainKind::External).address;
     let funding = Transaction {

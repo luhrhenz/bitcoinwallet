@@ -1,5 +1,5 @@
-// Wallet state shared by every screen: what the backend told us last, plus the actions that
-// change it. Screens read from here and call `api` only for their own one-off requests.
+// Wallet state shared by every screen: what the backend told us last, and the actions that
+// change it.
 
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../lib/api";
@@ -191,7 +191,7 @@ export function WalletProvider({
       void lock("auto");
     },
     () => {
-      // Best effort: if it fails, the backend just locks a little earlier.
+      // Best effort: on failure the backend just locks a little earlier.
       void api.keepAlive().catch(() => undefined);
     },
   );

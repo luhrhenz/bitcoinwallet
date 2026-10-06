@@ -1,6 +1,6 @@
 //! `btcw-core`: the wallet engine shared by the `btcw` CLI and the desktop app.
 //!
-//! Layout (see `docs/PLAN.md` §4):
+//! Modules:
 //! - [`config`]   network policy, data directories, node RPC settings
 //! - [`keys`]     BIP39 mnemonics → BIP84 descriptors
 //! - [`keystore`] mnemonic encrypted at rest (Argon2id + XChaCha20-Poly1305)
@@ -11,8 +11,7 @@
 //! - [`api`]      high-level flows (create / restore / unlock) used by both frontends
 //! - [`types`]    serializable views returned to the CLI (`--json`) and the UI
 //!
-//! Rust-bitcoin is always used through the re-export below, so every crate in the
-//! workspace agrees on one `bitcoin` version.
+//! Use `bitcoin` through the re-export below so the workspace agrees on one version.
 
 pub use bdk_wallet;
 pub use bdk_wallet::bitcoin;

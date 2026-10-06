@@ -1,22 +1,14 @@
-//! `btcw send --to ADDR|NAME --amount SAT`: build → preview → confirm → sign → broadcast
-//! (PLAN §5.8; contact names: PLAN-v2 §1).
+//! `btcw send --to ADDR|NAME --amount SAT`: build → preview → confirm → sign → broadcast.
 //!
-//! 1. Checks that need neither the password nor the node: `--json` needs `--yes`, the address
-//!    (format and network), the amount (dust), `--fee-rate`, `--psbt-out`, the wallet exists,
-//!    and a terminal to confirm on (unless `--yes`).
-//! 2. Open the wallet **watch-only**: building and previewing a payment needs no secrets. A
-//!    `--to` that isn't an address is looked up in the address book here (and the amount checked
-//!    against the contact's address), still before any sync.
-//! 3. `Node::connect` + sync, so coin selection sees the current coins.
-//! 4. `tx::prepare_send`: fee rate (`--fee-rate`, else the node's 6-block estimate), unsigned
-//!    PSBT, preview. The desktop bridge calls the same function.
-//! 5. The preview on stdout, warnings for unusual fees, the unsigned PSBT if `--psbt-out`.
-//! 6. `Send? [y/N]` on the terminal unless `--yes`. Anything but yes → `tx::cancel`, exit 0.
-//! 7. Only now the password → `api::load_signer` (checks the seed belongs to this wallet), so the
-//!    master key is never in memory while the user reads the preview, and a declined payment
-//!    never touches it at all.
-//! 8. `tx::sign_psbt`, drop the signer (wiping the master key), `tx::broadcast_signed`
-//!    (extract → broadcast → record in the wallet).
+//! 1. Checks that need neither the password nor the node (address, dust, fee rate, files,
+//!    a terminal to confirm on).
+//! 2. Open the wallet watch-only; a contact name is resolved here.
+//! 3. Connect and sync, so coin selection sees the current coins.
+//! 4. `tx::prepare_send`, as the desktop app does.
+//! 5. Preview, fee warnings, the unsigned PSBT if `--psbt-out`.
+//! 6. `Send? [y/N]` unless `--yes`; anything but yes cancels and exits 0.
+//! 7. Only now the password, so the master key is never in memory during the preview.
+//! 8. Sign, drop the signer, broadcast.
 //!
 //! From step 4 on, every way out except a successful broadcast releases the change address.
 
@@ -40,9 +32,9 @@ use crate::commands::sync::sync_with_progress;
 use crate::output::{Painter, Ui, amount, btc, group_thousands, grouped};
 use crate::prompt::{self, Terminal};
 
-/// Warn when the fee is at least this share of the amount (same threshold as the desktop app).
+/// Warn when the fee is at least this share of the amount.
 const HIGH_FEE_PERCENT: u64 = 10;
-/// Warn above this rate: even busy mempools rarely need more, so it's more likely a typo.
+/// Warn above this rate: more likely a typo than a busy mempool.
 const HIGH_FEE_RATE_SAT_VB: f64 = 100.0;
 
 #[derive(Debug, Serialize)]
@@ -73,8 +65,7 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
     let value = Amount::from_sat(req.amount_sat);
     let address = match tx::parse_address(req.to, cfg.network) {
         Ok(address) => Some(address),
-        // Not an address and doesn't look like one: maybe a contact's name, which needs the
-        // wallet file (step 2). Anything address-like keeps its address error.
+        // Not address-like: maybe a contact's name, resolved in step 2.
         Err(WalletError::InvalidAddress(_))
             if !req.to.trim().is_empty() && !book::looks_like_address(req.to) =>
         {
@@ -108,11 +99,11 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
         tx::check_amount(&recipient.address, value)?;
     }
 
-    // 3. Spend from fresh state: coins that arrived or were spent since the last sync.
+    // 3. Fresh coins for coin selection.
     let node = Node::connect(&cfg.rpc, cfg.network)?;
     sync_with_progress(ui, &node, &mut wallet)?;
 
-    // 4. Same function as the desktop app's "Review payment".
+    // 4. Build and preview.
     let (mut psbt, preview) =
         tx::prepare_send(&mut wallet, &node, req.to, req.amount_sat, fee_rate)?;
 
@@ -150,7 +141,7 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
         release(ui, &mut wallet, &psbt);
         return Err(e.into());
     }
-    // Releases the change address itself if the extract or the broadcast fails.
+    // Releases the change address itself if extract or broadcast fails.
     let txid = tx::broadcast_signed(&mut wallet, &node, psbt)?;
     drop(wallet);
 
@@ -206,8 +197,8 @@ fn review(
     }
 }
 
-/// `tx::cancel` + persist, for every way out before the broadcast. The persist only saves the
-/// change address BDK revealed (the next payment reuses it), so a failure is just a warning.
+/// `tx::cancel` + persist, for every way out before the broadcast. A failed persist is only a
+/// warning.
 pub(crate) fn release(ui: &Ui, wallet: &mut WalletService, psbt: &Psbt) {
     tx::cancel(wallet, psbt);
     if let Err(e) = wallet.persist() {
@@ -226,9 +217,8 @@ pub(crate) fn release(ui: &Ui, wallet: &mut WalletService, psbt: &Psbt) {
 ///   Change    0.00899295 BTC (899,295 sat), back to this wallet
 ///   Total     0.00100705 BTC (100,705 sat), amount + fee
 /// ```
-/// The recipient is shown in full, in groups of four, never shortened (see `output::grouped`).
-/// A contact's name gets a line of its own *below* the address, never instead of it, and a fee
-/// bump starts with the payment it replaces:
+/// The recipient is shown in full, in groups of four. A contact's name goes below the address,
+/// never instead of it; a fee bump starts with the payment it replaces:
 /// ```text
 /// [regtest] Fee bump preview
 ///   Replaces  3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6
@@ -318,10 +308,9 @@ pub(crate) fn fee_rate_from_flag(sat_per_vb: u64) -> Result<FeeRate> {
         .ok_or_else(|| anyhow!("--fee-rate {sat_per_vb} sat/vB is too large"))
 }
 
-/// Checked up front so an existing file is reported before the password prompt; `write_psbt`
-/// refuses again (atomically, `create_new`) in case the file appears in between.
+/// Checked before the password prompt; `write_psbt` refuses again atomically.
 fn refuse_existing(path: &Path) -> Result<()> {
-    // `symlink_metadata` so that a dangling symlink also counts as "something is there".
+    // `symlink_metadata` so a dangling symlink counts too.
     if std::fs::symlink_metadata(path).is_ok() {
         bail!(
             "--psbt-out: {} already exists; refusing to overwrite it",
@@ -331,8 +320,8 @@ fn refuse_existing(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The **unsigned** PSBT as base64 (BIP174's text form) plus a newline, readable only by the
-/// owner: it holds no keys, but it does list the wallet's coins, change address and key paths.
+/// The unsigned PSBT as base64, mode 0600. It holds no keys, but it lists the wallet's coins,
+/// change address and key paths.
 fn write_psbt(path: &Path, psbt: &Psbt) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);

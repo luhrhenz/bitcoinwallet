@@ -1,4 +1,4 @@
-//! `btcw sync`: pull new blocks and mempool transactions from bitcoind (PLAN §5.5).
+//! `btcw sync`: pull new blocks and mempool transactions from bitcoind.
 
 use anyhow::Result;
 use btcw_core::api;
@@ -37,17 +37,13 @@ pub fn run(cfg: &Config, ui: &Ui) -> Result<()> {
     ))
 }
 
-/// `Node::sync` with a progress bar on stderr (hidden in `--json` mode or without a terminal).
-///
-/// The bar counts the blocks *this* sync downloads: from the first block after the wallet's
-/// checkpoint (or its birthday, for a first sync) to the node's tip. The message shows the
-/// absolute heights.
+/// `Node::sync` with a progress bar on stderr counting the blocks this sync downloads.
 pub fn sync_with_progress(
     ui: &Ui,
     node: &Node,
     wallet: &mut WalletService,
 ) -> btcw_core::Result<SyncReport> {
-    // Mirrors where `Node::sync` starts (PLAN §5.5): genesis itself is never fetched.
+    // Mirrors where `Node::sync` starts: genesis itself is never fetched.
     let first = wallet
         .synced_height()
         .saturating_add(1)

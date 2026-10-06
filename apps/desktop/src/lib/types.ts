@@ -60,7 +60,7 @@ export interface SendPreview {
   vsize: number;
   change_sat: number | null;
   total_sat: number;
-  /** Address-book name the user typed instead of the address; always shown next to `to`. */
+  /** Contact name the user typed; always shown next to `to`. */
   contact: string | null;
   /** Fee bump: the txid of the unconfirmed payment this transaction replaces. */
   replaces: string | null;
@@ -85,17 +85,9 @@ export interface AppInfo {
   wallet_exists: boolean;
   /** True when a signer is loaded (password entered). Watch-only views work without it. */
   unlocked: boolean;
-  /**
-   * Height the wallet is synced to (`WalletService::synced_height`, 0 before the first sync),
-   * or null when there is no wallet. Lets the dashboard say "as of block N" before, or
-   * without, a successful sync (the CLI's `as_of`).
-   */
+  /** Height the wallet is synced to (0 before the first sync), or null without a wallet. */
   synced_height: number | null;
-  /**
-   * Whether the user has proved their paper copy of the recovery phrase is right
-   * (`WalletService::read_backup_verified`), or null when there is no wallet. False after
-   * `createWallet` until `verifyBackup` passes; a restored wallet starts verified.
-   */
+  /** Whether the recovery phrase backup has been verified, or null without a wallet. */
   backup_verified: boolean | null;
 }
 
@@ -105,7 +97,7 @@ export interface Settings {
   rpc_cookie: string | null;
   /** 1 to 60. The Rust side also locks on its own, a minute after the UI would. */
   auto_lock_minutes: number;
-  /** The user typed MAINNET in Settings (the runtime half of the mainnet gate, PLAN §4.1). */
+  /** The user typed MAINNET in Settings (the runtime half of the mainnet gate). */
   mainnet_opt_in: boolean;
 }
 

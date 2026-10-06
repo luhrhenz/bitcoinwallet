@@ -5,11 +5,9 @@
 //! | password | hidden prompt on the TTY (`rpassword` opens `/dev/tty`) | `BTCW_PASSWORD` (insecure, scripts and tests only) |
 //! | recovery phrase | hidden prompt when stdin is a terminal | first line of stdin (`echo "<words>" \| btcw restore`) |
 //!
-//! Prompts are written to the TTY, never to stdout, so `--json` output stays clean. Secrets
-//! are copied into `SecretString` / `Zeroizing` buffers straight away and never printed.
-//!
-//! [`Terminal`] asks the one non-secret question, `send`'s "Send? [y/N]". It reads the TTY too,
-//! never stdin, so a piped-in "y" can't approve a payment.
+//! Prompts go to the TTY, never stdout. Secrets go straight into `SecretString` / `Zeroizing`
+//! buffers. [`Terminal`] reads confirmations from the TTY too, so a piped-in "y" can't approve
+//! a payment.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
@@ -21,14 +19,12 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::output::Ui;
 
-/// Wallet password for non-interactive use. Anything in the environment can leak (shell
-/// history, child processes, `/proc/<pid>/environ`, crash reports), so it is meant for demos
-/// and tests only.
+/// Wallet password for non-interactive use. The environment can leak (`/proc/<pid>/environ`,
+/// child processes), so this is for demos and tests only.
 pub const PASSWORD_ENV: &str = "BTCW_PASSWORD";
 
-/// Longest stdin line we accept as a phrase: 24 words of at most 8 letters fit in 215 bytes.
-/// The buffer is allocated at this size up front so reading never reallocates (and never
-/// leaves an unwiped copy behind).
+/// Longest stdin line accepted as a phrase (24 words fit in 215 bytes). Allocated up front so
+/// reading never reallocates and leaves no unwiped copy.
 const MAX_PHRASE_BYTES: usize = 1024;
 
 /// A mistyped or too-short new password gets this many tries before giving up.
@@ -67,8 +63,8 @@ pub fn new_password(ui: &Ui) -> Result<SecretString> {
     }
 }
 
-/// The password of an existing wallet, to unlock it for signing (`send`). Not checked against
-/// the new-password rules: unlocking never second-guesses a password that already works.
+/// The password of an existing wallet, to unlock it for signing. Not checked against the
+/// new-password rules.
 pub fn password(ui: &Ui) -> Result<SecretString> {
     if let Some(password) = password_from_env(ui)? {
         return Ok(password);
@@ -76,10 +72,8 @@ pub fn password(ui: &Ui) -> Result<SecretString> {
     read_password("Wallet password: ")
 }
 
-/// The controlling terminal, for yes/no questions.
-///
-/// Opened *before* any work starts, so "no terminal to confirm on" is reported before the
-/// password prompt, the sync and the coin selection, not after.
+/// The controlling terminal, for yes/no questions. Opened before any work starts, so a missing
+/// terminal is reported first.
 pub struct Terminal {
     input: BufReader<File>,
     output: File,
@@ -125,8 +119,8 @@ fn is_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// The recovery phrase for `restore`. Hidden prompt on a terminal; otherwise the first line of
-/// stdin. The words are validated by the caller (`keys::parse_mnemonic`), never echoed.
+/// The recovery phrase for `restore`: a hidden prompt on a terminal, else the first line of
+/// stdin. Never echoed.
 pub fn recovery_phrase() -> Result<Zeroizing<String>> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
@@ -137,8 +131,7 @@ pub fn recovery_phrase() -> Result<Zeroizing<String>> {
         return Ok(Zeroizing::new(typed));
     }
     let mut line = Zeroizing::new(String::with_capacity(MAX_PHRASE_BYTES));
-    // `take` keeps a stray multi-megabyte stdin from growing the buffer (and copying it).
-    // `usize` → `u64` cannot truncate on any platform Rust supports.
+    // `take` keeps a huge stdin from growing (and copying) the buffer.
     stdin
         .lock()
         .take(MAX_PHRASE_BYTES as u64)
@@ -150,8 +143,7 @@ pub fn recovery_phrase() -> Result<Zeroizing<String>> {
     Ok(line)
 }
 
-/// One word of the recovery phrase for the backup check, typed hidden (the words on screen
-/// would be as good as the phrase itself to anyone looking over the user's shoulder).
+/// One word of the recovery phrase for the backup check, typed hidden.
 pub fn hidden_word(prompt: &str) -> Result<Zeroizing<String>> {
     rpassword::prompt_password(prompt)
         .map(Zeroizing::new)
@@ -166,8 +158,7 @@ fn read_password(prompt: &str) -> Result<SecretString> {
              (insecure: meant for scripts and tests)"
         )
     })?);
-    // Copy into an exactly-sized allocation (no reallocation inside `SecretString::from`);
-    // `typed` is wiped when it drops.
+    // Exactly-sized copy (no reallocation); `typed` is wiped on drop.
     Ok(SecretString::from(typed.as_str()))
 }
 

@@ -47,7 +47,8 @@ flowchart LR
 | `keystore` | Mnemonic encrypted at rest; network bound as AEAD associated data; atomic 0600 writes | `argon2`, `chacha20poly1305` |
 | `wallet` | `WalletService`: BDK wallet in SQLite, per-network file lock, birthday + backup flag, views (balance, history, UTXOs, addresses) | `bdk_wallet` (rusqlite) |
 | `chain` | `Node`: connect + chain check, block-by-block sync with reorg handling, mempool (+ cache), broadcast, fee estimates, regtest mining | `bdk_bitcoind_rpc`, `bitcoincore-rpc`, `minreq` (TLS) |
-| `tx` | Address parsing, PSBT build, preview (every output explained), sign + finalize, extract, broadcast, record, status | `bdk_wallet`, `bitcoin` |
+| `book` | Address book (contacts) and transaction labels, in the wallet's SQLite file | `bdk_wallet` (rusqlite) |
+| `tx` | Address parsing, PSBT build, preview (every output explained), sign + finalize, extract, broadcast, record, status, fee bumps (BIP125 RBF) | `bdk_wallet`, `bitcoin` |
 | `api` | Lifecycle both frontends use: create / restore / unlock / watch-only / backup verify / reveal / load signer | — |
 
 ## Sending a payment
@@ -83,7 +84,7 @@ so a declined or failed send leaves no trace.
 
 | File (`<datadir>/<network>/`) | Contents | Secret? |
 |---|---|---|
-| `wallet.sqlite` | BDK state: **public** descriptors, transactions, chain checkpoints; `btcw_meta` (birthday, backup flag) | No (reveals balances and addresses) |
+| `wallet.sqlite` | BDK state: **public** descriptors, transactions, chain checkpoints; `btcw_meta` (birthday, backup flag); contacts and labels | No (reveals balances and addresses) |
 | `seed.enc` | Recovery phrase, encrypted (Argon2id 64 MiB → XChaCha20-Poly1305) | Encrypted |
 | `wallet.lock` | Held while a process has the wallet open | No |
 | `mempool-cache.txt` | Mempool transactions already downloaded (public data) | No |

@@ -2,10 +2,7 @@ import { useState } from "react";
 import type { MockControls } from "../lib/mock";
 import { useWallet } from "../state/wallet";
 
-/**
- * Demo controls, shown only when the in-memory mock backend is running (`npm run dev:mock`
- * or a plain browser). The real app never renders this.
- */
+/** Demo controls, shown only with the in-memory mock backend. */
 export function MockPanel({ mock }: { mock: MockControls }) {
   const { info } = useWallet();
   const [online, setOnline] = useState(mock.isNodeOnline());

@@ -1,4 +1,4 @@
-//! `btcw restore`: rebuild a wallet from its recovery phrase, then sync (PLAN §5.2).
+//! `btcw restore`: rebuild a wallet from its recovery phrase, then sync.
 
 use anyhow::Result;
 use btcw_core::WalletError;
@@ -26,13 +26,12 @@ struct RestoreJson {
 }
 
 pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>) -> Result<()> {
-    // Checked again (under the lock) by the core; this just avoids asking for secrets first.
+    // The core checks again under the lock; this avoids asking for secrets first.
     if api::wallet_exists(cfg) {
         return Err(WalletError::WalletExists(cfg.network_dir()).into());
     }
     let phrase = prompt::recovery_phrase()?;
-    // Validate before asking for a password, so a typo doesn't cost two password prompts.
-    // The error names a position or a count, never the words.
+    // Validate before the password prompts. The error never names the words.
     let word_count = keys::parse_mnemonic(&phrase)?.word_count();
     let password = prompt::new_password(ui)?;
     let Unlocked { mut wallet, signer } = api::restore_wallet(cfg, &phrase, &password, birthday)?;
@@ -53,7 +52,7 @@ pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>) -> Result<()> {
         ))?;
     }
 
-    // The wallet is restored whatever happens next; a missing node only postpones the scan.
+    // A missing node only postpones the scan.
     let sync = Node::connect(&cfg.rpc, cfg.network)
         .and_then(|node| sync_with_progress(ui, &node, &mut wallet))
         .map_err(anyhow::Error::from);

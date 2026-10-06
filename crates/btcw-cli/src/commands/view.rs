@@ -1,8 +1,5 @@
-//! `btcw balance`, `btcw history`, `btcw utxos` (PLAN §5.6–5.7). `history` shows transaction
-//! labels (`btcw label`) in a last column, when at least one transaction has one.
-//!
-//! All three are watch-only and offline: they read the wallet's SQLite file as of the last
-//! `btcw sync`, which is why each one says which block its numbers are from.
+//! `btcw balance`, `btcw history`, `btcw utxos`: watch-only and offline, as of the last sync,
+//! so each says which block its numbers are from.
 
 use anyhow::Result;
 use btcw_core::api;
@@ -62,7 +59,7 @@ pub fn balance(cfg: &Config, ui: &Ui) -> Result<()> {
 ///   Immature       50.00002820 BTC (5,000,002,820 sat)  mined; spendable after 100 confirmations
 ///   Total          50.01002820 BTC (5,001,002,820 sat)
 /// ```
-/// Immature is only listed when there is some (it only happens to miners, i.e. on regtest).
+/// Immature is only listed when there is some (mined coins, i.e. regtest).
 pub fn balance_lines(balance: &BalanceView, paint: Painter) -> String {
     let mut rows = vec![
         ("Confirmed", balance.confirmed_sat, ""),
@@ -119,7 +116,7 @@ pub fn history(cfg: &Config, ui: &Ui) -> Result<()> {
             as_of(synced_height)
         ));
     }
-    // Without any label, the table looks exactly as it did before labels existed.
+    // The label column only appears when some transaction has one.
     let labelled = transactions.iter().any(|tx| tx.label.is_some());
     let mut header = vec!["Date (UTC)", "Type", "Amount", "Fee", "Status", "Txid"];
     if labelled {

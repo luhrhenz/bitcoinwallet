@@ -1,4 +1,4 @@
-//! `btcw address new` / `btcw address list` (PLAN §5.4). Watch-only: no password, no node.
+//! `btcw address new` / `btcw address list`. Watch-only: no password, no node.
 
 use anyhow::Result;
 use btcw_core::api;
@@ -22,8 +22,7 @@ struct AddressListJson {
     addresses: Vec<AddressRow>,
 }
 
-/// The lowest revealed address that has never been paid (a new one only when all are used),
-/// so asking twice without receiving anything returns the same address.
+/// The lowest revealed address that has never been paid, so asking twice returns the same one.
 pub fn new(cfg: &Config, ui: &Ui) -> Result<()> {
     let mut wallet = api::open_watch_only(cfg)?;
     let address = wallet.new_address()?;

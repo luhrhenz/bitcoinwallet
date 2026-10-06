@@ -1,7 +1,7 @@
 //! One typed error for the whole library.
 //!
-//! Rule: error messages must never contain secret material (mnemonic words, xprvs,
-//! passwords). Wrap foreign errors as strings only after checking they can't leak secrets.
+//! Messages must never contain secrets (mnemonic words, xprvs, passwords); wrap foreign errors
+//! as strings only after checking they can't leak any.
 
 use std::path::PathBuf;
 
@@ -56,8 +56,7 @@ pub enum WalletError {
     #[error("transaction not found: {0}")]
     TxNotFound(String),
 
-    /// Address book and labels: an unknown contact name, a duplicate, an invalid name, note or
-    /// label. The message is complete on its own (it names the rule that was broken).
+    /// Address book and labels: unknown, duplicate or invalid name, note or label.
     #[error("{0}")]
     Contact(String),
 

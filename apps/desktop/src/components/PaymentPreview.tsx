@@ -10,10 +10,8 @@ import { Icon } from "./Icon";
 export const rate = (satVb: number) => String(Math.round(satVb * 100) / 100);
 
 /**
- * What the user checks before a payment (or its replacement) is signed: the full address in
- * groups of four, the contact name *next to* it when one was typed (never instead of it), and
- * every amount. For a fee bump (`preview.replaces`) it says which transaction is replaced and how
- * much more fee that costs.
+ * What the user checks before a payment or fee bump is signed: the full address (with any
+ * contact name next to it), every amount, and for a bump the transaction it replaces.
  */
 export function PaymentPreview({
   preview,

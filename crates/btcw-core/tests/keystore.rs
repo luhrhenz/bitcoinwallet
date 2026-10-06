@@ -1,4 +1,4 @@
-//! Agent A: the encrypted mnemonic keystore (Argon2id → XChaCha20-Poly1305).
+//! The encrypted mnemonic keystore (Argon2id → XChaCha20-Poly1305).
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -77,10 +77,8 @@ fn file_matches_the_documented_format() -> TestResult {
         mnemonic.phrase().len() + 16
     );
 
-    // The plaintext phrase appears nowhere in the file. Single words can't be checked: short
-    // BIP39 words such as "salt", "network" or "test" legitimately occur in the file's own field
-    // names and values ("network": "regtest"), which made a per-word check fail on ~3% of random
-    // phrases. Two adjacent words separated by a space, though, can only come from the phrase.
+    // No two adjacent phrase words appear in the file. Single words can't be checked: words
+    // like "salt" or "network" occur in the file's own field names.
     let raw = std::fs::read_to_string(&path)?;
     let phrase = mnemonic.phrase();
     assert!(

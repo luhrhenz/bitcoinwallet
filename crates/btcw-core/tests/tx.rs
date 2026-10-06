@@ -1,14 +1,8 @@
-//! Agent F: sending and transaction status against a real regtest `bitcoind`.
+//! Sending, fee bumps and transaction status against a real regtest `bitcoind`, including the
+//! failure paths that need real wallet state.
 //!
-//! fund → sync → build at a given fee rate → preview → sign → extract → broadcast → record →
-//! mine → sync → confirmed, plus the failure paths that need real wallet state (insufficient
-//! funds, cancel, a signer from another seed), through both the step-by-step functions and the
-//! `prepare_send` / `complete_send` helpers the desktop bridge uses.
-//!
-//! Node tests skip (not fail) without `bitcoind`; set `BITCOIND_EXE`. Each node start mines 101
-//! blocks (~20 s on Core v31), so the checks are grouped into two tests. Offline unit tests
-//! (address parsing, preview math on a hand-funded wallet, dust, fee-rate limits) live in
-//! `src/tx.rs`, because funding a wallet without a node needs the crate-private `bdk_mut()`.
+//! Skipped without `bitcoind` (set `BITCOIND_EXE`). Each node start mines 101 blocks, so checks
+//! are grouped into few tests. Offline unit tests are in `src/tx.rs`.
 
 use std::error::Error;
 use std::path::Path;
@@ -41,10 +35,8 @@ struct Setup {
     _dir: tempfile::TempDir,
 }
 
-/// `TestNode::available()` runs `bitcoind -version`, and Core v31 rewrites
-/// `~/.bitcoin/settings.json` even for that: two probes at once can fail on the rename and read
-/// as "no bitcoind", which would silently skip a test. Serialize the probes in this binary and
-/// retry, so a test only skips when bitcoind really is missing.
+/// Core v31 rewrites `settings.json` even for `bitcoind -version`, so concurrent probes can fail
+/// and look like "no bitcoind". Serialize and retry, so a test only skips when it is missing.
 fn bitcoind_available() -> bool {
     static PROBE: Mutex<()> = Mutex::new(());
     let _guard = PROBE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -292,8 +284,7 @@ fn send_step_by_step_then_watch_it_confirm() -> TestResult {
     Ok(())
 }
 
-/// `prepare_send` → `complete_send`, the pair the desktop bridge calls, including a failed
-/// signing attempt with someone else's key.
+/// `prepare_send` → `complete_send`, including a failed signing attempt with someone else's key.
 #[test]
 fn prepare_and_complete_send() -> TestResult {
     if !bitcoind_available() {
@@ -363,10 +354,8 @@ fn prepare_and_complete_send() -> TestResult {
     Ok(())
 }
 
-/// Agent I: a payment sent at 2 sat/vB is sped up to 5 sat/vB. Core's mempool ends up holding
-/// only the replacement, with the fee the preview showed; the wallet shows only the replacement
-/// (before and after a sync) and the balance drops by exactly the extra fee. Plus what can't be
-/// bumped: a too-low rate, a stranger's transaction, a payment *to* the wallet, a confirmed one.
+/// A payment at 2 sat/vB sped up to 5 sat/vB: node and wallet hold only the replacement and the
+/// balance drops by exactly the extra fee. Plus what can't be bumped.
 #[test]
 fn fee_bump_replaces_a_stuck_payment() -> TestResult {
     if !bitcoind_available() {
@@ -468,8 +457,7 @@ fn fee_bump_replaces_a_stuck_payment() -> TestResult {
     let mut wallet = WalletService::open(&cfg, None)?;
     check(&wallet)?;
 
-    // The original is gone for good; the replacement could be bumped again (no rate given: the
-    // node's estimate, raised to the minimum), but we cancel.
+    // The original is gone; the replacement could be bumped again, but we cancel.
     assert!(matches!(
         expect_err(tx::prepare_fee_bump(&mut wallet, &node, original, Some(rate(10)?)))?,
         WalletError::TxBuild(msg) if msg.contains("was replaced")

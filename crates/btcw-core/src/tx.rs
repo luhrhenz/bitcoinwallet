@@ -1,34 +1,23 @@
 //! Sending: address validation → PSBT build → preview → sign → extract; plus tx status.
 //!
-//! OWNER: Agent F (Phase 2). Contract: PLAN §5.8–5.9.
-//!
-//! Flow used by both frontends:
 //! ```text
 //! parse_address ─▶ build_psbt ─▶ preview ─▶ (user confirms?) ─┬─▶ sign_psbt ─▶ extract_tx
 //!                                                            └─▶ cancel (releases change addr)
 //! extract_tx ─▶ Node::broadcast ─▶ record_broadcast
 //! ```
-//! [`prepare_send`] (parse → fee rate → build → preview) and [`complete_send`]
-//! (sign → [`broadcast_signed`]) bundle those steps, so the CLI and the desktop bridge run the
-//! same sequence. The bridge keeps the PSBT in Rust between the two calls; the UI only ever sees
-//! the [`SendPreview`].
+//! [`prepare_send`] and [`complete_send`] bundle those steps so the CLI and the desktop bridge
+//! run the same sequence; the bridge keeps the PSBT in Rust and the UI only sees the
+//! [`SendPreview`].
 //!
-//! Guarantees the frontends rely on:
-//! - **The preview explains every output.** It finds the recipient output (exact script and
-//!   amount) and requires every other output to pay this wallet's change keychain; anything else
-//!   is an error. So what the user confirms is the whole transaction, not a summary of part of it.
-//! - **All or nothing signing.** [`sign_psbt`] fails unless the wallet's key signed *every* input
-//!   and BDK finalized every input.
-//! - **Nothing stays reserved after a failure.** The helpers call [`cancel`] on every error before
-//!   the broadcast succeeds, so a declined or failed send never burns a change address.
+//! Guarantees:
+//! - The preview accounts for every output: the recipient's, and the rest must be this wallet's
+//!   change. Anything else is an error.
+//! - [`sign_psbt`] fails unless every input was signed and finalized.
+//! - Every error before a successful broadcast calls [`cancel`], so a failed send never burns a
+//!   change address.
 //!
-//! Fee bumps (v2, Agent I) reuse all of it: [`prepare_fee_bump`] (= [`build_fee_bump`] +
-//! [`preview_fee_bump`]) builds a replacement for one of the wallet's unconfirmed payments and
-//! summarises it with the same [`preview`] (so the same "every output explained" rule holds, and
-//! [`SendPreview::replaces`] names the transaction being replaced); then [`complete_send`] /
-//! [`broadcast_signed`] / [`cancel`] as for any payment, and [`check_prepared_bump`] instead of
-//! [`check_prepared`] when the wallet was closed in between. The BIP125 rules and the fee math
-//! are explained at the top of the "Fee bump" section below.
+//! Fee bumps ([`prepare_fee_bump`]) reuse the same [`preview`], [`complete_send`] and
+//! [`cancel`]; the BIP125 rules and fee math are in the "Fee bump" section below.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -53,8 +42,7 @@ use crate::wallet::WalletService;
 /// Dust threshold for a P2WPKH output at the default relay fee.
 pub const DUST_LIMIT_P2WPKH: Amount = Amount::from_sat(294);
 
-/// Confirmation target (in blocks) for the node's fee estimate when the caller doesn't choose a
-/// fee rate: about an hour.
+/// Confirmation target (in blocks, about an hour) for the node's fee estimate.
 pub const FEE_TARGET_BLOCKS: u16 = 6;
 
 /// BIP144 serializes a transaction with witnesses as `version | 0x00 marker | 0x01 flag | ...`.
@@ -90,8 +78,8 @@ pub fn parse_address(s: &str, network: Network) -> Result<Address> {
         })
 }
 
-/// Which supported networks an address is valid on, e.g. `"a testnet4/signet address"`.
-/// (A `tb1…` address can't tell testnet4 from signet: they share the prefix.)
+/// Which supported networks an address is valid on, e.g. `"a testnet4/signet address"`
+/// (testnet4 and signet share the `tb1` prefix).
 fn networks_of(address: &Address<NetworkUnchecked>) -> String {
     let names: Vec<&str> = [
         (Network::Bitcoin, "mainnet"),
@@ -113,12 +101,10 @@ fn networks_of(address: &Address<NetworkUnchecked>) -> String {
 // ── Build and preview ───────────────────────────────────────────────────────────────────────
 
 /// Unsigned PSBT paying `amount` to `to` at `fee_rate`; BDK picks coins and adds change.
-/// `DustAmount` / `InsufficientFunds` on bad input.
 ///
-/// BDK's defaults are kept on purpose: change goes to the next unused address of the
-/// **internal** keychain, every input signals RBF (`nSequence = 0xFFFFFFFD`), and `nLockTime` is
-/// the wallet's synced tip height (anti fee-sniping). Building reveals that change address and
-/// marks it used in memory; [`cancel`] undoes that if the payment is not sent.
+/// BDK's defaults are kept: change to the next unused internal address, RBF signalled on every
+/// input (`0xFFFFFFFD`), and `nLockTime` at the synced tip (anti fee-sniping). Building marks
+/// the change address used in memory; [`cancel`] undoes that.
 pub fn build_psbt(
     wallet: &mut WalletService,
     to: &Address,
@@ -144,11 +130,10 @@ pub fn build_psbt(
     builder.finish().map_err(|e| create_tx_error(e, amount))
 }
 
-/// The dust rule [`build_psbt`] applies (`DustAmount`), exposed so a frontend can reject the
-/// amount before unlocking the wallet or syncing.
+/// The dust rule [`build_psbt`] applies, exposed so a frontend can check it before unlocking.
 ///
-/// Nodes don't relay an output worth less than it would cost to spend at 3 sat/vB ("dust"):
-/// 294 sat for P2WPKH, more for bigger scripts (546 for legacy P2PKH, 330 for taproot).
+/// Dust is an output worth less than it costs to spend at 3 sat/vB: 294 sat for P2WPKH, 546 for
+/// P2PKH, 330 for taproot.
 pub fn check_amount(to: &Address, amount: Amount) -> Result<()> {
     if amount < DUST_LIMIT_P2WPKH.max(to.script_pubkey().minimal_non_dust()) {
         return Err(WalletError::DustAmount(amount));
@@ -156,12 +141,10 @@ pub fn check_amount(to: &Address, amount: Amount) -> Result<()> {
     Ok(())
 }
 
-/// The fee-rate rule [`build_psbt`] applies (`TxBuild`), exposed so a frontend can reject the
-/// rate before unlocking the wallet or syncing.
+/// The fee-rate rule [`build_psbt`] applies, exposed so a frontend can check it before unlocking.
 ///
-/// Nodes drop transactions below 1 sat/vB (the default `minrelaytxfee`), and rust-bitcoin's
-/// `extract_tx` refuses anything above 25 000 sat/vB, so a rate outside that range is refused
-/// before the user is asked to confirm anything.
+/// Below 1 sat/vB (`minrelaytxfee`) nodes drop the transaction; above 25 000 sat/vB
+/// rust-bitcoin's `extract_tx` refuses it.
 pub fn check_fee_rate(rate: FeeRate) -> Result<()> {
     if rate < FeeRate::BROADCAST_MIN {
         return Err(WalletError::TxBuild(format!(
@@ -181,8 +164,8 @@ pub fn check_fee_rate(rate: FeeRate) -> Result<()> {
 
 /// Summarise a built PSBT for the confirmation step.
 ///
-/// Fails (`TxBuild`) unless the PSBT pays exactly `amount` to `to` and every other output goes
-/// back to this wallet's change keychain, so the preview can never hide an output.
+/// Fails unless the PSBT pays exactly `amount` to `to` and every other output is this wallet's
+/// change, so the preview can never hide an output.
 pub fn preview(
     wallet: &WalletService,
     psbt: &Psbt,
@@ -222,8 +205,7 @@ pub fn preview(
         }
     }
 
-    // Fee = inputs − outputs. The PSBT carries each input's previous output (`witness_utxo`),
-    // which is how the fee is known before the transaction is signed.
+    // Fee = inputs − outputs; each input's `witness_utxo` gives its value before signing.
     let fee = psbt
         .fee()
         .map_err(|e| WalletError::TxBuild(format!("cannot work out the fee: {e}")))?;
@@ -235,8 +217,7 @@ pub fn preview(
         to: to.to_string(),
         amount_sat: amount.to_sat(),
         fee_sat: fee.to_sat(),
-        // For display only; every amount stays an integer number of satoshis. `vsize` is at
-        // least the 10-byte transaction header, so this never divides by zero.
+        // Display only; amounts stay integer satoshis.
         fee_rate_sat_vb: fee.to_sat() as f64 / vsize.max(1) as f64,
         vsize,
         change_sat: change.map(Amount::to_sat),
@@ -248,31 +229,25 @@ pub fn preview(
 
 /// User declined: un-reserve the change address BDK revealed while building.
 ///
-/// Only touches staged, in-memory state (BDK's "unused" marks are not persisted); the caller
-/// persists if it wants the reveal itself saved. Harmless for an address that was actually paid:
-/// BDK ignores `unmark_used` for scripts that have received outputs.
+/// In-memory only (BDK doesn't persist "used" marks). Harmless for an address that was paid:
+/// BDK ignores `unmark_used` for scripts with outputs.
 pub fn cancel(wallet: &mut WalletService, psbt: &Psbt) {
     let bdk = wallet.bdk_mut();
     for out in &psbt.unsigned_tx.output {
         if let Some((KeychainKind::Internal, index)) =
             bdk.derivation_of_spk(out.script_pubkey.clone())
         {
-            // `build_tx` picks the lowest revealed-but-unused change index and marks it used.
-            // Unmarking it makes the next build pick the same index again instead of a new one,
-            // so declined payments don't leave a trail of never-used change addresses.
+            // So the next build reuses this index instead of revealing a new one.
             bdk.unmark_used(KeychainKind::Internal, index);
         }
     }
 }
 
-/// For a PSBT built earlier and signed later, after the wallet was closed in between (the
-/// desktop app's prepared payment): check the wallet hasn't moved on. Every input must still be
-/// an unspent coin of this wallet, and no change output may pay an address another transaction
-/// has paid since. `TxBuild` otherwise.
+/// For a PSBT built before the wallet was closed and reopened: every input must still be an
+/// unspent coin of this wallet, and no change address may have been paid since.
 ///
-/// Another process (`btcw send` in a terminal) can spend those coins, or take the same
-/// revealed-but-unused change address, while the preview is on screen. Signing anyway would
-/// replace that payment by RBF (if this one pays more) or reuse an address.
+/// Another process can spend those coins or take that change address while the preview is on
+/// screen; signing anyway would RBF-replace its payment or reuse an address.
 pub fn check_prepared(wallet: &WalletService, psbt: &Psbt) -> Result<()> {
     let bdk = wallet.bdk();
     for input in &psbt.unsigned_tx.input {
@@ -296,7 +271,6 @@ fn check_change_unused(wallet: &WalletService, psbt: &Psbt, replaces: Option<Txi
             bdk.derivation_of_spk(out.script_pubkey.clone()),
             Some((KeychainKind::Internal, _))
         );
-        // Outputs the wallet already holds, spent or not: was this address paid meanwhile?
         if is_change
             && bdk.list_output().any(|output| {
                 output.txout.script_pubkey == out.script_pubkey
@@ -315,12 +289,10 @@ fn check_change_unused(wallet: &WalletService, psbt: &Psbt, replaces: Option<Txi
 
 // ── Sign, extract, record ───────────────────────────────────────────────────────────────────
 
-/// `signer.sign_psbt` then BDK's `finalize_psbt` (builds the witnesses).
-/// `Sign` error unless every input ends up finalized.
+/// Sign with `signer`, then finalize with BDK. Fails unless every input ends up finalized.
 ///
-/// The two halves are split on purpose (PLAN §4, Phase 0 finding 1): rust-bitcoin's `Psbt::sign`
-/// produces the signatures from the master key (BDK 3.2 deprecated its own key store), and BDK,
-/// which knows the descriptors, turns each signature + public key into the final witness.
+/// rust-bitcoin's `Psbt::sign` makes the signatures (BDK 3.2 deprecated its own signers), and
+/// BDK, which knows the descriptors, builds the witnesses.
 pub fn sign_psbt(wallet: &WalletService, signer: &Signer, psbt: &mut Psbt) -> Result<()> {
     check_shape(psbt)?;
     let inputs = psbt.inputs.len();
@@ -346,7 +318,6 @@ pub fn sign_psbt(wallet: &WalletService, signer: &Signer, psbt: &mut Psbt) -> Re
 /// Extract the network-ready transaction (rejects absurd fee rates).
 pub fn extract_tx(psbt: Psbt) -> Result<Transaction> {
     check_shape(&psbt)?;
-    // Extracting an unfinalized input yields an empty witness: a transaction every node rejects.
     if let Some(i) = psbt
         .inputs
         .iter()
@@ -356,13 +327,11 @@ pub fn extract_tx(psbt: Psbt) -> Result<Transaction> {
             "input {i} is not signed and finalized; call sign_psbt first"
         )));
     }
-    // `Psbt::extract_tx` computes the fee itself but treats one of the fee errors (a
-    // `non_witness_utxo` without the spent output) as unreachable and panics. Computing it here
-    // first turns that case into an error.
+    // `Psbt::extract_tx` panics on one fee error (a `non_witness_utxo` missing the spent
+    // output); computing the fee first turns it into an error.
     psbt.fee()
         .map_err(|e| WalletError::TxBuild(format!("cannot work out the fee: {e}")))?;
-    // rust-bitcoin's sanity check stays on: it refuses fee rates above 25 000 sat/vB, the
-    // classic "fee in BTC typed into the sat field" mistake.
+    // Keeps rust-bitcoin's absurd-fee check (> 25 000 sat/vB).
     psbt.extract_tx().map_err(|e| match e {
         ExtractTxError::AbsurdFeeRate { fee_rate, .. } => WalletError::TxBuild(format!(
             "refusing to extract a transaction paying {} sat/vB (the limit is {} sat/vB)",
@@ -373,18 +342,13 @@ pub fn extract_tx(psbt: Psbt) -> Result<Transaction> {
     })
 }
 
-/// After a successful broadcast: add the tx to the wallet as unconfirmed and persist,
-/// so the balance reflects the spend before the next sync.
-///
-/// For a fee bump, the replaced payment drops out of the history and balance at once, and the
-/// replacement takes over its label.
+/// After a successful broadcast: add the tx as unconfirmed and persist, so the balance reflects
+/// it before the next sync. A fee bump's replacement takes over the original's label.
 pub fn record_broadcast(wallet: &mut WalletService, tx: &Transaction) -> Result<()> {
     let txid = tx.compute_txid();
-    // The seen time is the "last seen in the mempool" time BDK uses to pick between conflicting
-    // unconfirmed transactions: the newest wins, and a tie goes to the *higher txid*. It is
-    // `now`, but strictly after every transaction this one conflicts with (the payment a fee
-    // bump replaces), so the wallet agrees with the node straight away even when the original
-    // was last seen by a sync in this same second. It also becomes the tx's `first_seen`.
+    // BDK picks between conflicting unconfirmed txs by last-seen time (ties go to the higher
+    // txid), so seen time must be strictly after anything this tx replaces, even within the
+    // same second.
     let replaced = conflicting_txids(wallet, tx);
     let graph = wallet.bdk().tx_graph();
     let seen = replaced
@@ -414,10 +378,8 @@ fn conflicting_txids(wallet: &WalletService, tx: &Transaction) -> Vec<Txid> {
     conflicts
 }
 
-/// Status from the wallet's view (call `Node::sync` first for fresh data).
-///
-/// `None` if the wallet doesn't know the transaction, or no longer considers it part of the
-/// chain or mempool (e.g. it was replaced). Confirmations count from the wallet's synced tip.
+/// Status from the wallet's view (sync first for fresh data). `None` if unknown or no longer
+/// canonical (e.g. replaced).
 pub fn tx_status(wallet: &WalletService, txid: Txid) -> Option<TxStatus> {
     let wtx = wallet.bdk().get_tx(txid)?;
     Some(crate::wallet::tx_status(
@@ -428,14 +390,10 @@ pub fn tx_status(wallet: &WalletService, txid: Txid) -> Option<TxStatus> {
 
 // ── One code path for both frontends ────────────────────────────────────────────────────────
 
-/// Everything from "the user typed a payment" to "show the preview": resolve `to` (an address
-/// for the wallet's network, or a contact's name: [`WalletService::resolve_recipient`]), pick the
-/// fee rate (`fee_rate`, else the node's estimate for [`FEE_TARGET_BLOCKS`]), build the PSBT and
-/// summarise it. The preview's `to` is always the full address; `contact` is the name, if one was
-/// typed.
+/// Resolve `to` (address or contact name), pick the fee rate (else the node's estimate for
+/// [`FEE_TARGET_BLOCKS`]), build the PSBT and preview it.
 ///
-/// Call [`Node::sync`] first so coin selection sees the current UTXOs. The caller then holds the
-/// PSBT until the user decides: [`complete_send`] to send it, [`cancel`] to drop it.
+/// Sync first so coin selection sees current UTXOs. Then [`complete_send`] or [`cancel`].
 pub fn prepare_send(
     wallet: &mut WalletService,
     node: &Node,
@@ -463,9 +421,6 @@ pub fn prepare_send(
 }
 
 /// The user confirmed: [`sign_psbt`], then [`broadcast_signed`]. Returns the txid.
-///
-/// On any error before the broadcast succeeds, the change address is released ([`cancel`]) and
-/// nothing was sent.
 pub fn complete_send(
     wallet: &mut WalletService,
     signer: &Signer,
@@ -479,14 +434,12 @@ pub fn complete_send(
     broadcast_signed(wallet, node, psbt)
 }
 
-/// Second half of [`complete_send`], for callers that drop the [`Signer`] as soon as signing is
-/// done (the CLI): [`extract_tx`] → [`Node::broadcast`] → [`record_broadcast`].
+/// Second half of [`complete_send`], for callers that drop the [`Signer`] right after signing.
 ///
-/// Errors before the node accepts the transaction release the change address ([`cancel`]).
-/// Once it has accepted it the coins are on their way, so a failure to *record* it is only
-/// logged: the spend stays staged in memory, and the next sync finds it in the mempool anyway.
+/// Once the node has accepted the transaction, a failure to record it is only logged: the next
+/// sync finds it in the mempool anyway.
 pub fn broadcast_signed(wallet: &mut WalletService, node: &Node, psbt: Psbt) -> Result<Txid> {
-    // Extract from a copy: on failure the outputs are still needed to release the change address.
+    // Copy: on failure the outputs are needed to release the change address.
     let tx = match extract_tx(psbt.clone()) {
         Ok(tx) => tx,
         Err(e) => {
@@ -497,8 +450,7 @@ pub fn broadcast_signed(wallet: &mut WalletService, node: &Node, psbt: Psbt) -> 
     let txid = match node.broadcast(&tx) {
         Ok(txid) => txid,
         Err(e) => {
-            // If the node did accept it after all (say, the reply timed out), the next sync sees
-            // the transaction in the mempool and marks the change address used again.
+            // If the node accepted it anyway (reply timed out), the next sync re-marks the change.
             cancel(wallet, &psbt);
             return Err(e);
         }
@@ -516,34 +468,22 @@ pub fn broadcast_signed(wallet: &mut WalletService, node: &Node, psbt: Psbt) -> 
 
 // ── Fee bump (RBF) ──────────────────────────────────────────────────────────────────────────
 //
-// A payment stuck at a low fee can be *replaced* by a new transaction that spends the same coins,
-// pays the same recipient the same amount, and pays a higher fee, taken out of the change. A node
-// that accepts the replacement drops the original from its mempool, and since both spend the same
-// coins, at most one of them can ever confirm.
+// A replacement spends the same coins, pays the same recipient the same amount, and takes a
+// higher fee out of the change. BIP125 rules (Core's `policy/rbf.cpp`):
 //
-// Nodes accept a replacement under the BIP125 rules (Core's mempool policy, `policy/rbf.cpp`):
+//   1. The original signals RBF (an input with nSequence < 0xFFFFFFFE). Ours always do (BDK's
+//      0xFFFFFFFD). Core 28+ does full RBF, but other nodes go by the signal, so we require it.
+//   2. No new *unconfirmed* inputs. BDK only adds confirmed coins; we check again anyway.
+//   3. Pays at least the absolute fee of everything evicted. We refuse payments with unconfirmed
+//      descendants, so that is the original's fee.
+//   4. New fee − old fee ≥ incremental relay fee × replacement size. We use 1 sat/vB (newer Core
+//      lowers it to 0.1).
+//   5. At most 100 evictions: trivially true here.
 //
-//   1. The original signals replaceability: one of its inputs has nSequence < 0xFFFFFFFE. Our
-//      payments always do (BDK's default 0xFFFFFFFD, §7). Core 28+ relays replacements of
-//      non-signalling transactions too ("full RBF"), but other nodes and wallets go by the
-//      signal, so we require it.
-//   2. The replacement adds no *unconfirmed* inputs the original didn't have. BDK only offers
-//      confirmed coins when the change can't cover the extra fee; we check again anyway.
-//   3. It pays at least the absolute fee of everything it evicts: the original plus its
-//      descendants. We refuse to bump a payment whose outputs another unconfirmed wallet
-//      transaction spends (replacing it would silently cancel that payment too), so this is just
-//      the original's fee.
-//   4. On top of that it pays for its own relay: new fee − old fee ≥ incremental relay fee rate ×
-//      the replacement's size. Core's incremental relay fee was 1 sat/vB for years (newer
-//      versions lower it to 0.1); we use 1 sat/vB, the stricter of the two.
-//   5. At most 100 transactions are evicted: trivially true for one transaction and no
-//      descendants.
+//   Core also wants a higher fee rate; BDK's `build_fee_bump` requires old rate + 1 sat/vB,
+//   with the old rate = fee ÷ signed weight, rounded down to sat/kwu.
 //
-//   Core also requires the replacement's fee *rate* to beat the original's. BDK's
-//   `build_fee_bump` goes further and requires new rate ≥ old rate + 1 sat/vB, where the old rate
-//   is the original's fee ÷ its real (signed) weight, rounded down to whole sat/kwu.
-//
-// The fee math, worked through (1 P2WPKH input, recipient + change; 562 WU = 141 vB estimated):
+// Worked example (1 P2WPKH input, recipient + change; 562 WU = 141 vB estimated):
 //
 //   original at 2 sat/vB (500 sat/kwu): fee = ⌈500 × 562 / 1000⌉ = 281 sat. Signed, it weighs
 //     561 or 562 WU (signatures vary by a byte), so its rate is ⌊281 000 / 561⌋ = 500 sat/kwu.
@@ -555,10 +495,8 @@ pub fn broadcast_signed(wallet: &mut WalletService, node: &Node, psbt: Psbt) -> 
 //                 703 − 281 = 422 sat, the recipient still gets the same amount, and the
 //                 wallet's balance drops by exactly those 422 sat.
 //
-// The replacement keeps the original's change address (`drain_to`): it was already handed out
-// for this payment, and only one of the two transactions can confirm, so nothing is linked that
-// wasn't already. When the original had no change, BDK adds a change output at a fresh address
-// (and [`cancel`] releases it, as for any payment).
+// The replacement keeps the original's change address (`drain_to`); only one of the two can
+// confirm, so nothing new is linked. Without change, BDK adds one at a fresh address.
 
 /// Incremental relay fee rate for BIP125 rule 4 (see above): 1 sat/vB.
 pub const INCREMENTAL_RELAY_FEE: FeeRate = FeeRate::BROADCAST_MIN;
@@ -578,9 +516,7 @@ struct BumpTarget {
     min_rate: FeeRate,
 }
 
-/// Every reason a transaction can't be replaced, checked before BDK is asked to build anything,
-/// so each one gets its own message (`TxNotFound` for a txid the wallet has never seen, `TxBuild`
-/// for the rest).
+/// Every reason a transaction can't be replaced, checked up front so each gets its own message.
 fn bump_target(wallet: &WalletService, txid: Txid) -> Result<BumpTarget> {
     let bdk = wallet.bdk();
     let refuse = |why: String| WalletError::TxBuild(format!("cannot speed up {txid}: {why}"));
@@ -676,15 +612,11 @@ fn bump_target(wallet: &WalletService, txid: Txid) -> Result<BumpTarget> {
         )));
     }
 
-    // The minimum rate is the larger of two:
-    // - BDK's rule: the original's rate + 1 sat/vB, with the same arithmetic as its
-    //   `build_fee_bump` (fee ÷ signed weight, rounded down);
-    // - BIP125 rule 4 for a replacement the size of the original (the usual case: same inputs and
-    //   outputs, only the change shrinks): (old fee + 1 sat/vB × vsize) ÷ weight, rounded up.
-    //   Without it, BDK's minimum can fall a satoshi short of rule 4 through rounding, and the
-    //   node refuses the replacement: an original of 562 WU paying 703 sat (5 sat/vB) has a BDK
-    //   minimum of ⌊703 000 / 562⌋ + 250 = 1 500 sat/kwu, which pays ⌈1 500 × 562 / 1 000⌉ =
-    //   843 sat, but Core wants 703 + 141 = 844. (Found by the regtest test.)
+    // The minimum rate is the larger of:
+    // - BDK's: the original's rate + 1 sat/vB (fee ÷ signed weight, rounded down);
+    // - BIP125 rule 4 for a same-size replacement: (old fee + 1 sat/vB × vsize) ÷ weight,
+    //   rounded up. BDK's alone can fall a satoshi short through rounding: 562 WU at 703 sat
+    //   gives ⌊703 000 / 562⌋ + 250 = 1 500 sat/kwu → 843 sat, but Core wants 703 + 141 = 844.
     let overflow = || refuse("its fee rate can't be worked out".into());
     let rate_kwu = fee
         .to_sat()
@@ -713,19 +645,16 @@ fn bump_target(wallet: &WalletService, txid: Txid) -> Result<BumpTarget> {
     })
 }
 
-/// The lowest fee rate [`build_fee_bump`] accepts for replacing `txid`: its current rate plus
-/// 1 sat/vB, or a hair more where BIP125 rule 4 needs it (see above). Fails, with the same errors as [`build_fee_bump`], if `txid` can't be replaced at
-/// all, so a frontend can ask before offering "speed up".
+/// The lowest fee rate [`build_fee_bump`] accepts for `txid`; fails like it if `txid` can't be
+/// replaced at all.
 pub fn min_fee_bump_rate(wallet: &WalletService, txid: Txid) -> Result<FeeRate> {
     bump_target(wallet, txid).map(|target| target.min_rate)
 }
 
-/// Unsigned PSBT replacing the wallet's unconfirmed payment `txid` at `fee_rate`: same inputs,
-/// same recipient and amount, same change address, more fee (from the change; BDK adds a
-/// confirmed coin if the change can't cover it). Applies every rule above (`TxNotFound` for an
-/// unknown txid, `TxBuild` otherwise, `InsufficientFunds` if even extra coins can't pay).
+/// Unsigned PSBT replacing the unconfirmed payment `txid` at `fee_rate`: same inputs, recipient
+/// and change address, more fee from the change (plus a confirmed coin if needed).
 ///
-/// Like [`build_psbt`], building may reveal and reserve a change address; [`cancel`] releases it.
+/// Like [`build_psbt`], may reserve a change address; [`cancel`] releases it.
 pub fn build_fee_bump(wallet: &mut WalletService, txid: Txid, fee_rate: FeeRate) -> Result<Psbt> {
     check_fee_rate(fee_rate)?;
     let target = bump_target(wallet, txid)?;
@@ -754,10 +683,8 @@ pub fn build_fee_bump(wallet: &mut WalletService, txid: Txid, fee_rate: FeeRate)
     Ok(psbt)
 }
 
-/// Summarise a fee bump built by [`build_fee_bump`] for the confirmation step: the same
-/// [`preview`] as a payment (it pays the original recipient exactly the original amount, and
-/// every other output is this wallet's change) with [`SendPreview::replaces`] set. Fails if the
-/// PSBT doesn't replace `txid` under the rules above.
+/// [`preview`] for a fee bump, with [`SendPreview::replaces`] set. Fails if the PSBT doesn't
+/// replace `txid` under the rules above.
 pub fn preview_fee_bump(wallet: &WalletService, psbt: &Psbt, txid: Txid) -> Result<SendPreview> {
     let target = bump_target(wallet, txid)?;
     check_replacement(wallet, psbt, &target)?;
@@ -770,12 +697,8 @@ pub fn preview_fee_bump(wallet: &WalletService, psbt: &Psbt, txid: Txid) -> Resu
     Ok(summary)
 }
 
-/// "Speed up" in one call, the fee-bump twin of [`prepare_send`]: fee rate (`fee_rate`, else the
-/// node's estimate for [`FEE_TARGET_BLOCKS`], raised to the minimum if it is below it, rounded up
-/// to a whole sat/vB), [`build_fee_bump`], [`preview_fee_bump`].
-///
-/// Call [`Node::sync`] first: a payment that confirmed meanwhile can't be replaced. Then
-/// [`complete_send`] to send the replacement, or [`cancel`].
+/// The fee-bump twin of [`prepare_send`]. Without `fee_rate`, uses the node's estimate raised to
+/// at least the minimum and rounded up to a whole sat/vB.
 pub fn prepare_fee_bump(
     wallet: &mut WalletService,
     node: &Node,
@@ -802,22 +725,16 @@ pub fn prepare_fee_bump(
     }
 }
 
-/// [`check_prepared`] for a fee bump built earlier and signed later, after the wallet was closed
-/// in between: `replaces` must still be unconfirmed and replaceable (nothing confirmed or replaced
-/// it, no payment spends its change), and `psbt` must still be a valid replacement for it whose
-/// extra coins, if any, are still unspent. `TxBuild` / `TxNotFound` otherwise.
-///
-/// Its inputs are *meant* to be spent already (by `replaces`), and its change address was paid
-/// by `replaces`, which is why the plain [`check_prepared`] would refuse it.
+/// [`check_prepared`] for a fee bump: `replaces` must still be replaceable and `psbt` still a
+/// valid replacement. (Its inputs and change are already used by `replaces`, so the plain check
+/// would refuse it.)
 pub fn check_prepared_bump(wallet: &WalletService, psbt: &Psbt, replaces: Txid) -> Result<()> {
     let target = bump_target(wallet, replaces)?;
     check_replacement(wallet, psbt, &target)?;
     check_change_unused(wallet, psbt, Some(replaces))
 }
 
-/// `psbt` replaces `target` under the rules above: it spends every coin the original spends,
-/// any other coin is an unspent, confirmed wallet coin (rule 2), and it pays at least the old fee
-/// plus the incremental relay fee for its own size (rules 3 and 4).
+/// `psbt` replaces `target` under BIP125 rules 2–4.
 fn check_replacement(wallet: &WalletService, psbt: &Psbt, target: &BumpTarget) -> Result<()> {
     check_shape(psbt)?;
     let txid = target.txid;
@@ -894,11 +811,8 @@ fn rate_too_low(target: &BumpTarget, asked: FeeRate, required: FeeRate) -> Walle
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
-/// Weight of the transaction once every input is signed, with the largest possible signatures.
-///
-/// The unsigned transaction can't simply be measured: its inputs have empty witnesses, and the
-/// witness (signature + public key) is most of a P2WPKH input's size. So we start from the
-/// unsigned weight and add what signing adds:
+/// Weight once every input is signed, assuming the largest signatures: the unsigned weight plus
+/// what signing adds.
 ///
 /// ```text
 /// unsigned weight   4 WU per byte (no witness → serialized without the segwit marker/flag)
@@ -910,10 +824,8 @@ fn rate_too_low(target: &BumpTarget, asked: FeeRate, required: FeeRate) -> Walle
 ///              + 1 + 33 (compressed public key)                                key push
 ///              = 107 WU
 /// ```
-/// About half of all signatures are a byte shorter (when `r` fits in 32 bytes), and very rarely
-/// two, so the estimate is an upper bound, usually 0 or 1 WU per input above the real weight.
-/// That's the safe side: the fee rate actually paid is never below the one shown. BDK's coin
-/// selection sizes inputs the same way, which is why `fee ≈ fee rate × this vsize`.
+/// Signatures are often a byte shorter, so this is an upper bound (0–1 WU per input over): the
+/// rate paid is never below the one shown. BDK's coin selection sizes inputs the same way.
 fn estimated_signed_weight(wallet: &WalletService, psbt: &Psbt) -> Result<Weight> {
     let tx = &psbt.unsigned_tx;
     if tx.input.is_empty() {
@@ -927,9 +839,8 @@ fn estimated_signed_weight(wallet: &WalletService, psbt: &Psbt) -> Result<Weight
     Ok(weight)
 }
 
-/// The same estimate for a transaction the wallet already sent (signed): its weight with the
-/// witnesses stripped, plus what signing adds, so it can be compared like for like with a
-/// replacement's [`estimated_signed_weight`] (signatures vary by a byte, the estimate doesn't).
+/// The same estimate for an already signed transaction, comparable with
+/// [`estimated_signed_weight`] (real signatures vary by a byte).
 fn estimated_weight_of_sent(wallet: &WalletService, tx: &Transaction) -> Result<Weight> {
     let mut unsigned = tx.clone();
     for input in &mut unsigned.input {
@@ -961,8 +872,8 @@ fn input_witness_weight(wallet: &WalletService, i: usize, script: &ScriptBuf) ->
     Ok(WITNESS_ITEM_COUNT + satisfaction)
 }
 
-/// rust-bitcoin's PSBT helpers (`fee`, `iter_funding_utxos`) *assert* one input map per
-/// transaction input. PSBTs we build always match, but a hand-made one could panic there.
+/// rust-bitcoin's PSBT helpers assert one input map per input; check first so a malformed PSBT
+/// errors instead of panicking.
 fn check_shape(psbt: &Psbt) -> Result<()> {
     let tx = &psbt.unsigned_tx;
     if psbt.inputs.len() != tx.input.len() || psbt.outputs.len() != tx.output.len() {
@@ -977,8 +888,7 @@ fn check_shape(psbt: &Psbt) -> Result<()> {
     Ok(())
 }
 
-/// `FeeRate` counts sat per 1000 weight units; 1 vB = 4 WU, so 1 sat/vB = 250 sat/kwu.
-/// For messages only (`2`, `0.996`, `25000`).
+/// sat/kwu → sat/vB (÷ 250), for messages only.
 fn sat_per_vb(rate: FeeRate) -> f64 {
     rate.to_sat_per_kwu() as f64 / 250.0
 }
@@ -1006,9 +916,8 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// Offline tests: the wallet is funded with made-up unconfirmed transactions (BDK doesn't need to
-/// see the parents of their dummy inputs), which needs the crate-private `bdk_mut()`. The same
-/// flow against a real node, including broadcast and confirmation, is in `tests/tx.rs`.
+/// Offline tests on a wallet funded with made-up unconfirmed transactions. The node-backed
+/// flow is in `tests/tx.rs`.
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -1224,7 +1133,7 @@ mod tests {
         sign_psbt(&wallet, &signer, &mut psbt)?;
         let signed = extract_tx(psbt)?;
         assert!(signed.input.iter().all(|txin| txin.witness.len() == 2));
-        // The estimate is an upper bound, and at most a byte per input above the real size.
+        // The estimate is an upper bound, at most a byte per input over.
         let real = u64::try_from(signed.vsize())?;
         assert!(
             real <= preview.vsize && preview.vsize <= real + 2,
@@ -1233,9 +1142,8 @@ mod tests {
         );
         // So the rate really paid is at least the one shown...
         assert!(preview.fee_sat as f64 / real as f64 >= preview.fee_rate_sat_vb);
-        // ...and, per weight unit (how BDK and Core's fee logic measure it), at least the one
-        // asked for. (Per *rounded-up* vbyte it can be a hair below: 626 sat / 834 WU is
-        // 3.002 sat/vB, but 834 WU rounds up to 209 vB and 626 / 209 = 2.995.)
+        // ...and, per weight unit, at least the one asked for. (Per rounded-up vbyte it can be a
+        // hair below: 626 sat / 834 WU = 3.002 sat/vB, but 626 / 209 vB = 2.995.)
         assert!(
             4 * preview.fee_sat >= 3 * signed.weight().to_wu(),
             "{} sat for {}",
@@ -1510,8 +1418,7 @@ mod tests {
             .ok_or("no change output")?;
         let change = Address::from_script(&change_out.script_pubkey, Network::Regtest)?;
 
-        // Another payment, from the *other* coin, sends its change to the same address (as a
-        // second process does: the address was revealed, saved and never paid).
+        // Another payment, from the other coin, sends its change to the same address.
         let used: Vec<OutPoint> = psbt
             .unsigned_tx
             .input

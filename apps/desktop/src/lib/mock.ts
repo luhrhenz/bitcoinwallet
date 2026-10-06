@@ -1,33 +1,13 @@
-// In-memory stand-in for the Rust command layer (src-tauri, Agent G), so the whole UI can be
-// built, demoed (`npm run dev:mock`) and tested without Rust or a node.
+// In-memory stand-in for the Rust command layer, so the UI can be built, demoed
+// (`npm run dev:mock`) and tested without Rust or a node.
 //
-// It follows btcw-core's rules closely enough that the UI meets every real error path:
-// - phrases are real BIP39 (word list + checksum); passwords need 8+ characters;
-// - addresses are real bech32 for the active network (`tb1…` / `bcrt1…`), and sending checks
-//   prefix, checksum, dust (294 sat), funds, and builds a fee preview with P2WPKH sizes
-//   (~141 vB for 1 input and 2 outputs);
-// - the wallet only learns about the chain by syncing: a payment shows up after `sync`, and a
-//   block mined with `mineBlocks` turns into confirmations after `sync` or `txStatus` (which
-//   syncs first when the node is up and otherwise answers from the last sync, like the Rust
-//   command);
-// - sending follows the Rust bridge: one prepared payment at a time (a new one replaces it),
-//   `locked` without the password, and a prepared payment is gone after any `confirmSend`
-//   (sent, failed or expired after 10 minutes) and after locking;
-// - the backup flag: a new wallet is unverified, a restored one verified; `backupChallenge`,
-//   `verifyBackup` and `revealPhrase` check the password like the keystore does;
-// - the address book and labels (btcw-core `book.rs`): names trimmed, 1–40 characters, unique
-//   ignoring case, never address-like; addresses checked for the network; labels 1–100
-//   characters, only for transactions the wallet knows; all of it per network and watch-only.
-//   `prepareSend` takes a contact's name like the core's `resolve_recipient`;
-// - "speed up" (RBF): only the wallet's own unconfirmed payments, a minimum of the old rate +
-//   1 sat/vB (and old fee + 1 sat/vB × size), the extra fee out of the change, the same single
-//   prepared-payment slot; `confirmSend` syncs first and refuses if the original confirmed, and
-//   the replacement takes the original's place (and label) in the history;
-// - every failure rejects with a plain `ApiError { code, message }` object, like Tauri.
+// It follows btcw-core's rules closely enough that the UI meets every real error path: real
+// BIP39 phrases and bech32 addresses, dust and fee checks, sync-driven confirmations, one
+// prepared payment at a time, the backup flag, the address book and label rules, and RBF
+// minimums. Failures reject with `ApiError { code, message }`, like Tauri.
 //
-// Simplifications: one fake "node" per network, coins only to and from this wallet, no
-// reorgs or evictions, legacy (base58) addresses accepted by shape without a checksum, and a
-// fee bump never adds a coin (if the change can't pay the extra fee it is `insufficient_funds`).
+// Simplifications: one fake node per network, coins only to and from this wallet, no reorgs or
+// evictions, legacy addresses accepted by shape only, and a fee bump never adds a coin.
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { WalletApi } from "./api";
@@ -99,9 +79,6 @@ const MAX_NAME_CHARS = 40;
 const MAX_NOTE_CHARS = 200;
 const MAX_LABEL_CHARS = 100;
 const SEGWIT_PREFIXES = ["bc1", "tb1", "bcrt1"];
-
-// ---------------------------------------------------------------------------------------------
-// State
 
 interface Output {
   outpoint: string;
@@ -198,9 +175,6 @@ function concat(...parts: Uint8Array[]): Uint8Array {
 }
 
 const u32le = (n: number) => new Uint8Array([n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff]);
-
-// ---------------------------------------------------------------------------------------------
-// The mock
 
 export function createMockApi(options: MockOptions = {}): MockWalletApi {
   const latency = options.latencyMs ?? 150;
@@ -465,8 +439,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
   function prepare(to: string, amountSat: number, feeRate: number | null): PreparedSend {
     const { chain, wallet } = requireWallet();
     requireUnlocked(wallet);
-    // An address is checked at once; a name (anything not address-like) after the cheap checks,
-    // like the bridge, which needs the wallet file for it.
+    // An address is checked at once; a name after the cheap checks, like the bridge.
     let typed: string | null = null;
     try {
       typed = checkAddress(to, chain.network);
@@ -559,8 +532,8 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     if (!entry) return;
     pending.delete(id);
     const wallet = chainFor(entry.network).wallet;
-    // `tx::cancel`: un-reveal the change address if nothing was revealed after it. A fee bump's
-    // change address is the original's, which was paid: nothing to give back.
+    // `tx::cancel`: un-reveal the change address if it was the last one. A fee bump reuses the
+    // original's, so there is nothing to give back.
     if (entry.change && !entry.replaces && wallet && wallet.revealed.internal === entry.change.index + 1) {
       wallet.revealed.internal -= 1;
     }
@@ -793,7 +766,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         label: wallet.labels.get(tx.txid) ?? null,
       };
     });
-    // PLAN §5.7: unconfirmed first (latest seen first), then by height, newest first.
+    // Unconfirmed first (latest seen first), then by height, newest first.
     const key = (r: TxRow): [number, number] =>
       r.status.state === "unconfirmed" ? [1, r.status.first_seen ?? 0] : [0, r.status.height];
     return rows.sort((x, y) => {
@@ -866,7 +839,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         const wallet: Wallet = {
           password,
           words,
-          // The user just typed the whole phrase: that is the backup, and it's correct.
+          // The user just typed the phrase, so the backup is known to be correct.
           backupVerified: true,
           seed: sha256(utf8(words.join(" "))),
           birthday: birthday ?? 0,
@@ -1061,8 +1034,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
           throw fail("config", "configuration error: the cookie path is empty");
         }
         if (next.network !== settings.network) {
-          // Switching networks opens a different wallet; the old one is locked and its
-          // prepared sends are dropped.
+          // Switching networks locks the old wallet and drops its prepared sends.
           const old = active();
           if (old.wallet) old.wallet.unlocked = false;
           for (const [id, entry] of pending) if (entry.network === old.network) release(id);
@@ -1142,10 +1114,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
   };
 }
 
-/**
- * `book::looks_like_address`: an address on any network, or an attempt at one (a SegWit prefix,
- * or longer than a contact name can be). Such input is never looked up as a contact's name.
- */
+/** `book::looks_like_address`: never looked up as a contact's name. */
 export function looksLikeAddress(input: string): boolean {
   const text = input.trim();
   const lower = text.toLowerCase();
@@ -1174,7 +1143,6 @@ function backupMismatchMessage(positions: number[]): string {
   return `words ${positions.slice(0, -1).join(", ")} and ${positions.at(-1)} do not match your recovery phrase`;
 }
 
-// ---------------------------------------------------------------------------------------------
 // BIP39 (mnemonic ↔ entropy with checksum)
 
 let wordIndex: Map<string, number> | null = null;
@@ -1216,7 +1184,6 @@ export function checkMnemonic(words: string[]): string | null {
     : "checksum mismatch (a word is probably mistyped or out of order)";
 }
 
-// ---------------------------------------------------------------------------------------------
 // bech32 / bech32m segwit addresses (BIP173, BIP350)
 
 const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -1287,7 +1254,6 @@ export function decodeSegwit(address: string): { hrp: string; version: number; p
   return { hrp, version, program };
 }
 
-// ---------------------------------------------------------------------------------------------
 // SHA-256 (FIPS 180-4), synchronous so the mock needs no async crypto
 
 const K = [

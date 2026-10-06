@@ -1,7 +1,5 @@
 //! BIP39 mnemonics → BIP32 master key → BIP84 (native SegWit) descriptors.
 //!
-//! OWNER: Agent A (Phase 1). Contract: PLAN §4, §5.1–5.3.
-//!
 //! ```text
 //! mnemonic + passphrase ──PBKDF2──▶ seed ──BIP32──▶ master xprv
 //! master / 84' / coin' / account'  ──▶ account xprv
@@ -9,9 +7,8 @@
 //! internal: wpkh([fingerprint/84'/coin'/account']xpub/1/*)   change
 //! Signer:   master xprv, kept in memory only while unlocked
 //! ```
-//! `coin` comes from [`crate::config::coin_type`] (0 mainnet, 1 test networks).
-//! The key origin `[fingerprint/path]` must be included so PSBTs carry BIP32 derivation info,
-//! which is how [`Signer`] finds the right child key.
+//! `coin` comes from [`crate::config::coin_type`]. The key origin `[fingerprint/path]` is
+//! included so PSBTs carry the BIP32 derivation [`Signer`] uses to find the child key.
 
 use std::fmt;
 
@@ -72,8 +69,7 @@ impl fmt::Debug for Mnemonic {
 
 /// Generate a fresh mnemonic from the OS CSPRNG.
 pub fn generate_mnemonic(words: WordCount) -> Result<Mnemonic> {
-    // Entropy comes straight from the OS (getrandom) instead of a userspace PRNG, and the
-    // buffer is wiped once the words have been computed from it.
+    // Entropy straight from the OS, in a buffer wiped after use.
     let mut entropy = Zeroizing::new([0u8; 32]);
     let entropy = &mut entropy[..words.entropy_bytes()];
     getrandom::fill(entropy).map_err(|e| {
@@ -81,8 +77,7 @@ pub fn generate_mnemonic(words: WordCount) -> Result<Mnemonic> {
             "OS random number generator failed: {e}"
         )))
     })?;
-    // Only fails for entropy lengths other than 128..=256 bits in 32-bit steps, which
-    // `WordCount` rules out; the message is generic because entropy is secret anyway.
+    // Only fails for bad entropy lengths, which `WordCount` rules out.
     let mnemonic = bip39::Mnemonic::from_entropy(entropy)
         .map_err(|_| WalletError::InvalidMnemonic("could not encode entropy".into()))?;
     Ok(Mnemonic(mnemonic))
@@ -97,12 +92,10 @@ pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic> {
     Ok(Mnemonic(mnemonic))
 }
 
-/// Trim, collapse any run of whitespace to one space and lowercase, into a buffer that is
-/// wiped on drop.
+/// Trim, collapse whitespace and lowercase, into a buffer wiped on drop.
 ///
-/// ASCII lowercasing is enough: every word in the English list is ASCII, so a word with any
-/// non-ASCII letter is rejected by the wordlist check anyway. It also means the output is never
-/// longer than the input, so the pre-sized buffer never reallocates and leaves no unwiped copy.
+/// ASCII lowercasing suffices (the English list is ASCII) and never lengthens the text, so the
+/// pre-sized buffer never reallocates and leaves no unwiped copy.
 fn normalize_phrase(phrase: &str) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(phrase.len()));
     for word in phrase.split_whitespace() {
@@ -132,9 +125,8 @@ fn describe_bip39_error(e: bip39::Error) -> String {
     }
 }
 
-/// *Public* external + internal descriptors for one BIP84 account, with key origin, e.g.
-/// `wpkh([73c5da0a/84'/1'/0']tpubDC.../0/*)`. Safe to store and display: they reveal
-/// addresses and balances, never spending keys.
+/// Public external + internal descriptors for one BIP84 account, with key origin, e.g.
+/// `wpkh([73c5da0a/84'/1'/0']tpubDC.../0/*)`. Safe to store: no spending keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Descriptors {
     external: String,
@@ -159,27 +151,23 @@ impl Descriptors {
     }
 }
 
-/// Holds the BIP32 *master* private key and signs PSBTs with rust-bitcoin's `Psbt::sign`.
-/// (BDK 3.2 deprecated `Wallet::sign`; the wallet itself only ever holds public descriptors.)
-///
-/// `Psbt::sign` matches each input's `bip32_derivation` (master fingerprint + full path, which
-/// BDK fills in from the descriptor's key origin) and derives the child key from this master.
-/// The secret key is wiped on drop (`non_secure_erase`); `Debug` is redacted.
+/// Holds the BIP32 master private key and signs PSBTs with rust-bitcoin's `Psbt::sign` (BDK 3.2
+/// deprecated `Wallet::sign`), which derives child keys from each input's `bip32_derivation`.
+/// The key is wiped on drop; `Debug` is redacted.
 pub struct Signer {
     master: bitcoin::bip32::Xpriv,
 }
 
 impl Signer {
-    /// Sign every input this key can sign. Returns how many inputs were signed.
-    /// Finalizing (building the witness) is done afterwards by `tx::sign_psbt` via BDK.
+    /// Sign every input this key can sign. Returns how many were signed; finalizing is left to
+    /// `tx::sign_psbt`.
     pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) -> Result<usize> {
         let secp = Secp256k1::new();
         match psbt.sign(&self.master, &secp) {
-            // `Psbt::sign` records every input it looked at, with an empty key list when none of
-            // the input's derivation paths belong to this master, so count non-empty entries.
+            // `Psbt::sign` lists every input it looked at, with empty key lists for ones it
+            // couldn't sign.
             Ok(used) => Ok(used.values().filter(|keys| signed_any(keys)).count()),
-            // `SignError` only describes the input (missing UTXO, bad sighash type, ...), never
-            // key material, so it is safe to surface.
+            // `SignError` describes the input, never key material.
             Err((_, errors)) => {
                 let detail = errors
                     .iter()
@@ -228,15 +216,14 @@ pub fn derive_account(
 
     // BIP39: PBKDF2-HMAC-SHA512(words, "mnemonic" + passphrase), 2048 rounds → 64-byte seed.
     let seed = Zeroizing::new(mnemonic.0.to_seed(passphrase));
-    // Hand the master to `Signer` straight away so its `Drop` wipes it on every error path below.
+    // Into `Signer` at once so its `Drop` wipes the key on every error path below.
     let signer = Signer {
         master: Xpriv::new_master(network, seed.as_slice()).map_err(derivation_error)?,
     };
     let master_fingerprint = signer.master.fingerprint(&secp);
 
-    // m/84'/coin'/account', every step hardened (BIP44 convention). With non-hardened steps a
-    // single leaked child private key plus the parent xpub reveals the parent private key;
-    // hardening stops such a leak at the account, so the master and other accounts stay safe.
+    // m/84'/coin'/account', all hardened: a leaked child key plus the xpub then can't reveal
+    // the master or other accounts.
     let account_path = DerivationPath::from(vec![
         hardened(BIP84_PURPOSE)?,
         hardened(crate::config::coin_type(network))?,
@@ -258,8 +245,8 @@ pub fn derive_account(
     Ok((descriptors, signer))
 }
 
-/// `wpkh([fp/84'/coin'/account']xpub/<chain>/*)#checksum`, built from typed miniscript keys so
-/// the origin syntax and the checksum come from the library rather than string formatting.
+/// `wpkh([fp/84'/coin'/account']xpub/<chain>/*)#checksum`, built from typed miniscript keys
+/// rather than string formatting.
 fn wpkh_descriptor(
     origin: &(Fingerprint, DerivationPath),
     account_xpub: Xpub,
@@ -285,8 +272,7 @@ fn hardened(index: u32) -> Result<ChildNumber> {
     })
 }
 
-/// BIP32 errors describe the failing step (invalid child number, secp256k1 range check),
-/// never key bytes. Reaching this for a valid seed has a probability of about 2^-127.
+/// BIP32 errors describe the failing step, never key bytes.
 fn derivation_error(e: bitcoin::bip32::Error) -> WalletError {
     WalletError::Config(format!("key derivation failed: {e}"))
 }

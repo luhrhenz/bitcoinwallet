@@ -1,12 +1,8 @@
 //! The `#[tauri::command]`s: one thin wrapper per function in `commands.rs`.
 //!
-//! Names are snake_case and arguments camelCase on the JS side (Tauri converts `amountSat` to
-//! `amount_sat`), as `apps/desktop/src/lib/api.ts` calls them. Each wrapper moves its work to a
-//! blocking thread (wallet, SQLite, Argon2 and RPC calls all block), so the webview's event loop
-//! never waits on them. Passwords and phrases are deserialized straight into `SecretString`,
-//! which redacts itself in `Debug` and is wiped on drop.
-//!
-//! Logging: the command name and the error code at `debug` level, never arguments or results.
+//! Arguments are camelCase on the JS side (Tauri converts them). Each wrapper runs on a blocking
+//! thread, since wallet, SQLite, Argon2 and RPC calls all block. Passwords and phrases go
+//! straight into `SecretString`. Only command names and error codes are logged.
 
 use std::sync::Arc;
 
@@ -34,8 +30,7 @@ where
     let result = tauri::async_runtime::spawn_blocking(move || f(&state))
         .await
         .unwrap_or_else(|_| {
-            // A panic inside the command. The message stays generic: a panic payload is not
-            // guaranteed to be free of data.
+            // A panic. Generic message: the payload may contain data.
             Err(ApiError::internal(
                 "the command stopped unexpectedly; please try again",
             ))

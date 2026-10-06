@@ -1,18 +1,16 @@
 //! `btcw-desktop`: the Rust side of the desktop app (Tauri 2).
 //!
-//! The React UI (`apps/desktop/src`) runs in a webview and talks to Rust only through the
-//! commands in [`ipc`] (Tauri's IPC: `invoke("balance")` → `ipc::balance` → [`commands::balance`]
-//! → btcw-core). Rust owns every secret: the master key lives in [`state::AppState`] while the
-//! app is unlocked, payments are signed here, and the webview gets plain views of the wallet.
+//! The React UI talks to Rust only through [`ipc`] (`invoke("balance")` → `ipc::balance` →
+//! [`commands::balance`] → btcw-core). Every secret stays in Rust; the webview gets plain views.
 //!
-//! - [`commands`] holds the logic, as plain functions over [`state::AppState`] (unit-tested);
+//! - [`commands`] holds the logic, as plain functions over [`state::AppState`];
 //! - [`state`] keeps the settings, the signing session and the per-network wallet gates;
 //! - [`settings`] reads and writes `<datadir>/desktop.json`;
-//! - [`error`] is `ApiError { code, message }`, the shape every failure has in JS;
-//! - `ipc` has the thin `#[tauri::command]` wrappers.
+//! - [`error`] is `ApiError { code, message }`;
+//! - `ipc` has the `#[tauri::command]` wrappers.
 //!
-//! The window is locked down: a strict CSP (`tauri.conf.json`), no plugins, the event
-//! permissions as the only capability, and navigation limited to the app's own pages.
+//! The window is locked down: strict CSP, no plugins, only event permissions, and navigation
+//! limited to the app's own pages.
 
 pub mod commands;
 pub mod error;
@@ -84,9 +82,8 @@ pub fn run() {
     }
 }
 
-/// The window from `tauri.conf.json` (`"create": false` there), built here so it can refuse to
-/// navigate anywhere but the app itself or to open new windows. A link or a redirect can then
-/// never put a remote page into the window that holds the IPC bridge.
+/// The window from `tauri.conf.json`, built here so it refuses to navigate away from the app or
+/// open new windows: a remote page must never get the IPC bridge.
 fn create_main_window(app: &tauri::App) -> tauri::Result<()> {
     let Some(config) = app
         .config()

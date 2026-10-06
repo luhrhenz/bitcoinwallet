@@ -1,11 +1,7 @@
-//! Agent B: `chain::Node` against a real regtest `bitcoind`: connecting (and every way it can
-//! fail), tip height, fee estimates, mining, and syncing a wallet through receive → confirm →
-//! reorg → re-confirm, plus the birthday and resuming from the persisted checkpoint.
+//! `chain::Node` against a real regtest `bitcoind`: connection errors, tip, fee estimates,
+//! mining, and sync through receive → confirm → reorg → re-confirm, birthday and resume.
 //!
-//! Node tests skip (not fail) without `bitcoind`; set `BITCOIND_EXE`. Each node start mines 101
-//! blocks (~20 s on Core v31), so checks are grouped into a few tests that share a node. The
-//! broadcast test is an in-module test in `src/chain.rs`, because building a payment needs the
-//! crate-private `bdk_mut()`.
+//! Skipped without `bitcoind` (set `BITCOIND_EXE`). The broadcast test is in `src/chain.rs`.
 
 use std::error::Error;
 use std::path::Path;
@@ -97,9 +93,7 @@ fn block_hash(test_node: &TestNode, height: u32) -> Result<Value, Box<dyn Error>
 
 #[test]
 fn connect_failures_are_quick_and_actionable() -> TestResult {
-    // Nothing listens on port 1 (privileged, unused): connection refused, immediately. Not a
-    // just-released ephemeral port: the regtest nodes other tests start in parallel pick free
-    // ports too, and one occasionally landed on it.
+    // Port 1: refused at once. A released ephemeral port could be taken by a parallel test node.
     let closed = RpcConfig {
         url: "http://127.0.0.1:1".to_owned(),
         auth: RpcAuth::UserPass {
@@ -286,20 +280,16 @@ fn sync_receives_confirms_survives_a_reorg_and_resumes() -> TestResult {
     let stale_block = block_hash(&test_node, funded_at)?;
     test_node.call("invalidateblock", std::slice::from_ref(&stale_block))?;
     assert_eq!(node.tip_height()?, birthday);
-    // With no competing block yet, the node's chain is just shorter. The Emitter only reports
-    // blocks that connect, so there's nothing to apply: sync succeeds and keeps our tip until a
-    // block at that height exists again (logged as a warning).
+    // With no competing block yet the chain is just shorter: sync succeeds and keeps our tip.
     let (report, _) = sync(&node, &mut wallet)?;
     assert_eq!(report.blocks_scanned, 0);
 
-    // The competing block: mined on the old parent with *no* transactions (`generateblock`
-    // with an empty list), so our payment stays in the mempool, where Core put it back.
+    // The competing block has no transactions, so our payment stays in the mempool.
     let faucet = test_node.faucet_address()?.to_string();
     let replacement = test_node.call("generateblock", &[json!(faucet), json!([])])?;
     assert_ne!(replacement["hash"], stale_block);
     let (report, events) = sync(&node, &mut wallet)?;
-    // The replacement is emitted at the reorged height, connected to the agreement point below
-    // it; BDK drops our stale checkpoint and with it the payment's confirmation.
+    // BDK drops the stale checkpoint and with it the payment's confirmation.
     assert_eq!(report.blocks_scanned, 1);
     assert_eq!(report.tip_height, funded_at);
     assert_eq!(

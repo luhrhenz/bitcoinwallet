@@ -18,7 +18,7 @@ name = "btcw-desktop"
 path = "src/main.rs"
 
 [features]
-# Compiles mainnet in; it still needs the opt-in in Settings (PLAN §4.1).
+# Compiles mainnet in; it still needs the opt-in in Settings.
 mainnet = ["btcw-core/mainnet"]
 
 [build-dependencies]

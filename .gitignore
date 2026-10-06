@@ -7,13 +7,13 @@ dist/
 seed.enc
 /regtest-data/
 
-# local AI-tool configs (not part of the project)
+# Local editor/tool configs
 .autoclaw/
 .clinerules/
 .kilocodemodes
 .kiro/
 
-# Personal notes (kept locally, never published)
+# Local notes
 WALKTHROUGH.md
 docs/PLAN.md
 docs/PLAN-v2.md

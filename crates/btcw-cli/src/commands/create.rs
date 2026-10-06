@@ -1,4 +1,4 @@
-//! `btcw create`: new wallet, recovery phrase shown exactly once (PLAN §5.1).
+//! `btcw create`: new wallet, recovery phrase shown exactly once.
 
 use std::fmt::{self, Write as _};
 use std::io::IsTerminal;
@@ -18,8 +18,8 @@ use serde::Serialize;
 use crate::output::{Painter, Ui};
 use crate::prompt;
 
-/// `--json` result. Deliberately has no phrase field: the phrase goes to stderr, so it can't
-/// end up in a file or log that only expected machine-readable output.
+/// `--json` result. No phrase field: the phrase goes to stderr, so it can't end up in a file
+/// meant for machine-readable output.
 #[derive(Debug, Serialize)]
 struct CreateJson {
     network: String,
@@ -27,19 +27,18 @@ struct CreateJson {
     first_address: String,
 }
 
-/// Big enough for a 24-word grid, the warning, the other lines and escape codes (plus the
-/// wallet path, added at runtime), so the buffer holding the phrase never reallocates, which
-/// would leave an unwiped copy behind.
+/// Big enough for everything `create` prints, so the phrase buffer never reallocates and
+/// leaves no unwiped copy.
 const PHRASE_TEXT_CAPACITY: usize = 4096;
 
 pub fn run(cfg: &Config, ui: &Ui, words: WordCount) -> Result<()> {
-    // Checked again (under the lock) by the core; this just avoids asking for a password first.
+    // The core checks again under the lock; this avoids asking for a password first.
     if api::wallet_exists(cfg) {
         return Err(WalletError::WalletExists(cfg.network_dir()).into());
     }
     let password = prompt::new_password(ui)?;
 
-    // A new wallet can't have older transactions, so its first sync can start at today's tip.
+    // A new wallet has no older transactions, so its first sync can start at today's tip.
     let birthday = match current_tip(cfg) {
         Ok(height) => Some(height),
         Err(e) => {
@@ -62,8 +61,7 @@ pub fn run(cfg: &Config, ui: &Ui, words: WordCount) -> Result<()> {
     let birthday_height = wallet.birthday_height();
     drop(wallet);
 
-    // The wallet exists now and this is the only time its phrase can be shown, so it is
-    // rendered and printed before anything else can fail.
+    // The only time the phrase can be shown: print it before anything else can fail.
     let network_dir = cfg.network_dir();
     let mut text = Zeroizing::new(String::with_capacity(
         PHRASE_TEXT_CAPACITY + network_dir.as_os_str().len(),
@@ -168,8 +166,8 @@ impl Human<'_> {
     }
 }
 
-/// The numbered grid plus the warning. Row-major, 4 words per row: `1. word   2. word ...`.
-/// Written straight into `text` so no other buffer ever holds the words.
+/// The numbered grid (4 words per row) plus the warning, written straight into `text` so no
+/// other buffer holds the words.
 pub(crate) fn write_phrase(text: &mut String, phrase: &str, paint: Painter) -> fmt::Result {
     let words: Vec<&str> = phrase.split_whitespace().collect();
     writeln!(

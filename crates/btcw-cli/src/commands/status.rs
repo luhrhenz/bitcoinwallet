@@ -1,11 +1,7 @@
-//! `btcw status TXID [--watch]`: where one of the wallet's transactions is (PLAN §5.9).
+//! `btcw status TXID [--watch]`: where one of the wallet's transactions is.
 //!
-//! Watch-only, no password. Every check is a full open → sync → read → **close**: the wallet
-//! (and its lock file) is released between checks, so another `btcw` command or the desktop app
-//! can use it while `--watch` sleeps, and Ctrl-C during the sleep can't interrupt a write.
-//!
-//! When bitcoind can't be reached, a single check still answers from the wallet database (as of
-//! the last sync, with a warning); `--watch` warns and keeps trying.
+//! Each check opens, syncs, reads and closes the wallet, so others can use it while `--watch`
+//! sleeps and Ctrl-C can't interrupt a write. Without a node, it answers from the last sync.
 
 use std::time::Duration;
 
@@ -32,8 +28,7 @@ struct StatusJson {
     /// The wallet's tip when the status was read; confirmations count up to it.
     synced_height: u32,
     status: TxStatus,
-    /// Set when bitcoind could not be reached (or the sync failed): `status` is then as of the
-    /// last successful sync.
+    /// Set when the sync failed; `status` is then as of the last successful sync.
     sync_error: Option<ErrorBody>,
 }
 
@@ -111,8 +106,8 @@ fn check_once(cfg: &Config, ui: &Ui, txid: Txid) -> Result<()> {
     ))
 }
 
-/// Poll every `interval` until the transaction has `until` confirmations. Prints a line
-/// whenever something changes (a new block, or the status), so a quiet minute stays quiet.
+/// Poll every `interval` until the transaction has `until` confirmations, printing a line only
+/// when something changes.
 fn watch_until(cfg: &Config, ui: &Ui, txid: Txid, watch: Watch) -> Result<()> {
     let every = watch.interval.as_secs();
     if !ui.json() {
@@ -122,13 +117,12 @@ fn watch_until(cfg: &Config, ui: &Ui, txid: Txid, watch: Watch) -> Result<()> {
             plural(watch.until, "confirmation", "confirmations"),
         ))?;
     }
-    // Compared as printed text, not as `TxStatus`: `first_seen` is not stable across reopens
-    // (bdk_chain 0.23 restores it from the persisted *last*-seen time), and it isn't shown here.
+    // Compared as printed text, not as `TxStatus`: `first_seen` isn't shown and can differ
+    // across reopens.
     let mut last_line = String::new();
     let mut first = true;
     loop {
-        // Only the first check can have many blocks to catch up on; later ones would just
-        // flash a progress bar every few seconds.
+        // Progress only for the first check; later ones would just flash a bar.
         match check(cfg, ui, txid, first) {
             Ok(Check {
                 status,
@@ -151,8 +145,7 @@ fn watch_until(cfg: &Config, ui: &Ui, txid: Txid, watch: Watch) -> Result<()> {
                             ui.println(&line)?;
                         }
                         last_line = line;
-                        // Confirmations only ever undercount (a stale tip), so reaching the
-                        // target is final even when this check couldn't sync.
+                        // Confirmations only undercount, so reaching the target is final.
                         if confirmations(&status) >= watch.until {
                             return if ui.json() {
                                 print_json(
@@ -170,8 +163,7 @@ fn watch_until(cfg: &Config, ui: &Ui, txid: Txid, watch: Watch) -> Result<()> {
                     }
                 }
             }
-            // Another btcw command or the desktop app has the wallet open right now. It will
-            // close it again; this is exactly why we don't hold it between checks either.
+            // Another process has the wallet open for now; try again next time.
             Err(e) if error_code(&e) == WalletError::WalletInUse.code() => {
                 ui.warn(format_args!("{e:#}; trying again in {every} s"));
             }

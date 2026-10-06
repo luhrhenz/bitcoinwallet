@@ -1,19 +1,16 @@
 //! End-to-end user journeys: the real `btcw` binary, one process per command, against a real
 //! regtest `bitcoind`.
 //!
-//! `cli.rs` checks what each command prints. These tests chain commands the way a person would
-//! and check that the parts agree with each other and with Bitcoin Core: the wallet's fee is the
-//! fee Core sees, the balance is received − sent − fee to the satoshi, two wallets agree on the
-//! transactions between them, and a restored wallet sees exactly what the original saw.
+//! These chain commands the way a person would and check that the parts agree with each other
+//! and with Bitcoin Core: fees, balances to the satoshi, two wallets paying each other, and
+//! restores.
 //!
-//! Assertions are tagged with the PRD requirement they check (docs/PLAN.md §1):
+//! Assertions are tagged with the requirement they check:
 //! R1 create · R2 restore · R3 BIP84 derivation · R4 receive addresses + used flags · R5 sync ·
 //! R6 balance · R7 history · R8 PSBT signing · R9 broadcast · R10 tx status · R11 persistence.
 //!
-//! Three node tests, each with its own `bitcoind` (about 20 s to start and mine 101 blocks).
-//! They are skipped only when no bitcoind can be run, and fail when `BITCOIND_EXE` is set but
-//! broken. Every run gets its own temp datadirs; `TestNode` stops its node on drop, and spawned
-//! `btcw` processes are killed on drop, so a failing assertion leaves nothing running.
+//! Each test starts its own `bitcoind` and is skipped only when none can be run. Nodes and
+//! spawned `btcw` processes are stopped on drop, so a failing assertion leaves nothing running.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -46,8 +43,8 @@ const WALLET_IN_USE: &str = "wallet is open in another btcw process";
 
 // ── Harness ─────────────────────────────────────────────────────────────────────────────────
 
-/// One wallet's world: its own datadir, pointed at the test node. Like `cli.rs`, every run gets
-/// `--network regtest`, `NO_COLOR`, `BTCW_PASSWORD` and no inherited `BTCW_*` variables.
+/// One wallet's own datadir, pointed at the test node, with the same isolated environment as
+/// `cli.rs`.
 struct Env {
     root: TempDir,
     rpc_url: String,
@@ -319,9 +316,8 @@ fn text_of(buffer: &Mutex<Vec<u8>>) -> String {
         .unwrap_or_default()
 }
 
-/// A transparent TCP proxy in front of bitcoind's RPC port that counts `getrawtransaction`
-/// requests. Each one is a round trip per mempool transaction during a sync, so the count shows
-/// exactly what a sync downloaded, independent of timing.
+/// A TCP proxy in front of bitcoind's RPC port that counts `getrawtransaction` requests, i.e.
+/// what a sync downloaded.
 struct CountingProxy {
     url: String,
     getrawtransaction: Arc<AtomicUsize>,
@@ -371,8 +367,8 @@ impl CountingProxy {
 fn pump(mut from: TcpStream, mut to: TcpStream, counter: Option<&AtomicUsize>) {
     let needle = CountingProxy::NEEDLE;
     let mut chunk = [0u8; 16 * 1024];
-    // The end of the previous chunk, so a method name split across two reads is still seen
-    // (shorter than the needle, so nothing is counted twice).
+    // The end of the previous chunk, so a name split across two reads is still seen (shorter
+    // than the needle, so nothing is counted twice).
     let mut tail: Vec<u8> = Vec::new();
     loop {
         let n = match from.read(&mut chunk) {
@@ -474,8 +470,7 @@ fn phrase_from_grid(text: &str) -> TestResult<String> {
     Ok(words.join(" "))
 }
 
-/// BIP84 address `m/84'/1'/0'/<keychain>/<index>` for `phrase`, derived without btcw's wallet:
-/// the core's key derivation fed into a plain in-memory BDK wallet.
+/// BIP84 address `m/84'/1'/0'/<keychain>/<index>` for `phrase`, derived without btcw's wallet.
 fn derived_address(phrase: &str, keychain: KeychainKind, index: u32) -> TestResult<String> {
     let mnemonic = keys::parse_mnemonic(phrase)?;
     let (descriptors, _signer) = keys::derive_account(&mnemonic, "", Network::Regtest, 0)?;
@@ -992,9 +987,8 @@ fn two_wallets_pay_each_other_and_lock_out_a_second_process() -> TestResult {
         txids(&bob_history)?,
         BTreeSet::from([t1.clone(), t2.clone(), t3.clone()])
     );
-    // A fee is inputs − outputs, so the payee knows it only if it holds the transactions the
-    // inputs came from: Bob never saw Alice's funding (t1), but t2 spends Alice's change from
-    // t1, which Bob has, and t3 spends Bob's coins from t1 and t2, which Alice has.
+    // The payee knows a fee only if it holds the transactions the inputs came from: t2 spends
+    // Alice's change from t1, which Bob has; t3 spends Bob's coins from t1 and t2.
     for (txid, amount, fee, alice_paid, payee_knows_fee) in [
         (&t1, 600_000, fee1, true, false),
         (&t2, 300_000, fee2, true, true),
@@ -1063,7 +1057,7 @@ fn two_wallets_pay_each_other_and_lock_out_a_second_process() -> TestResult {
         BTreeSet::from([(c2, "internal".into(), 1), (a1, "external".into(), 1)])
     );
 
-    // ── Locking (PLAN §4.2): one process at a time per wallet, and a clean error otherwise.
+    // ── Locking: one process at a time per wallet, and a clean error otherwise.
     // 1. A `btcw send` stopped at its `Send? [y/N]` prompt holds Bob's wallet.
     let faucet = node.faucet_address()?.to_string();
     if has_program("script") {
@@ -1151,9 +1145,8 @@ fn reorgs_and_the_mempool_cache_through_the_cli() -> TestResult {
         return Ok(());
     };
 
-    // ── A birthday above the node's tip. A wallet is created at the tip and that block is
-    // reorged away before the first sync; a restore is given a height the chain hasn't reached.
-    // There is nothing to scan yet, so sync must succeed and wait, not fail (R5).
+    // ── A birthday above the node's tip (reorged away, or a restore height not reached yet):
+    // sync must succeed and wait, not fail (R5).
     let early = Env::new(&node)?;
     let (created, phrase) = early.create()?;
     let born = node.tip_height()?;
@@ -1218,8 +1211,8 @@ fn reorgs_and_the_mempool_cache_through_the_cli() -> TestResult {
         1
     );
 
-    // The block with our payment is reorged out. Until a competing block exists, the node's
-    // chain is just shorter and the wallet says so (the documented limitation, §3).
+    // The block with our payment is reorged out. Until a competing block exists, the chain is
+    // just shorter and the wallet says so (a known limitation).
     node.call("invalidateblock", &[json!(block)])?;
     assert!(mempool(&node)?.contains(&funding), "Core put it back");
     let out = env.run(&["sync"])?;
@@ -1370,9 +1363,8 @@ fn reorgs_and_the_mempool_cache_through_the_cli() -> TestResult {
     assert_eq!(balance["unconfirmed_sat"], 0);
     let (code, _) = env.json_error(&["status", &incoming])?;
     assert_eq!(code, "tx_not_found");
-    // In the database: the wallet's own transactions, plus `clawback`, which BDK keeps because
-    // it conflicts with one of ours (it's how the wallet knows `incoming` lost). It is never
-    // shown. The other strangers are not stored at all.
+    // Stored: the wallet's own transactions, plus `clawback`, which BDK keeps (never shown)
+    // because it conflicts with one of ours. Other strangers are not stored.
     assert_eq!(
         stored_txids(&env)?,
         BTreeSet::from([funding_txid, spend, incoming, clawback_txid])

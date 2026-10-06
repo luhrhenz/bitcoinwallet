@@ -18,11 +18,8 @@ import { contactNamed, RecipientField } from "../components/RecipientField";
 type FieldErrors = { to: string | null; amount: string | null; fee: string | null };
 const NO_ERRORS: FieldErrors = { to: null, amount: null, fee: null };
 /**
- * Send: form → (unlock) → preview → confirm or cancel → tx detail. The transaction itself
- * (PSBT) is built and signed in Rust; the UI only sees the preview and an opaque id.
- *
- * The recipient is an address or a contact's name (Rust resolves it); the preview always shows
- * the full address, with the name next to it.
+ * Send: form → (unlock) → preview → confirm or cancel → tx detail. The PSBT is built and signed
+ * in Rust; the UI only sees the preview and an opaque id. The recipient may be a contact's name.
  */
 export function Send({ go, initialTo = "" }: { go: Go; initialTo?: string }) {
   const wallet = useWallet();
@@ -39,8 +36,8 @@ export function Send({ go, initialTo = "" }: { go: Go; initialTo?: string }) {
   const [busy, setBusy] = useState<null | "preparing" | "sending">(null);
   const [prepared, setPrepared] = useState<PreparedSend | null>(null);
 
-  // The open preview, readable from cleanup code. Cleared *before* anything that should not
-  // cancel it (a successful send) so leaving the screen never cancels a sent transaction.
+  // The open preview, readable from cleanup code. Cleared before a successful send, so leaving
+  // the screen never cancels a sent transaction.
   const open = useRef<PreparedSend | null>(null);
   const sending = useRef(false);
   const setPreview = (next: PreparedSend | null) => {
@@ -163,8 +160,8 @@ export function Send({ go, initialTo = "" }: { go: Go; initialTo?: string }) {
         await wallet.refreshInfo().catch(() => undefined);
         return;
       }
-      // The backend drops a prepared payment after any failed send (and an expired one): back
-      // to the form, with what was typed still there, to review it again.
+      // The backend drops a prepared payment after any failed send: back to the form to review
+      // it again.
       setPreview(null);
       setFormError(err);
       void wallet.refreshWallet();

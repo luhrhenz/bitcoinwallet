@@ -1,11 +1,6 @@
-// The one place that turns a failed command into words for people.
-//
-// Every command rejects with `ApiError { code, message }`, where `code` is
-// `WalletError::code()` from btcw-core (crates/btcw-core/src/error.rs). Screens never show
-// `message` on its own and never show a stack trace: they call `describeError`, which gives a
-// plain-language title per code plus, where it helps, the core's own message as detail. The
-// core's messages are written for people and never contain secrets (error.rs rule), so they
-// are safe to show.
+// Turns a failed command into words for people. Screens call `describeError`: a plain title
+// per `WalletError::code()`, plus the core's message as detail where it helps (it never
+// contains secrets).
 
 import type { ApiError, NetworkName } from "./types";
 import { DUST_LIMIT_SAT, groupThousands } from "./amount";

@@ -1,11 +1,8 @@
 // Amounts: integer satoshis everywhere, strings only at the edges.
 //
-// Every amount the backend sends is an integer number of satoshis (a u64 in Rust). The total
-// supply is 2.1e15 sat, well inside JavaScript's exact-integer range (2^53 ≈ 9.007e15), so a
-// plain `number` holds any real amount exactly. What must never happen is BTC arithmetic on
-// floats: `0.1 + 0.2 === 0.30000000000000004` and `4.35 * 1e8 === 434999999.99999994`.
-// So BTC strings are produced with integer division and parsed digit by digit (BigInt), the
-// same way the CLI's `output::btc` does it.
+// 2.1e15 sat fits exactly in a `number` (2^53 ≈ 9.007e15), but BTC arithmetic on floats is
+// wrong (`4.35 * 1e8 === 434999999.99999994`), so BTC strings are formatted with integer
+// division and parsed digit by digit, like the CLI's `output::btc`.
 
 export const SAT_PER_BTC = 100_000_000;
 /** 21 million BTC, the most any amount can be. */
@@ -92,9 +89,8 @@ function checkRange(sat: bigint): ParseResult {
 }
 
 /**
- * `"0.0015"` → 150 000 sat. Digits and at most one dot, at most 8 decimals; no exponent, no
- * sign, no grouping. Commas are rejected on purpose: in many countries `0,001` means one
- * thousandth, and silently reading it as `0001` would send a thousand times too much.
+ * `"0.0015"` → 150 000 sat. Digits and at most one dot, at most 8 decimals. Commas are
+ * rejected: `0,001` is a decimal comma in many countries.
  */
 export function parseBtc(input: string): ParseResult {
   const text = input.trim();
