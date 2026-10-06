@@ -12,3 +12,9 @@ seed.enc
 .clinerules/
 .kilocodemodes
 .kiro/
+
+# Personal notes (kept locally, never published)
+WALKTHROUGH.md
+docs/PLAN.md
+docs/PLAN-v2.md
+docs/DEMO.md
