@@ -1,4 +1,4 @@
-import { checkMnemonic, createMockApi, decodeSegwit, encodeSegwit, entropyToMnemonic, sha256 } from "./mock";
+import { checkMnemonic, createMockApi, decodeSegwit, encodeSegwit, entropyToMnemonic, looksLikeAddress, sha256 } from "./mock";
 import { BIP39_ENGLISH } from "./mock-wordlist";
 import type { ApiError, SyncProgress } from "./types";
 
@@ -282,5 +282,126 @@ describe("mock wallet", () => {
     });
     await api.setSettings({ ...settings, network: "testnet4" });
     expect(await api.appInfo()).toMatchObject({ network: "testnet4", wallet_exists: true, unlocked: false });
+  });
+
+  it("keeps an address book and labels like the core, per network and watch-only", async () => {
+    const api = createMockApi({ latencyMs: 0 });
+    await api.createWallet(12, PASSWORD);
+    await api.lock();
+    const to = encodeSegwit("tb", 0, new Uint8Array(20).fill(7));
+    expect(await api.addContact(" Bob ", to.toUpperCase(), "  ")).toEqual({ name: "Bob", address: to, note: null });
+    await api.addContact("alice", to, "rent");
+    expect((await api.listContacts()).map((c) => c.name)).toEqual(["alice", "Bob"]);
+    for (const [name, address, code] of [
+      ["BOB", to, "contact"],
+      ["", to, "contact"],
+      ["tb1qfriend", to, "contact"],
+      ["x".repeat(41), to, "contact"],
+      ["Tab\there", to, "contact"],
+      ["Carol", "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", "network_mismatch"],
+      ["Carol", "nope", "invalid_address"],
+    ] as const) {
+      expect(await rejection(api.addContact(name, address, null)), name).toMatchObject({ code });
+    }
+    expect(await api.renameContact("ALICE", "Alice")).toMatchObject({ name: "Alice" });
+    expect(await rejection(api.renameContact("alice", "bob"))).toMatchObject({ code: "contact" });
+    expect(await api.removeContact("bob")).toMatchObject({ name: "Bob" });
+    expect(await rejection(api.removeContact("bob"))).toMatchObject({ code: "contact" });
+
+    const unknown = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+    expect(await rejection(api.setLabel(unknown, "rent"))).toMatchObject({ code: "tx_not_found" });
+    expect(await rejection(api.setLabel("nope", "rent"))).toMatchObject({ code: "tx_not_found" });
+    expect(await rejection(api.clearLabel(unknown))).toMatchObject({ code: "tx_not_found" });
+    const txid = api.simulateIncoming(50_000);
+    await api.sync();
+    expect(await api.setLabel(txid, "  gift ")).toBe("gift");
+    expect((await api.history())[0]!.label).toBe("gift");
+    expect(await rejection(api.setLabel(txid, "y".repeat(101)))).toMatchObject({ code: "contact" });
+    await api.clearLabel(txid);
+    await api.clearLabel(txid);
+    expect((await api.history())[0]!.label).toBeNull();
+    expect((await api.appInfo()).unlocked).toBe(false);
+
+    // Another network has its own (empty) address book.
+    const settings = await api.getSettings();
+    await api.setSettings({ ...settings, network: "signet" });
+    await api.createWallet(12, PASSWORD);
+    expect(await api.listContacts()).toEqual([]);
+
+    expect(looksLikeAddress("tb1qanything")).toBe(true);
+    expect(looksLikeAddress(to)).toBe(true);
+    expect(looksLikeAddress("Alice B.")).toBe(false);
+  });
+
+  it("pays a contact by name, never a mistyped address", async () => {
+    const api = createMockApi({ latencyMs: 0 });
+    await api.createWallet(12, PASSWORD);
+    api.simulateIncoming(1_000_000);
+    api.mineBlocks(1);
+    await api.sync();
+    const to = encodeSegwit("tb", 0, new Uint8Array(20).fill(7));
+    await api.addContact("Alice", to, null);
+    const { preview } = await api.prepareSend(" alice ", 100_000, 2);
+    expect(preview).toMatchObject({ to, contact: "Alice", replaces: null });
+    expect(await rejection(api.prepareSend("Alcie", 100_000, 2))).toMatchObject({ code: "contact" });
+    expect(await rejection(api.prepareSend("tb1qalice", 100_000, 2))).toMatchObject({ code: "invalid_address" });
+    expect(await rejection(api.prepareSend("alice", 100, 2))).toMatchObject({ code: "dust_amount" });
+  });
+
+  it("speeds up an unconfirmed payment like the core", async () => {
+    const api = createMockApi({ latencyMs: 0 });
+    await api.createWallet(12, PASSWORD);
+    const incoming = api.simulateIncoming(1_000_000);
+    api.mineBlocks(1);
+    await api.sync();
+    const to = encodeSegwit("tb", 0, new Uint8Array(20).fill(7));
+    const sent = await api.prepareSend(to, 100_000, 2);
+    const { txid } = await api.confirmSend(sent.id);
+    await api.setLabel(txid, "rent");
+
+    expect(await api.minFeeBumpRate(txid)).toBe(3);
+    expect(await rejection(api.minFeeBumpRate(incoming))).toMatchObject({ code: "tx_build" });
+    expect(await rejection(api.minFeeBumpRate("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"))).toMatchObject({
+      code: "tx_not_found",
+    });
+    await api.lock();
+    expect(await rejection(api.prepareFeeBump(txid, 5))).toMatchObject({ code: "locked" });
+    await api.unlock(PASSWORD);
+    const low = await rejection(api.prepareFeeBump(txid, 2.5));
+    expect(low).toMatchObject({ code: "tx_build" });
+    expect(low.message).toMatch(/at least 3\.00 sat\/vB/);
+
+    // A bump takes the single slot: a payment preview prepared before it is gone.
+    const other = await api.prepareSend(to, 10_000, 2);
+    const bump = await api.prepareFeeBump(txid, 5);
+    expect(await rejection(api.confirmSend(other.id))).toMatchObject({ code: "tx_build" });
+    expect(bump.preview).toEqual({
+      to,
+      amount_sat: 100_000,
+      fee_sat: 705,
+      fee_rate_sat_vb: 5,
+      vsize: 141,
+      change_sat: 1_000_000 - 100_000 - 705,
+      total_sat: 100_705,
+      contact: null,
+      replaces: txid,
+    });
+    const { txid: replacement } = await api.confirmSend(bump.id);
+    const history = await api.history();
+    expect(history.map((r) => r.txid)).not.toContain(txid);
+    expect(history[0]).toMatchObject({ txid: replacement, net_sat: -100_705, fee_sat: 705, label: "rent" });
+    expect(await api.balance()).toMatchObject({ unconfirmed_sat: 1_000_000 - 100_705 });
+    expect(await api.txStatus(txid)).toBeNull();
+    expect(await rejection(api.minFeeBumpRate(txid))).toMatchObject({ code: "tx_build" });
+
+    // Prepared, then the payment confirms before Send: refused, nothing sent.
+    const late = await api.prepareFeeBump(replacement, null);
+    expect(late.preview.fee_rate_sat_vb).toBeGreaterThanOrEqual(await api.minFeeBumpRate(replacement));
+    api.mineBlocks(1);
+    const refused = await rejection(api.confirmSend(late.id));
+    expect(refused).toMatchObject({ code: "tx_build" });
+    expect(refused.message).toMatch(/already confirmed/);
+    expect((await api.history()).filter((r) => r.net_sat < 0)).toHaveLength(1);
+    expect(await rejection(api.confirmSend(late.id))).toMatchObject({ code: "tx_build" });
   });
 });

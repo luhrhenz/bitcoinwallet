@@ -1774,6 +1774,238 @@ fieldset.panel {
 
 /* ---------- smaller windows (down to 800 × 600) ---------- */
 
+/* ---------- v2: contacts, labels, speed up ---------- */
+
+.btn--danger {
+  background: var(--danger);
+  color: var(--surface);
+}
+
+.btn--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 85%, var(--ink));
+}
+
+.btn--danger-text {
+  color: var(--danger);
+}
+
+.actions--start {
+  justify-content: flex-start;
+}
+
+/* Recipient combobox: the suggestions sit in the flow, right under the field. */
+.recipient {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recipient__match {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--ink-2);
+}
+
+.recipient__match .icon {
+  vertical-align: -2px;
+}
+
+.suggest {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.suggest[hidden] {
+  display: none;
+}
+
+.suggest__option {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.suggest__option:hover,
+.suggest__option[aria-selected="true"] {
+  background: var(--accent-soft);
+}
+
+.suggest__option[aria-selected="true"] {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.suggest__name {
+  font-weight: 620;
+}
+
+.suggest__addr {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.review__contact {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.review__replaces {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  background: var(--warn-soft);
+}
+
+.review__replaces .mono {
+  font-size: 13.5px;
+}
+
+.review__extra {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.contactlist {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.contact {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+}
+
+.contact + .contact {
+  border-top: 1px solid var(--line);
+}
+
+.contact__main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 320px;
+}
+
+.contact__name {
+  font-weight: 650;
+}
+
+.contact__note {
+  font-size: 13.5px;
+  color: var(--muted);
+}
+
+.contact__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.contact__rename {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1 1 280px;
+}
+
+.txrow__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--ink-2);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.txrow__label > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.labelview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 16px;
+}
+
+.labelview__text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.labelview__actions {
+  display: inline-flex;
+  gap: 14px;
+}
+
+.labelform {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.speedup {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 20px;
+}
+
+.speedup__head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.speedup__icon {
+  color: var(--warn);
+  margin-top: 2px;
+}
+
+.speedup__title {
+  font-size: 16px;
+  font-weight: 650;
+}
+
 @media (max-width: 920px) {
   .topbar {
     gap: 10px;

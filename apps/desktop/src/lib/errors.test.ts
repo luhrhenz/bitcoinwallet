@@ -17,6 +17,7 @@ describe("describeError", () => {
       "tx_build",
       "sign",
       "tx_not_found",
+      "contact",
       "rpc",
       "persist",
       "keystore",
@@ -60,6 +61,21 @@ describe("describeError", () => {
       describeError({ code: "invalid_mnemonic", message: "invalid mnemonic: word 5 is not in the BIP39 English word list" })
         .detail,
     ).toBe("word 5 is not in the BIP39 English word list");
+  });
+
+  it("explains address book and label refusals", () => {
+    expect(
+      describeError({ code: "contact", message: "no contact is named `Alcie`, and it is not a valid address either" })
+        .title,
+    ).toMatch(/^No contact has that name, and it isn't a valid address either/);
+    expect(describeError({ code: "contact", message: "no contact is named `Bob`" }).title).toMatch(
+      /^There's no contact with that name/,
+    );
+    expect(describeError({ code: "contact", message: "a contact named `Alice` already exists" })).toEqual({
+      code: "contact",
+      title: "That name, note or label can't be used.",
+      detail: "A contact named `Alice` already exists",
+    });
   });
 
   it("names the right address prefix for the network", () => {

@@ -91,6 +91,18 @@ const DESCRIPTIONS: Record<string, Describe> = {
   }),
   sign: (message) => ({ title: "The transaction couldn't be signed.", detail: message }),
   tx_not_found: () => ({ title: "This transaction isn't in your wallet." }),
+  // Address book and labels. The core's message names the rule that was broken.
+  contact: (message) => {
+    if (/^no contact is named/.test(message)) {
+      return /not a valid address/.test(message)
+        ? {
+            title:
+              "No contact has that name, and it isn't a valid address either. Check the spelling or pick a contact from the list.",
+          }
+        : { title: "There's no contact with that name. It may have been renamed or removed." };
+    }
+    return { title: "That name, note or label can't be used.", detail: sentence(message) };
+  },
   rpc: (message) => ({
     title:
       "Can't reach your Bitcoin node. Check that bitcoind is running and that the node settings are right.",
@@ -122,6 +134,11 @@ const DESCRIPTIONS: Record<string, Describe> = {
     detail: message,
   }),
 };
+
+/** The core's messages start in lower case ("a contact named …"); as a detail line, capitalise. */
+function sentence(message: string): string {
+  return message.charAt(0).toUpperCase() + message.slice(1);
+}
 
 /**
  * The word positions in a `backup_mismatch` message ("word 7 does not match…", "words 3 and 7

@@ -1,48 +1,36 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api } from "../lib/api";
-import { formatBtc, formatSat, parseAmount, satToInput, type AmountUnit } from "../lib/amount";
+import { formatBtc, formatSat, parseAmount, parseFeeRate, satToInput, type AmountUnit } from "../lib/amount";
 import { errorText, toApiError } from "../lib/errors";
 import { NETWORKS } from "../lib/network";
-import type { PreparedSend, SendPreview } from "../lib/types";
+import type { Contact, PreparedSend } from "../lib/types";
 import type { Go } from "../state/nav";
 import { useWallet } from "../state/wallet";
-import { AddressChunks } from "../components/Address";
-import { Btc, Sat } from "../components/Amount";
+import { Btc } from "../components/Amount";
 import { BackupReminder } from "../components/BackupReminder";
 import { ErrorNotice } from "../components/ErrorNotice";
 import { Field, NO_ASSIST } from "../components/Field";
 import { ScreenHeader } from "../components/Frame";
 import { Icon } from "../components/Icon";
+import { PaymentPreview, sendLabel } from "../components/PaymentPreview";
+import { contactNamed, RecipientField } from "../components/RecipientField";
 
 type FieldErrors = { to: string | null; amount: string | null; fee: string | null };
 const NO_ERRORS: FieldErrors = { to: null, amount: null, fee: null };
-const MAX_FEE_RATE = 1000;
-
-/** `3` → "3", `2.5` → "2.5", `1.234567` → "1.23" */
-const rate = (satVb: number) => String(Math.round(satVb * 100) / 100);
-
-function parseFeeRate(text: string): { ok: true; value: number | null } | { ok: false; error: string } {
-  const t = text.trim();
-  if (t === "") return { ok: true, value: null };
-  if (!/^\d+(\.\d{1,3})?$/.test(t)) return { ok: false, error: "Enter a number of sat/vB, like 2 or 2.5." };
-  const value = Number(t);
-  if (value <= 0) return { ok: false, error: "The fee rate must be above zero." };
-  if (value > MAX_FEE_RATE) {
-    return { ok: false, error: `Above ${MAX_FEE_RATE} sat/vB is almost certainly a mistake.` };
-  }
-  return { ok: true, value };
-}
-
 /**
  * Send: form → (unlock) → preview → confirm or cancel → tx detail. The transaction itself
  * (PSBT) is built and signed in Rust; the UI only sees the preview and an opaque id.
+ *
+ * The recipient is an address or a contact's name (Rust resolves it); the preview always shows
+ * the full address, with the name next to it.
  */
-export function Send({ go }: { go: Go }) {
+export function Send({ go, initialTo = "" }: { go: Go; initialTo?: string }) {
   const wallet = useWallet();
   const { info, balance } = wallet;
   const meta = NETWORKS[info.network];
 
-  const [to, setTo] = useState("");
+  const [to, setTo] = useState(initialTo);
+  const [contacts, setContacts] = useState<Contact[]>([]);
   const [amountText, setAmountText] = useState("");
   const [unit, setUnit] = useState<AmountUnit>("btc");
   const [feeText, setFeeText] = useState("");
@@ -59,6 +47,18 @@ export function Send({ go }: { go: Go }) {
     open.current = next;
     setPrepared(next);
   };
+
+  // The address book, for the recipient picker. Without it, addresses still work.
+  useEffect(() => {
+    let alive = true;
+    api
+      .listContacts()
+      .then((list) => alive && setContacts(list))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // Leaving the screen with a preview open releases it (reserved coins, change address).
   useEffect(
@@ -94,8 +94,13 @@ export function Send({ go }: { go: Go }) {
 
   function validate(): { amountSat: number; feeRate: number | null } | null {
     const next: FieldErrors = { ...NO_ERRORS };
-    if (to.trim() === "") next.to = "Enter the address you're sending to.";
-    else if (/\s/.test(to.trim())) next.to = "An address has no spaces. Copy it again from the source.";
+    const text = to.trim();
+    // Contact names may have spaces ("Alice B."); a pasted address with spaces in it is a mistake.
+    const addressLike = text.length > 40 || /^(bc1|tb1|bcrt1)/i.test(text);
+    if (text === "") next.to = "Enter the address you're sending to, or a contact's name.";
+    else if (/\s/.test(text) && addressLike && !contactNamed(contacts, text)) {
+      next.to = "An address has no spaces. Copy it again from the source.";
+    }
     const amount = parseAmount(amountText, unit);
     if (!amount.ok) next.amount = amount.error;
     const fee = parseFeeRate(feeText);
@@ -129,7 +134,9 @@ export function Send({ go }: { go: Go }) {
           continue;
         }
         const text = errorText(err, { network: info.network });
-        if (code === "invalid_address" || code === "network_mismatch") setErrors((x) => ({ ...x, to: text }));
+        if (code === "invalid_address" || code === "network_mismatch" || code === "contact") {
+          setErrors((x) => ({ ...x, to: text }));
+        }
         else if (code === "dust_amount" || code === "insufficient_funds") setErrors((x) => ({ ...x, amount: text }));
         else setFormError(err);
         return;
@@ -178,12 +185,17 @@ export function Send({ go }: { go: Go }) {
 
   if (prepared) {
     return (
-      <Preview
-        preview={prepared.preview}
-        sending={busy === "sending"}
-        onConfirm={() => void confirm()}
-        onCancel={() => void cancel()}
-      />
+      <div className="screen">
+        <ScreenHeader title="Review and send" />
+        <PaymentPreview
+          preview={prepared.preview}
+          label="Transaction preview"
+          confirmLabel={sendLabel(prepared.preview)}
+          sending={busy === "sending"}
+          onConfirm={() => void confirm()}
+          onCancel={() => void cancel()}
+        />
+      </div>
     );
   }
 
@@ -197,7 +209,10 @@ export function Send({ go }: { go: Go }) {
 
   return (
     <div className="screen">
-      <ScreenHeader title="Send" lead={`Pay a ${meta.label} address. You'll see the fee and check everything before anything is sent.`} />
+      <ScreenHeader
+        title="Send"
+        lead={`Pay a ${meta.label} address or one of your contacts. You'll see the fee and check everything before anything is sent.`}
+      />
       <BackupReminder />
       {!info.unlocked && (
         <p className="inline-note">
@@ -205,18 +220,17 @@ export function Send({ go }: { go: Go }) {
         </p>
       )}
       <form className="panel stack" onSubmit={review} noValidate>
-        <Field
-          label="Recipient address"
+        <RecipientField
           value={to}
-          onChange={(e) => {
-            setTo(e.target.value);
+          onChange={(text) => {
+            setTo(text);
             setErrors((x) => ({ ...x, to: null }));
           }}
+          contacts={contacts}
           error={errors.to}
-          placeholder={`${meta.addressPrefix}q…`}
-          mono
+          placeholder={contacts.length > 0 ? `${meta.addressPrefix}q… or a contact's name` : `${meta.addressPrefix}q…`}
+          hint={`A ${meta.label} address, or the name of a saved contact.`}
           disabled={busy !== null}
-          {...NO_ASSIST}
         />
         <Field
           label="Amount"
@@ -277,106 +291,6 @@ export function Send({ go }: { go: Go }) {
           </button>
         </div>
       </form>
-    </div>
-  );
-}
-
-function Preview({
-  preview,
-  sending,
-  onConfirm,
-  onCancel,
-}: {
-  preview: SendPreview;
-  sending: boolean;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  const { info } = useWallet();
-  const meta = NETWORKS[info.network];
-  const feeShare = preview.amount_sat > 0 ? preview.fee_sat / preview.amount_sat : 0;
-  const warnings: string[] = [];
-  if (meta.real) warnings.push("This sends real bitcoin. A transaction can't be undone once it is broadcast.");
-  if (feeShare >= 0.1) {
-    warnings.push(`The fee is ${Math.round(feeShare * 100)}% of the amount you're sending.`);
-  }
-  if (preview.fee_rate_sat_vb > 100) {
-    warnings.push(`${rate(preview.fee_rate_sat_vb)} sat/vB is a high fee rate. Check that it's what you meant.`);
-  }
-
-  return (
-    <div className="screen">
-      <ScreenHeader title="Review and send" />
-      <section className="panel review" aria-label="Transaction preview">
-        <div className="review__to">
-          <p className="eyebrow">Sending to</p>
-          <p className="review__address">
-            <AddressChunks address={preview.to} size="lg" />
-          </p>
-          <p className="muted small">
-            Compare every group of four with the address you were given, on paper or on the recipient&apos;s screen.
-            Malware can swap a copied address for its own; looking is the only check.
-          </p>
-        </div>
-        <dl className="lines">
-          <div className="lines__row">
-            <dt>Amount</dt>
-            <dd>
-              <Btc sat={preview.amount_sat} />
-              <Sat sat={preview.amount_sat} />
-            </dd>
-          </div>
-          <div className="lines__row">
-            <dt>Network fee</dt>
-            <dd>
-              <Btc sat={preview.fee_sat} />
-              <span className="sat">
-                {formatSat(preview.fee_sat)} · {rate(preview.fee_rate_sat_vb)} sat/vB × {preview.vsize} vB
-              </span>
-            </dd>
-          </div>
-          <div className="lines__row">
-            <dt>Change</dt>
-            <dd>
-              {preview.change_sat === null ? (
-                <span className="lines__note">None: the small remainder goes to the fee</span>
-              ) : (
-                <>
-                  <Btc sat={preview.change_sat} />
-                  <span className="lines__note">back to a new address in this wallet</span>
-                </>
-              )}
-            </dd>
-          </div>
-          <div className="lines__row lines__row--total">
-            <dt>Total leaving the wallet</dt>
-            <dd>
-              <Btc sat={preview.total_sat} />
-              <Sat sat={preview.total_sat} />
-            </dd>
-          </div>
-        </dl>
-        {warnings.length > 0 && (
-          <div className="notice notice--warning" role="note">
-            <Icon name="alert" className="notice__icon" />
-            <div className="notice__body">
-              {warnings.map((w) => (
-                <p key={w} className="notice__title">
-                  {w}
-                </p>
-              ))}
-            </div>
-          </div>
-        )}
-        <div className="actions">
-          <button type="button" className="btn btn--ghost" onClick={onCancel} disabled={sending}>
-            Cancel
-          </button>
-          <button type="button" className="btn btn--primary btn--send" onClick={onConfirm} disabled={sending}>
-            {sending ? "Sending…" : `Send ${formatBtc(preview.amount_sat)} BTC`}
-          </button>
-        </div>
-      </section>
     </div>
   );
 }

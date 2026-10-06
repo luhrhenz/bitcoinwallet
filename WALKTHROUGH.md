@@ -2053,3 +2053,186 @@ when at least one transaction has a label; without any, the table looks exactly 
 - The new error code `contact` needs a line in `errors.ts`.
 - A bump's preview has `contact: None` even when the recipient is a saved contact: the field means
   "the name the user typed". Looking the address up for display would be easy if the UI wants it.
+
+## 14. v2 desktop: contacts, labels, speed up (Agent J)
+
+**What we built:** the desktop half of §13. A **Contacts** screen, contact names on the **Send**
+screen, **labels** in the lists and on the transaction screen, and **"Speed up"** for a stuck
+payment. Underneath, eight new Tauri commands and two fixes to the payment bridge that Agent I
+flagged.
+
+```text
+apps/desktop/src-tauri/src/
+  commands.rs        prepare_send takes a name · confirm_send checks bumps · 8 new commands
+  state.rs           PendingSend.replaces: Option<Txid>
+  ipc.rs, lib.rs     the wrappers and their registration
+apps/desktop/src/
+  screens/Contacts.tsx           list · add · rename · remove (with confirmation) · Pay
+  components/RecipientField.tsx  address-or-name combobox for Send
+  components/PaymentPreview.tsx  the preview card, shared by Send and Speed up
+  screens/TxDetail.tsx           label editor · Speed up form → preview → replacement
+  lib/{api,types,errors,mock}.ts the contract, the `contact` error text, the mock's rules
+```
+
+### The commands
+All of them are plain functions in `commands.rs` with a thin `#[tauri::command]` wrapper, like
+the rest of §9.
+
+| Command (JS → Rust) | Returns | Needs | Activity |
+|---|---|---|---|
+| `list_contacts` | `Contact[]` | a wallet | background |
+| `add_contact(name, address, note)` | `Contact` | a wallet | user |
+| `remove_contact(name)` | the removed `Contact` | a wallet | user |
+| `rename_contact(old, new)` | the renamed `Contact` | a wallet | user |
+| `set_label(txid, label)` | the label as stored | a wallet | user |
+| `clear_label(txid)` | nothing | a wallet | user |
+| `min_fee_bump_rate(txid)` | sat/vB, rounded **up** to 0.01 | a wallet | user |
+| `prepare_fee_bump(txid, feeRateSatVb?)` | `PreparedSend` (`preview.replaces` set) | **unlocked** | user |
+
+Contacts and labels are wallet edits, not spending, so they work **watch-only**: no password,
+whether the app is locked or not. They count as user activity for the Rust-side auto-lock
+backstop (§9). Listing contacts is a read, like `history`, so a screen that lists them can't keep
+the key alive. A malformed txid is `tx_not_found`, as in `tx_status`. Errors are the core's own
+(`contact`, `invalid_address`, `network_mismatch`, `tx_not_found`, `tx_build`).
+
+`min_fee_bump_rate` returns 751 sat/kWU as **3.01**, never 3.00: hundredths are rounded up
+(`⌈kWU × 2 / 5⌉ / 100`). Typing the number back goes through `fee_rate_from_sat_vb`, which also
+rounds up, so the minimum shown is always accepted. A test checks this for every rate from 250 to
+50 000 sat/kWU. The command doesn't contact the node; it answers from the last sync, which the
+transaction screen's 10-second `tx_status` poll keeps fresh.
+
+### Fix 1: a contact name in `prepare_send`
+The desktop `prepare_send` used to parse `to` as an address before anything else, so a name
+failed as `invalid_address`. It now follows `btcw send` (§13):
+
+```text
+parse_address(to) ok        → check dust now, as before (no wallet, no node)
+invalid_address, and to is  → maybe a name: after the fee-rate check, open the wallet,
+  not address-like            resolve_recipient (unknown name = `contact`), check dust for
+                              the contact's address, all before Node::connect
+anything else               → that error (network_mismatch, an address-like typo, empty)
+```
+
+`book::looks_like_address` decides which input is "address-like": a SegWit prefix, more than 40
+characters, or anything that parses as an address on any network. That input is never looked up
+as a name. So `bcrt1qnotanaddress` is still `invalid_address`, and early validation of real
+addresses is unchanged. `tx::prepare_send` resolves the name a second time while building, and
+`preview.to` is always the full address.
+
+### Fix 2: confirming a fee bump
+A prepared payment now remembers whether it is a bump: `PendingSend.replaces: Option<Txid>`.
+`confirm_send` picks the check:
+
+```text
+replaces = None             tx::check_prepared → Node::connect          (unchanged)
+replaces = Some(original)   Node::connect → sync → tx::check_prepared_bump(wallet, psbt, original)
+```
+
+The plain check would refuse every bump, because the original already spends those coins and has
+already paid that change address. The bump check is run **after a sync**. The usual way a
+prepared bump goes stale is that the original confirms while the preview is on screen, and only
+the node can tell the wallet that. Without the sync, the app would sign the replacement and the
+node would reject it with an RPC error. With it, `bump_target` says "cannot speed up …: it is
+already confirmed (block N)" (`tx_build`), and nothing is signed. Plain payments don't sync here
+(no change from §10). After the broadcast, `record_broadcast` handles the replacement (§13): the
+original drops out of the history and the label carries over.
+
+A bump uses **the same single slot** as a payment: a new preview of either kind cancels the last,
+it expires after 10 minutes, a lock drops it, and `confirm_send` / `cancel_send` work on it
+unchanged. `prepare_fee_bump` refuses an unknown, incoming or confirmed transaction from the
+wallet file before it contacts the node. Then it syncs, calls `tx::prepare_fee_bump`, and persists
+the wallet, as `prepare_send` does: a replacement of a payment that had no change gets a fresh
+change address, and the wallet that signs must know it.
+
+### The screens
+- **Contacts** (new nav entry, between History and Settings). The list shows the name, the full
+  address in groups of four, and the note, with **Pay** (opens Send with the name filled in),
+  **Rename** (inline, Escape cancels, focus returns to the button) and **Remove** (a dialog that
+  shows the address, with focus on Cancel). The add form checks for an empty name or address
+  locally. Rust's refusals land on the field they concern: the address field for
+  `invalid_address` / `network_mismatch`, the note field for a note rule, the name field for the
+  others. There's an empty state when the book is empty. It all works while locked.
+- **Send**. The field is now **Recipient**, an ARIA combobox: typing filters contacts by name, ↓
+  opens the full list, ↑/↓ move, Enter picks (without submitting), Escape closes, and the
+  **Contacts** button lists everyone. When the text is a contact's name, the hint under the field
+  shows that contact's **full address**. The **preview card** (now `PaymentPreview`) shows the
+  grouped address as before, with the contact as a separate chip under it ("Contact Alice"), plus
+  a line saying the address above is where the money goes. A name never replaces the address.
+  An unknown name is a field error ("No contact has that name, and it isn't a valid address
+  either…").
+- **Labels**. A label appears under the kind ("Sent") in History and in the dashboard's recent
+  activity (`TxList`). On the transaction screen, a **Label** row lets you add, edit (Save /
+  Cancel / Escape) or remove it, and focus returns to the button.
+- **Speed up**. Only for an **unconfirmed outgoing** payment: the wallet spent coins in it, and
+  the polled status is unconfirmed. Incoming and confirmed transactions don't get the button, and
+  it disappears when a poll sees a confirmation. Here is the flow:
+  1. **Speed up** asks `min_fee_bump_rate`. A refusal (say, a payment whose change is already
+     spent) is shown instead of the form.
+  2. The form's **New fee rate** is pre-filled with that minimum. A lower rate is refused on the
+     spot ("Replacing this payment needs at least 3.01 sat/vB.") before Rust is asked, and Rust
+     refuses it too.
+  3. **Review** asks for the password if the wallet is locked, then calls `prepare_fee_bump`.
+  4. The preview card starts with a **Replaces &lt;full txid&gt;** block. The fee line says how
+     much more it pays ("423 sat more than the 282 sat it pays now"). The button reads **Send
+     replacement**.
+  5. **Confirm** → `confirm_send` → the **replacement's** transaction screen: "Sped up. The
+     replacement is on its way.", with a *Replaces* row. **Cancel** → `cancel_send` → back,
+     "Nothing was sent".
+  6. If the wallet locks or the payment confirms while the preview is open, the preview is
+     discarded and the user is told. If `confirm_send` fails (it confirmed meanwhile), the
+     reason is shown and the status is re-checked at once, so the button goes away.
+
+### Mock
+`npm run dev:mock` has all of it. The mock applies the core's contact rules (trim, 1–40
+characters, unique ignoring case, not address-like, control characters, note ≤ 200, the address
+checked for the network) and its label rules (1–100 characters, known txids only), per network.
+It resolves names like `resolve_recipient`. For fee bumps it applies a minimum of old rate +
+1 sat/vB or old fee + 1 sat/vB × size, refuses unknown, incoming, confirmed, replaced or
+parent-of-a-payment transactions, takes the extra fee from the change, and shares the single slot.
+`confirmSend` syncs and refuses if the original confirmed. The replacement takes the original's
+place and its label. One simplification: it never adds a coin, so if the change can't pay the
+extra fee it reports `insufficient_funds`.
+
+### Testing
+- **Rust, offline** (6 new tests, 26 offline in `btcw-desktop`):
+  - contact CRUD while locked, and every validation error: duplicate ignoring case, empty,
+    address-like, too long, control characters, a note too long, `network_mismatch`,
+    `invalid_address`, an unknown name on rename and remove
+  - wallet edits keep the session alive, while listing doesn't
+  - `prepare_send` with a name: unknown → `contact`, dust → `dust_amount`, address-like typos stay
+    `invalid_address`, all before the node; a known name, in any case, gets as far as `rpc`
+  - labels on an unknown or malformed txid → `tx_not_found`
+  - `prepare_fee_bump` → `locked` when locked, `tx_not_found` before the node; a bump in the
+    pending slot is used up by confirm, forgotten by cancel and dropped by lock
+  - the rounding round-trip
+- **Rust, regtest** (`contacts_labels_and_speed_up_against_a_regtest_node`, one node start):
+  1. Add Alice and pay `alice` at 2 sat/vB. The preview has her address and name, 281 sat.
+  2. Label the payment. `min_fee_bump_rate` is 3.01; 2 and 3 are refused with "at least 3.01
+     sat/vB".
+  3. A bump at the minimum, then one at 5 sat/vB in the same slot (the first id is dead).
+     Confirm: 703 sat, change − 422.
+  4. The node's mempool holds only the replacement (`getmempoolentry` fee 0.00000703). The
+     wallet's history has only the replacement, labelled "rent October", before and after a
+     sync. `tx_status(original)` is `null`.
+  5. Clear the label (twice). Prepare and cancel a bump, then prepare one more, and **mine**:
+     `confirm_send` refuses with "already confirmed", the mempool is empty, and the id is used
+     up.
+- **UI** (Vitest, 82 tests in all, 14 new):
+  - the Contacts screen: add, field errors, rename (Escape, focus, taken name), remove (Cancel,
+    confirm), empty state, all locked; Pay
+  - Send by name with a click and with the keyboard: the full address in the hint and in the
+    preview, plus the name; an unknown name
+  - labels: add, edit and remove, with the length rule, shown in History and on the dashboard
+  - Speed up: shown only for unconfirmed outgoing, gone after a confirmation; the minimum
+    pre-filled and enforced; the preview's "Replaces" and extra fee; confirm opens the
+    replacement with the inherited label; the unlock prompt; cancel; confirmed before Send
+  - the mock's new rules, and the `contact` error text
+  - `vite.config.ts` raises Vitest's per-test timeout from 5 s to 15 s: the click-through journeys
+    take 1–2 s on an idle machine but brushed 5 s on a busy one.
+
+### Open questions
+- A bump's preview has `contact: null`, even when the recipient is a saved contact, because the
+  core's field means "the name that was typed". The Speed up preview shows the full address
+  only. Showing the matching contact there would be a small, display-only lookup.
+- `confirm_send` syncs before checking a **bump**, but still not before an ordinary payment (§10's
+  behaviour). Doing it for both would catch more stale previews, at the cost of a slower "Send".

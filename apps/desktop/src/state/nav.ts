@@ -4,8 +4,10 @@ import type { SendPreview } from "../lib/types";
 export type Route =
   | { name: "dashboard" }
   | { name: "receive" }
-  | { name: "send" }
+  /** `to`: a contact's name to pay, from the Contacts screen. */
+  | { name: "send"; to?: string }
   | { name: "history" }
+  | { name: "contacts" }
   | { name: "settings" }
   /** `sent` is set when arriving straight from a confirmed send. */
   | { name: "tx"; txid: string; sent?: SendPreview };

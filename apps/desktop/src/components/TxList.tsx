@@ -22,6 +22,12 @@ export function TxList({ rows, onOpen, label }: { rows: TxRow[]; onOpen: (txid: 
               </span>
               <span className="txrow__main">
                 <span className="txrow__kind">{LABEL[dir]}</span>
+                {tx.label && (
+                  <span className="txrow__label">
+                    <Icon name="tag" size={13} />
+                    <span>{tx.label}</span>
+                  </span>
+                )}
                 <span className="txrow__meta">
                   {time ? formatDateTime(time) : "Time unknown"} · <span className="mono">{shortId(tx.txid)}</span>
                 </span>

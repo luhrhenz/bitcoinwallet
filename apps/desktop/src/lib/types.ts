@@ -66,6 +66,14 @@ export interface SendPreview {
   replaces: string | null;
 }
 
+/** One address-book entry. Names are unique ignoring case; the address is valid for the network. */
+export interface Contact {
+  name: string;
+  /** Canonical form (lower-case bech32), checked for the wallet's network when it was saved. */
+  address: string;
+  note: string | null;
+}
+
 // ---- Desktop-only shapes (defined by the Tauri command layer, apps/desktop/src-tauri) ----
 
 export type NetworkName = "testnet4" | "signet" | "regtest" | "bitcoin";

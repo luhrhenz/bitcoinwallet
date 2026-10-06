@@ -91,6 +91,11 @@ fn info(fx: &Fixture) -> AppInfo {
 
 /// A prepared payment without a node: an empty PSBT is enough for the session's bookkeeping.
 fn fake_pending(fx: &Fixture, id: &str) {
+    fake_pending_replacing(fx, id, None);
+}
+
+/// [`fake_pending`], as a fee bump of `replaces` when given.
+fn fake_pending_replacing(fx: &Fixture, id: &str, replaces: Option<Txid>) {
     let tx = Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
@@ -102,6 +107,7 @@ fn fake_pending(fx: &Fixture, id: &str) {
         network: Network::Regtest,
         psbt: Psbt::from_unsigned_tx(tx).unwrap(),
         created: fx.state.now(),
+        replaces,
     });
 }
 
@@ -431,7 +437,9 @@ fn sending_needs_the_signer_and_a_known_id() {
     unlock(&fx.state, &secret(PASSWORD)).unwrap();
     // Refused before the node is contacted (which would be `rpc` here).
     for (to, amount, rate, expected) in [
-        ("not an address", 10_000, None, "invalid_address"),
+        // Not address-like: it could be a contact's name, and there is none by that name.
+        ("not an address", 10_000, None, "contact"),
+        ("bcrt1qnotanaddress", 10_000, None, "invalid_address"),
         (TB_ADDRESS, 10_000, None, "network_mismatch"),
         (BCRT_ADDRESS, 293, None, "dust_amount"),
         (BCRT_ADDRESS, 10_000, Some(0.5), "tx_build"),
@@ -502,6 +510,257 @@ fn tx_status_answers_from_the_last_sync_without_a_node() {
     let unknown = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
     assert_eq!(tx_status(&fx.state, unknown).unwrap(), None);
     assert_eq!(code(sync(&fx.state, &mut |_| {})), "rpc");
+}
+
+// ── Address book, labels, speed up (offline) ────────────────────────────────────────────────
+
+/// A txid no wallet here has ever seen (the genesis block's coinbase).
+const UNKNOWN_TXID: &str = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+
+#[test]
+fn contacts_are_edited_watch_only_with_the_core_rules() {
+    let fx = offline();
+    assert_eq!(code(list_contacts(&fx.state)), "wallet_not_found");
+    assert_eq!(
+        code(add_contact(&fx.state, "Alice", BCRT_ADDRESS, None)),
+        "wallet_not_found"
+    );
+    create(&fx);
+    lock(&fx.state).unwrap();
+    assert_eq!(list_contacts(&fx.state).unwrap(), vec![]);
+
+    // Saved while locked: no password needed. Trimmed; a blank note is no note.
+    let alice = add_contact(&fx.state, "  Alice ", BCRT_ADDRESS, Some("rent")).unwrap();
+    assert_eq!(
+        alice,
+        Contact {
+            name: "Alice".into(),
+            address: BCRT_ADDRESS.into(),
+            note: Some("rent".into()),
+        }
+    );
+    let bob = add_contact(&fx.state, "bob", &BCRT_ADDRESS.to_uppercase(), Some("  ")).unwrap();
+    assert_eq!(
+        bob.address, BCRT_ADDRESS,
+        "stored in canonical (lower) case"
+    );
+    assert_eq!(bob.note, None);
+    assert_eq!(
+        serde_json::to_value(list_contacts(&fx.state).unwrap()).unwrap(),
+        json!([
+            { "name": "Alice", "address": BCRT_ADDRESS, "note": "rent" },
+            { "name": "bob", "address": BCRT_ADDRESS, "note": null },
+        ])
+    );
+
+    for (name, address, note, expected) in [
+        ("ALICE", BCRT_ADDRESS, None, "contact"),
+        ("", BCRT_ADDRESS, None, "contact"),
+        ("bcrt1qnotanaddress", BCRT_ADDRESS, None, "contact"),
+        (&*"x".repeat(41), BCRT_ADDRESS, None, "contact"),
+        (
+            "Line
+break",
+            BCRT_ADDRESS,
+            None,
+            "contact",
+        ),
+        ("Carol", BCRT_ADDRESS, Some(&*"n".repeat(201)), "contact"),
+        ("Carol", TB_ADDRESS, None, "network_mismatch"),
+        ("Carol", "not an address", None, "invalid_address"),
+    ] {
+        assert_eq!(
+            code(add_contact(&fx.state, name, address, note)),
+            expected,
+            "{name:?} {address} {note:?}"
+        );
+    }
+    let duplicate = add_contact(&fx.state, "alice", BCRT_ADDRESS, None).unwrap_err();
+    assert_eq!(duplicate.message, "a contact named `Alice` already exists");
+
+    // Rename (case-insensitive lookup), refusing a taken name; a change of case is fine.
+    assert_eq!(
+        rename_contact(&fx.state, "ALICE", "Alice B.").unwrap().name,
+        "Alice B."
+    );
+    assert_eq!(
+        code(rename_contact(&fx.state, "Alice B.", "BOB")),
+        "contact"
+    );
+    assert_eq!(code(rename_contact(&fx.state, "nobody", "Zed")), "contact");
+    assert_eq!(rename_contact(&fx.state, "bob", "Bob").unwrap().name, "Bob");
+
+    // Remove returns what was removed; a second time there is nothing to remove.
+    assert_eq!(remove_contact(&fx.state, "bob").unwrap().name, "Bob");
+    assert_eq!(code(remove_contact(&fx.state, "bob")), "contact");
+    let names: Vec<String> = list_contacts(&fx.state)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["Alice B."]);
+    assert!(!info(&fx).unlocked, "editing contacts never unlocks");
+}
+
+#[test]
+fn wallet_edits_count_as_activity_and_listing_does_not() {
+    let fx = offline();
+    create(&fx); // unlocked; auto-lock 5 minutes (+ 1 minute grace on this side)
+    for i in 0..3 {
+        fx.clock.advance(Duration::from_secs(5 * 60));
+        add_contact(&fx.state, &format!("Friend {i}"), BCRT_ADDRESS, None).unwrap();
+    }
+    assert!(info(&fx).unlocked, "15 minutes, a contact saved every 5");
+    fx.clock.advance(Duration::from_secs(4 * 60));
+    list_contacts(&fx.state).unwrap();
+    fx.clock.advance(Duration::from_secs(2 * 60 + 1));
+    list_contacts(&fx.state).unwrap();
+    assert!(
+        !info(&fx).unlocked,
+        "reading the address book is not activity"
+    );
+}
+
+#[test]
+fn send_resolves_a_contact_name_before_the_node() {
+    let fx = offline();
+    create(&fx);
+    add_contact(&fx.state, "Alice", BCRT_ADDRESS, None).unwrap();
+    lock(&fx.state).unwrap();
+    assert_eq!(
+        code(prepare_send(&fx.state, "alice", 10_000, None)),
+        "locked"
+    );
+    unlock(&fx.state, &secret(PASSWORD)).unwrap();
+
+    for (to, amount, rate, expected) in [
+        // An unknown name, and a dust amount for a known one: before the node.
+        ("Alcie", 10_000, None, "contact"),
+        ("alice", 293, None, "dust_amount"),
+        ("alice", 10_000, Some(0.5), "tx_build"),
+        // Address-like input is never looked up as a name, so typos stay address errors.
+        ("bcrt1qnotanaddress", 10_000, None, "invalid_address"),
+        (TB_ADDRESS, 10_000, None, "network_mismatch"),
+        ("", 10_000, None, "invalid_address"),
+        // A known name (any case, padded) resolves and gets as far as the node.
+        (" ALICE ", 10_000, None, "rpc"),
+    ] {
+        assert_eq!(
+            code(prepare_send(&fx.state, to, amount, rate)),
+            expected,
+            "{to:?} {amount} {rate:?}"
+        );
+    }
+    let unknown = prepare_send(&fx.state, "Alcie", 10_000, None).unwrap_err();
+    assert_eq!(
+        unknown.message,
+        "no contact is named `Alcie`, and it is not a valid address either"
+    );
+}
+
+#[test]
+fn labels_need_a_transaction_the_wallet_knows() {
+    let fx = offline();
+    assert_eq!(
+        code(set_label(&fx.state, UNKNOWN_TXID, "rent")),
+        "wallet_not_found"
+    );
+    create(&fx);
+    lock(&fx.state).unwrap();
+    for txid in [UNKNOWN_TXID, "not a txid", ""] {
+        assert_eq!(
+            code(set_label(&fx.state, txid, "rent")),
+            "tx_not_found",
+            "{txid:?}"
+        );
+        assert_eq!(
+            code(clear_label(&fx.state, txid)),
+            "tx_not_found",
+            "{txid:?}"
+        );
+    }
+    // The label's own rules come first (no wallet lookup needed for them).
+    assert_eq!(code(set_label(&fx.state, UNKNOWN_TXID, "  ")), "contact");
+    assert_eq!(
+        code(set_label(&fx.state, UNKNOWN_TXID, &"x".repeat(101))),
+        "contact"
+    );
+}
+
+#[test]
+fn speed_up_needs_the_signer_and_a_transaction_the_wallet_sent() {
+    let fx = offline();
+    create(&fx);
+    lock(&fx.state).unwrap();
+    assert_eq!(
+        code(prepare_fee_bump(&fx.state, UNKNOWN_TXID, None)),
+        "locked"
+    );
+    assert_eq!(
+        code(prepare_fee_bump(&fx.state, "nope", Some(5.0))),
+        "locked"
+    );
+    // The minimum is a watch-only question: no password, and an unknown txid says so.
+    assert_eq!(
+        code(min_fee_bump_rate(&fx.state, UNKNOWN_TXID)),
+        "tx_not_found"
+    );
+    assert_eq!(code(min_fee_bump_rate(&fx.state, "nope")), "tx_not_found");
+
+    unlock(&fx.state, &secret(PASSWORD)).unwrap();
+    fake_pending(&fx, "beef");
+    for (txid, rate, expected) in [
+        ("not a txid", None, "tx_not_found"),
+        (UNKNOWN_TXID, Some(0.5), "tx_build"),
+        (UNKNOWN_TXID, Some(f64::NAN), "tx_build"),
+        // Refused from the wallet file, before the node (which would be `rpc` here).
+        (UNKNOWN_TXID, None, "tx_not_found"),
+        (UNKNOWN_TXID, Some(5.0), "tx_not_found"),
+    ] {
+        assert_eq!(
+            code(prepare_fee_bump(&fx.state, txid, rate)),
+            expected,
+            "{txid} {rate:?}"
+        );
+    }
+    // Like a new payment preview, a fee bump that got as far as the wallet replaced the old one.
+    assert!(!fx.state.session().has_pending());
+
+    // A prepared bump lives in the same slot, with the same rules: confirm uses it up (here the
+    // node is down), cancel forgets it, and a lock drops it.
+    let original = Txid::from_str(UNKNOWN_TXID).unwrap();
+    fake_pending_replacing(&fx, "b1", Some(original));
+    assert_eq!(code(confirm_send(&fx.state, "b1")), "rpc");
+    assert!(!fx.state.session().has_pending());
+    fake_pending_replacing(&fx, "b2", Some(original));
+    cancel_send(&fx.state, "b2").unwrap();
+    assert_eq!(code(confirm_send(&fx.state, "b2")), "tx_build");
+    fake_pending_replacing(&fx, "b3", Some(original));
+    lock(&fx.state).unwrap();
+    assert!(!fx.state.session().has_pending());
+}
+
+#[test]
+fn the_minimum_bump_rate_is_rounded_up_and_accepted_back() {
+    let shown = |kwu: u64| sat_vb_rounded_up(FeeRate::from_sat_per_kwu(kwu));
+    assert_eq!(shown(751), 3.01, "BIP125 rule 4's 3.004 sat/vB");
+    assert_eq!(shown(750), 3.0);
+    assert_eq!(shown(500), 2.0);
+    assert_eq!(shown(1_500), 6.0);
+    assert_eq!(shown(1_501), 6.01);
+    // Typing the number shown always gives at least the minimum back.
+    for kwu in 250..=50_000 {
+        let back = fee_rate_from_sat_vb(shown(kwu)).unwrap().to_sat_per_kwu();
+        assert!(
+            back >= kwu,
+            "{kwu} sat/kWU shown as {} came back as {back}",
+            shown(kwu)
+        );
+        assert!(
+            back <= kwu + 3,
+            "{kwu} sat/kWU came back as {back}: rounded up too far"
+        );
+    }
 }
 
 // ── Auto-lock ───────────────────────────────────────────────────────────────────────────────
@@ -989,4 +1248,155 @@ fn a_payment_prepared_in_the_app_is_refused_after_the_cli_spent_its_coin() {
     let mempool = mempool.as_array().unwrap();
     assert_eq!(mempool.len(), 2);
     assert!(mempool.contains(&json!(sent.txid)) && mempool.contains(&json!(cli_txid)));
+}
+
+/// v2 on the desktop bridge, against a real node: pay a contact by name, label the payment,
+/// speed it up (the minimum, then a new review at 5 sat/vB in the same slot), and check that the
+/// node and the wallet hold only the replacement, which inherits the label. Then a second bump is
+/// prepared and the payment confirms before "Send": `confirm_send` refuses it cleanly, without
+/// broadcasting anything.
+#[test]
+fn contacts_labels_and_speed_up_against_a_regtest_node() {
+    if !TestNode::available() {
+        eprintln!("skipping: no bitcoind (set BITCOIND_EXE to run this test)");
+        return;
+    }
+    let node = TestNode::start().unwrap();
+    let (fx, _cli) = regtest_fixture(&node);
+    let state = &fx.state;
+    create(&fx);
+    let receive = new_address(state)
+        .unwrap()
+        .address
+        .parse::<Address<NetworkUnchecked>>()
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap();
+    node.fund(&receive, Amount::from_sat(1_000_000)).unwrap();
+    node.mine(1).unwrap();
+    sync(state, &mut |_| {}).unwrap();
+
+    // Pay Alice by name at 2 sat/vB: the preview has her full address and her name.
+    let alice = node.faucet_address().unwrap().to_string();
+    add_contact(state, "Alice", &alice, Some("rent")).unwrap();
+    let prepared = prepare_send(state, "alice", 100_000, Some(2.0)).unwrap();
+    assert_eq!(prepared.preview.to, alice);
+    assert_eq!(prepared.preview.contact.as_deref(), Some("Alice"));
+    assert_eq!(prepared.preview.replaces, None);
+    assert_eq!(
+        prepared.preview.fee_sat, 281,
+        "PLAN-v2 §2: 141 vB at 2 sat/vB"
+    );
+    let original = confirm_send(state, &prepared.id).unwrap().txid;
+    assert_eq!(node.call("getrawmempool", &[]).unwrap(), json!([original]));
+
+    assert_eq!(
+        set_label(state, &original, "  rent October ").unwrap(),
+        "rent October"
+    );
+    let row = |txid: &str| {
+        history(state)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.txid == txid)
+    };
+    assert_eq!(
+        row(&original).unwrap().label.as_deref(),
+        Some("rent October")
+    );
+
+    // The minimum: BDK's old rate + 1 sat/vB, raised to BIP125 rule 4 (751 sat/kWU), shown
+    // rounded up. Anything lower is refused before signing.
+    let min = min_fee_bump_rate(state, &original).unwrap();
+    assert_eq!(min, 3.01);
+    for low in [2.0, 3.0] {
+        let refused = prepare_fee_bump(state, &original, Some(low)).unwrap_err();
+        assert_eq!(refused.code, "tx_build", "{low}: {}", refused.message);
+        assert!(
+            refused.message.contains("at least 3.01 sat/vB"),
+            "{}",
+            refused.message
+        );
+    }
+    let at_min = prepare_fee_bump(state, &original, Some(min)).unwrap();
+    assert_eq!(at_min.preview.replaces.as_deref(), Some(original.as_str()));
+    assert!(
+        at_min.preview.fee_sat >= 281 + at_min.preview.vsize,
+        "rule 4"
+    );
+
+    // A new review takes the same single slot: the first id is dead.
+    let bump = prepare_fee_bump(state, &original, Some(5.0)).unwrap();
+    assert_eq!(code(confirm_send(state, &at_min.id)), "tx_build");
+    let preview = &bump.preview;
+    assert_eq!(preview.replaces.as_deref(), Some(original.as_str()));
+    assert_eq!(preview.to, alice);
+    assert_eq!(preview.amount_sat, 100_000);
+    assert_eq!(preview.fee_sat, 703, "PLAN-v2 §2: 141 vB at 5 sat/vB");
+    assert_eq!(
+        preview.change_sat,
+        prepared.preview.change_sat.map(|c| c - 422)
+    );
+
+    // Send: `check_prepared_bump` accepts it (the plain check would refuse a bump).
+    let replacement = confirm_send(state, &bump.id).unwrap().txid;
+    assert_ne!(replacement, original);
+    assert_eq!(code(confirm_send(state, &bump.id)), "tx_build");
+    assert_eq!(
+        node.call("getrawmempool", &[]).unwrap(),
+        json!([replacement])
+    );
+    let entry = node.call("getmempoolentry", &[json!(replacement)]).unwrap();
+    assert_eq!(entry["fees"]["base"], json!(0.00000703));
+
+    // The wallet has only the replacement, with the label, before and after a sync.
+    for synced in [false, true] {
+        if synced {
+            sync(state, &mut |_| {}).unwrap();
+        }
+        assert!(row(&original).is_none(), "synced: {synced}");
+        assert_eq!(tx_status(state, &original).unwrap(), None);
+        let new_row = row(&replacement).unwrap();
+        assert_eq!(new_row.label.as_deref(), Some("rent October"));
+        assert_eq!(new_row.net_sat, -100_703);
+        assert_eq!(new_row.fee_sat, Some(703));
+        assert_eq!(balance(state).unwrap().total_sat, 1_000_000 - 100_703);
+    }
+    assert_eq!(code(min_fee_bump_rate(state, &original)), "tx_build");
+
+    // Labels can be cleared; clearing twice is fine.
+    clear_label(state, &replacement).unwrap();
+    clear_label(state, &replacement).unwrap();
+    assert_eq!(row(&replacement).unwrap().label, None);
+
+    // A bump prepared (a cancelled one first), then the payment confirms before "Send".
+    let cancelled = prepare_fee_bump(state, &replacement, None).unwrap();
+    cancel_send(state, &cancelled.id).unwrap();
+    assert_eq!(code(confirm_send(state, &cancelled.id)), "tx_build");
+    let late = prepare_fee_bump(state, &replacement, None).unwrap();
+    assert!(late.preview.fee_rate_sat_vb >= min_fee_bump_rate(state, &replacement).unwrap() - 0.01);
+    node.mine(1).unwrap();
+    let refused = confirm_send(state, &late.id).unwrap_err();
+    assert_eq!(refused.code, "tx_build", "{}", refused.message);
+    assert!(
+        refused.message.contains("already confirmed"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(node.call("getrawmempool", &[]).unwrap(), json!([]));
+    assert_eq!(code(confirm_send(state, &late.id)), "tx_build", "used up");
+    assert!(matches!(
+        row(&replacement).unwrap().status,
+        TxStatus::Confirmed {
+            confirmations: 1,
+            ..
+        }
+    ));
+    let after = balance(state).unwrap();
+    assert_eq!(after.confirmed_sat, 1_000_000 - 100_703);
+    assert_eq!(after.unconfirmed_sat, 0);
+    assert_eq!(
+        code(prepare_fee_bump(state, &replacement, None)),
+        "tx_build"
+    );
 }

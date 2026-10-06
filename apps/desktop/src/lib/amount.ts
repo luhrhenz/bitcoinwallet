@@ -142,3 +142,19 @@ export function satToInput(sat: number, unit: AmountUnit): string {
   if (unit === "sat") return sat.toString();
   return formatBtc(sat).replace(/\.?0+$/, "");
 }
+
+/** Above this many sat/vB the UI asks for a correction: almost certainly a typo. */
+export const MAX_FEE_RATE = 1000;
+
+/** A typed fee rate in sat/vB (up to 3 decimals); empty means "automatic" (`null`). */
+export function parseFeeRate(text: string): { ok: true; value: number | null } | { ok: false; error: string } {
+  const t = text.trim();
+  if (t === "") return { ok: true, value: null };
+  if (!/^\d+(\.\d{1,3})?$/.test(t)) return { ok: false, error: "Enter a number of sat/vB, like 2 or 2.5." };
+  const value = Number(t);
+  if (value <= 0) return { ok: false, error: "The fee rate must be above zero." };
+  if (value > MAX_FEE_RATE) {
+    return { ok: false, error: `Above ${MAX_FEE_RATE} sat/vB is almost certainly a mistake.` };
+  }
+  return { ok: true, value };
+}

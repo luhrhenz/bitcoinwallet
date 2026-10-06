@@ -11,5 +11,8 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./src/test-setup.ts"],
+    // The journey tests click through whole flows (about 1–2 s each on an idle machine); the
+    // default 5 s made them flaky on a busy one.
+    testTimeout: 15_000,
   },
 });

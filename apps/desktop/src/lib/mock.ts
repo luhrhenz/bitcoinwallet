@@ -15,10 +15,19 @@
 //   (sent, failed or expired after 10 minutes) and after locking;
 // - the backup flag: a new wallet is unverified, a restored one verified; `backupChallenge`,
 //   `verifyBackup` and `revealPhrase` check the password like the keystore does;
+// - the address book and labels (btcw-core `book.rs`): names trimmed, 1–40 characters, unique
+//   ignoring case, never address-like; addresses checked for the network; labels 1–100
+//   characters, only for transactions the wallet knows; all of it per network and watch-only.
+//   `prepareSend` takes a contact's name like the core's `resolve_recipient`;
+// - "speed up" (RBF): only the wallet's own unconfirmed payments, a minimum of the old rate +
+//   1 sat/vB (and old fee + 1 sat/vB × size), the extra fee out of the change, the same single
+//   prepared-payment slot; `confirmSend` syncs first and refuses if the original confirmed, and
+//   the replacement takes the original's place (and label) in the history;
 // - every failure rejects with a plain `ApiError { code, message }` object, like Tauri.
 //
 // Simplifications: one fake "node" per network, coins only to and from this wallet, no
-// reorgs or evictions, legacy (base58) addresses accepted by shape without a checksum.
+// reorgs or evictions, legacy (base58) addresses accepted by shape without a checksum, and a
+// fee bump never adds a coin (if the change can't pay the extra fee it is `insufficient_funds`).
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { WalletApi } from "./api";
@@ -27,6 +36,7 @@ import type {
   ApiError,
   AppInfo,
   BalanceView,
+  Contact,
   Keychain,
   NetworkName,
   PreparedSend,
@@ -85,6 +95,10 @@ const BLOCK_SECS = 600;
 const COINBASE_MATURITY = 100;
 const PENDING_SEND_TTL_MS = 10 * 60_000;
 const BACKUP_CHECK_WORDS = 3;
+const MAX_NAME_CHARS = 40;
+const MAX_NOTE_CHARS = 200;
+const MAX_LABEL_CHARS = 100;
+const SEGWIT_PREFIXES = ["bc1", "tb1", "bcrt1"];
 
 // ---------------------------------------------------------------------------------------------
 // State
@@ -110,6 +124,8 @@ interface MockTx {
   /** Block the node has it in; null while in the mempool. */
   height: number | null;
   coinbase: boolean;
+  /** Set for payments this wallet sent: who was paid how much (a fee bump keeps both). */
+  payment?: { to: string; amount: number };
 }
 
 interface Wallet {
@@ -124,6 +140,10 @@ interface Wallet {
   seen: Set<string>;
   revealed: Record<Keychain, number>;
   unlocked: boolean;
+  /** The address book (`btcw_contacts`), sorted by name ignoring case. */
+  contacts: Contact[];
+  /** `btcw_labels`: txid → label. */
+  labels: Map<string, string>;
 }
 
 interface Chain {
@@ -134,6 +154,8 @@ interface Chain {
   minedTimes: Map<number, number>;
   txs: MockTx[];
   wallet: Wallet | null;
+  /** Transactions replaced by a fee bump (gone from the node's mempool): old txid → new txid. */
+  replaced: Map<string, string>;
 }
 
 interface Pending {
@@ -143,6 +165,8 @@ interface Pending {
   preview: PreparedSend["preview"];
   inputs: Output[];
   change: Output | null;
+  /** A fee bump: the txid it replaces. Its change output is the original's (not a new address). */
+  replaces: string | null;
 }
 
 const nowSecs = () => Math.floor(Date.now() / 1000);
@@ -189,7 +213,16 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     let chain = chains.get(network);
     if (!chain) {
       const tip = START_TIP[network];
-      chain = { network, tip, anchorTip: tip, anchorTime: nowSecs() - 240, minedTimes: new Map(), txs: [], wallet: null };
+      chain = {
+        network,
+        tip,
+        anchorTip: tip,
+        anchorTime: nowSecs() - 240,
+        minedTimes: new Map(),
+        txs: [],
+        wallet: null,
+        replaced: new Map(),
+      };
       chains.set(network, chain);
     }
     return chain;
@@ -417,16 +450,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
   /** P2WPKH sizes: 10.5 vB overhead + 68 per input + 31 per output (141 vB for 1-in-2-out). */
   const vbytes = (inputs: number, outputs: number) => Math.ceil(10.5 + 68 * inputs + 31 * outputs);
 
-  function prepare(to: string, amountSat: number, feeRate: number | null): PreparedSend {
-    const { chain, wallet } = requireWallet();
-    requireUnlocked(wallet);
-    const address = checkAddress(to, chain.network);
-    if (!Number.isSafeInteger(amountSat) || amountSat <= 0) {
-      throw fail("tx_build", "could not build transaction: the amount must be a whole number of satoshis above zero");
-    }
-    if (amountSat < DUST_LIMIT_SAT) {
-      throw fail("dust_amount", `amount ${formatBtc(amountSat)} BTC is below the dust limit`);
-    }
+  function checkFeeRate(feeRate: number | null): void {
     if (feeRate !== null && !(Number.isFinite(feeRate) && feeRate > 0)) {
       throw fail("tx_build", "could not build transaction: the fee rate must be a positive number of sat/vB");
     }
@@ -436,8 +460,33 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     if (feeRate !== null && feeRate > 25_000) {
       throw fail("tx_build", `could not build transaction: fee rate ${feeRate} sat/vB is above the 25000 sat/vB safety limit`);
     }
+  }
+
+  function prepare(to: string, amountSat: number, feeRate: number | null): PreparedSend {
+    const { chain, wallet } = requireWallet();
+    requireUnlocked(wallet);
+    // An address is checked at once; a name (anything not address-like) after the cheap checks,
+    // like the bridge, which needs the wallet file for it.
+    let typed: string | null = null;
+    try {
+      typed = checkAddress(to, chain.network);
+    } catch (e) {
+      if ((e as ApiError).code !== "invalid_address" || to.trim() === "" || looksLikeAddress(to)) throw e;
+    }
+    if (!Number.isSafeInteger(amountSat) || amountSat <= 0) {
+      throw fail("tx_build", "could not build transaction: the amount must be a whole number of satoshis above zero");
+    }
+    if (typed !== null && amountSat < DUST_LIMIT_SAT) {
+      throw fail("dust_amount", `amount ${formatBtc(amountSat)} BTC is below the dust limit`);
+    }
+    checkFeeRate(feeRate);
     // One prepared payment at a time: this one replaces any earlier preview.
     for (const id of [...pending.keys()]) release(id);
+    const recipient = typed !== null ? { address: typed, contact: null } : resolveRecipient(chain, wallet, to);
+    const address = recipient.address;
+    if (amountSat < DUST_LIMIT_SAT) {
+      throw fail("dust_amount", `amount ${formatBtc(amountSat)} BTC is below the dust limit`);
+    }
     requireNode();
     applySync(chain, wallet); // spend from fresh UTXO state, like the core's send flow
     const rate = feeRate ?? defaultFeeRate;
@@ -465,12 +514,12 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
           index: changeIndex,
           address: addressOf(chain, wallet, "internal", changeIndex),
         };
-        return remember(chain, address, amountSat, feeWithChange, vbytes(inputs.length, 2), inputs, change);
+        return remember(chain, address, recipient.contact, amountSat, feeWithChange, vbytes(inputs.length, 2), inputs, change);
       }
       // Change would be dust: drop it and let the miner have the remainder (BDK does the same).
       const feeNoChange = Math.ceil(vbytes(inputs.length, 1) * rate);
       if (inSum >= amountSat + feeNoChange) {
-        return remember(chain, address, amountSat, inSum - amountSat, vbytes(inputs.length, 1), inputs, null);
+        return remember(chain, address, recipient.contact, amountSat, inSum - amountSat, vbytes(inputs.length, 1), inputs, null);
       }
     }
     const available = spendable.reduce((sum, out) => sum + out.value, 0);
@@ -478,7 +527,17 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     throw fail("insufficient_funds", `insufficient funds: need ${formatBtc(needed)} BTC, available ${formatBtc(available)} BTC`);
   }
 
-  function remember(chain: Chain, to: string, amount: number, fee: number, vsize: number, inputs: Output[], change: Output | null): PreparedSend {
+  function remember(
+    chain: Chain,
+    to: string,
+    contact: string | null,
+    amount: number,
+    fee: number,
+    vsize: number,
+    inputs: Output[],
+    change: Output | null,
+    replaces: string | null = null,
+  ): PreparedSend {
     const id = hex(randomBytes(16));
     const preview = {
       to,
@@ -488,10 +547,10 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       vsize,
       change_sat: change ? change.value : null,
       total_sat: amount + fee,
-      contact: null,
-      replaces: null,
+      contact,
+      replaces,
     };
-    pending.set(id, { network: chain.network, created: Date.now(), preview, inputs, change });
+    pending.set(id, { network: chain.network, created: Date.now(), preview, inputs, change, replaces });
     return { id, preview };
   }
 
@@ -500,8 +559,9 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
     if (!entry) return;
     pending.delete(id);
     const wallet = chainFor(entry.network).wallet;
-    // `tx::cancel`: un-reveal the change address if nothing was revealed after it.
-    if (entry.change && wallet && wallet.revealed.internal === entry.change.index + 1) {
+    // `tx::cancel`: un-reveal the change address if nothing was revealed after it. A fee bump's
+    // change address is the original's, which was paid: nothing to give back.
+    if (entry.change && !entry.replaces && wallet && wallet.revealed.internal === entry.change.index + 1) {
       wallet.revealed.internal -= 1;
     }
   }
@@ -525,6 +585,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       release(id);
       requireNode();
     }
+    if (entry.replaces) return confirmBump(chain, wallet, id, entry, entry.replaces);
     const spent = new Set(visibleTxs(chain, wallet).flatMap((tx) => tx.spends));
     if (entry.inputs.some((input) => spent.has(input.outpoint))) {
       release(id);
@@ -541,10 +602,169 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       firstSeen: nowSecs(),
       height: null,
       coinbase: false,
+      payment: { to: entry.preview.to, amount: entry.preview.amount_sat },
     });
     wallet.seen.add(txid); // `tx::record_broadcast`
     pending.delete(id);
     return { txid };
+  }
+
+  // --- speed up (fee bump) ---------------------------------------------------------------------
+
+  const ceilCents = (satVb: number) => Math.ceil(satVb * 100 - 1e-9) / 100;
+
+  function parseTxid(txid: string): string {
+    const text = txid.trim();
+    if (!/^[0-9a-fA-F]{64}$/.test(text)) {
+      throw fail("tx_not_found", `transaction not found: \`${txid.slice(0, 80)}\` is not a transaction id`);
+    }
+    return text.toLowerCase();
+  }
+
+  /** `tx::bump_target`: why `txid` can't be replaced, or what replacing it takes. */
+  function bumpTarget(chain: Chain, wallet: Wallet, txid: string) {
+    const refuse = (why: string) => fail("tx_build", `could not build transaction: cannot speed up ${txid}: ${why}`);
+    const tx = visibleTxs(chain, wallet).find((t) => t.txid === txid);
+    if (!tx) {
+      if (chain.replaced.has(txid)) throw refuse("it was replaced by another transaction or dropped from the mempool");
+      throw fail("tx_not_found", `transaction not found: ${txid}`);
+    }
+    const status = statusOf(chain, wallet, tx);
+    if (status.state === "confirmed") {
+      throw refuse(`it is already confirmed (block ${status.height}); only an unconfirmed payment can be replaced`);
+    }
+    if (!tx.payment || tx.feeSat === null || tx.spends.length === 0) {
+      throw refuse("it was not sent by this wallet (it spends none of this wallet's coins), so only its sender can replace it");
+    }
+    const outs = new Set(tx.outputs.map((o) => o.outpoint));
+    const child = visibleTxs(chain, wallet).find((t) => t.spends.some((s) => outs.has(s)));
+    if (child) throw refuse(`payment ${child.txid} spends one of its outputs, and replacing ${txid} would cancel that payment too`);
+    const vsize = vbytes(tx.spends.length, tx.outputs.length + 1);
+    const oldRate = Math.floor((tx.feeSat / vsize) * 100) / 100;
+    // BDK: old rate + 1 sat/vB; BIP125 rule 4: old fee + 1 sat/vB × size.
+    const min = ceilCents(Math.max(oldRate + 1, (tx.feeSat + vsize) / vsize));
+    return { tx, payment: tx.payment, oldFee: tx.feeSat, oldRate, vsize, min };
+  }
+
+  function prepareBump(rawTxid: string, feeRate: number | null): PreparedSend {
+    const { chain, wallet } = requireWallet();
+    requireUnlocked(wallet);
+    const txid = parseTxid(rawTxid);
+    checkFeeRate(feeRate);
+    for (const id of [...pending.keys()]) release(id);
+    bumpTarget(chain, wallet, txid); // refused from the wallet before the node is asked
+    requireNode();
+    applySync(chain, wallet);
+    const target = bumpTarget(chain, wallet, txid);
+    const rate = feeRate ?? Math.max(defaultFeeRate, Math.ceil(target.min));
+    if (rate < target.min) {
+      throw fail(
+        "tx_build",
+        `could not build transaction: cannot speed up ${txid}: a fee rate of ${rate} sat/vB is too low; it pays ${target.oldRate.toFixed(2)} sat/vB now, and a replacement must pay at least 1 sat/vB more (BIP125), so at least ${target.min.toFixed(2)} sat/vB`,
+      );
+    }
+    const fee = Math.ceil(target.vsize * rate);
+    const extra = fee - target.oldFee;
+    const change = target.tx.outputs.find((o) => o.keychain === "internal") ?? null;
+    if (!change || change.value - extra < DUST_LIMIT_SAT) {
+      throw fail(
+        "insufficient_funds",
+        `insufficient funds: need ${formatBtc(extra)} BTC more for the fee, available ${formatBtc(change?.value ?? 0)} BTC`,
+      );
+    }
+    const allOutputs = chain.txs.flatMap((t) => t.outputs);
+    const inputs = target.tx.spends.map((op) => allOutputs.find((o) => o.outpoint === op)).filter((o): o is Output => !!o);
+    const newChange: Output = { ...change, outpoint: "", value: change.value - extra };
+    return remember(chain, target.payment.to, null, target.payment.amount, fee, target.vsize, inputs, newChange, txid);
+  }
+
+  function confirmBump(chain: Chain, wallet: Wallet, id: string, entry: Pending, replaces: string): { txid: string } {
+    // Like the bridge: sync, then check the original can still be replaced.
+    applySync(chain, wallet);
+    let target: ReturnType<typeof bumpTarget>;
+    try {
+      target = bumpTarget(chain, wallet, replaces);
+    } catch (e) {
+      release(id);
+      throw e;
+    }
+    const txid = hex(randomBytes(32));
+    const outputs = entry.change ? [{ ...entry.change, outpoint: `${txid}:1` }] : [];
+    // The node drops the original from its mempool; the wallet shows only the replacement.
+    chain.txs = chain.txs.filter((t) => t !== target.tx);
+    chain.replaced.set(replaces, txid);
+    wallet.seen.delete(replaces);
+    chain.txs.push({
+      txid,
+      spends: [...target.tx.spends],
+      sentSat: target.tx.sentSat,
+      outputs,
+      feeSat: entry.preview.fee_sat,
+      firstSeen: nowSecs(),
+      height: null,
+      coinbase: false,
+      payment: { ...target.payment },
+    });
+    wallet.seen.add(txid);
+    const label = wallet.labels.get(replaces);
+    if (label !== undefined && !wallet.labels.has(txid)) wallet.labels.set(txid, label);
+    pending.delete(id);
+    return { txid };
+  }
+
+  // --- address book and labels -----------------------------------------------------------------
+
+  /** `book::checked_text`: trimmed, not empty, at most `max` characters, no control characters. */
+  function checkedText(what: string, text: string, max: number): string {
+    const t = text.trim();
+    const chars = [...t].length;
+    if (chars === 0) throw fail("contact", `${what} can't be empty`);
+    if (chars > max) throw fail("contact", `${what} can be at most ${max} characters (this one has ${chars})`);
+    if (/[\u0000-\u001f\u007f-\u009f]/.test(t)) {
+      throw fail("contact", `${what} can't contain control characters such as line breaks or tabs`);
+    }
+    return t;
+  }
+
+  function contactName(name: string): string {
+    const text = checkedText("a contact name", name, MAX_NAME_CHARS);
+    if (looksLikeAddress(text)) {
+      throw fail(
+        "contact",
+        `\`${text}\` looks like a Bitcoin address, so it can't be a contact name (a recipient must always be clearly one or the other)`,
+      );
+    }
+    return text;
+  }
+
+  const findContact = (wallet: Wallet, name: string) =>
+    wallet.contacts.find((c) => c.name.toLowerCase() === name.trim().toLowerCase());
+
+  function existingContact(wallet: Wallet, name: string): Contact {
+    const found = findContact(wallet, name);
+    if (!found) throw fail("contact", `no contact is named \`${name.trim().slice(0, MAX_NAME_CHARS)}\``);
+    return found;
+  }
+
+  function sortContacts(wallet: Wallet): void {
+    wallet.contacts.sort((a, b) => {
+      const x = a.name.toLowerCase();
+      const y = b.name.toLowerCase();
+      return x < y ? -1 : x > y ? 1 : a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+    });
+  }
+
+  /** `WalletService::resolve_recipient`: an address first, then (if not address-like) a name. */
+  function resolveRecipient(chain: Chain, wallet: Wallet, input: string): { address: string; contact: string | null } {
+    const text = input.trim();
+    try {
+      return { address: checkAddress(text, chain.network), contact: null };
+    } catch (e) {
+      if ((e as ApiError).code !== "invalid_address" || text === "" || looksLikeAddress(text)) throw e;
+    }
+    const found = findContact(wallet, text);
+    if (!found) throw fail("contact", `no contact is named \`${text}\`, and it is not a valid address either`);
+    return { address: checkAddress(found.address, chain.network), contact: found.name };
   }
 
   // --- views -----------------------------------------------------------------------------------
@@ -570,7 +790,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         net_sat: received - tx.sentSat,
         fee_sat: tx.feeSat,
         status: statusOf(chain, wallet, tx),
-        label: null,
+        label: wallet.labels.get(tx.txid) ?? null,
       };
     });
     // PLAN §5.7: unconfirmed first (latest seen first), then by height, newest first.
@@ -626,6 +846,8 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
           seen: new Set(),
           revealed: { external: 0, internal: 0 },
           unlocked: true,
+          contacts: [],
+          labels: new Map(),
         };
         return { mnemonic };
       }, latency * 4),
@@ -652,6 +874,8 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
           seen: new Set(),
           revealed: { external: 0, internal: 0 },
           unlocked: true,
+          contacts: [],
+          labels: new Map(),
         };
         chain.wallet = wallet;
         seedHistory(chain, wallet);
@@ -749,6 +973,72 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         if (nodeOnline) applySync(chain, wallet);
         const tx = visibleTxs(chain, wallet).find((t) => t.txid === txid);
         return tx ? statusOf(chain, wallet, tx) : null;
+      }),
+
+    minFeeBumpRate: (txid) =>
+      answer(() => {
+        const { chain, wallet } = requireWallet();
+        return bumpTarget(chain, wallet, parseTxid(txid)).min;
+      }),
+    prepareFeeBump: (txid, feeRate) => answer(() => prepareBump(txid, feeRate), latency),
+
+    listContacts: () =>
+      answer((): Contact[] => {
+        const { wallet } = requireWallet();
+        return wallet.contacts;
+      }),
+
+    addContact: (name, address, note) =>
+      answer((): Contact => {
+        const { chain, wallet } = requireWallet();
+        const canonical = checkAddress(address, chain.network);
+        const clean = contactName(name);
+        const cleanNote = note === null || note.trim() === "" ? null : checkedText("a note", note, MAX_NOTE_CHARS);
+        const existing = findContact(wallet, clean);
+        if (existing) throw fail("contact", `a contact named \`${existing.name}\` already exists`);
+        const contact = { name: clean, address: canonical, note: cleanNote };
+        wallet.contacts.push(contact);
+        sortContacts(wallet);
+        return contact;
+      }),
+
+    removeContact: (name) =>
+      answer((): Contact => {
+        const { wallet } = requireWallet();
+        const contact = existingContact(wallet, name);
+        wallet.contacts = wallet.contacts.filter((c) => c !== contact);
+        return contact;
+      }),
+
+    renameContact: (oldName, newName) =>
+      answer((): Contact => {
+        const { wallet } = requireWallet();
+        const contact = existingContact(wallet, oldName);
+        const clean = contactName(newName);
+        const other = findContact(wallet, clean);
+        if (other && other !== contact) throw fail("contact", `a contact named \`${other.name}\` already exists`);
+        contact.name = clean;
+        sortContacts(wallet);
+        return contact;
+      }),
+
+    setLabel: (txid, label) =>
+      answer((): string => {
+        const { chain, wallet } = requireWallet();
+        const id = parseTxid(txid);
+        const text = checkedText("a label", label, MAX_LABEL_CHARS);
+        if (!visibleTxs(chain, wallet).some((t) => t.txid === id)) throw fail("tx_not_found", `transaction not found: ${id}`);
+        wallet.labels.set(id, text);
+        return text;
+      }),
+
+    clearLabel: (txid) =>
+      answer(() => {
+        const { chain, wallet } = requireWallet();
+        const id = parseTxid(txid);
+        if (!wallet.labels.delete(id) && !visibleTxs(chain, wallet).some((t) => t.txid === id)) {
+          throw fail("tx_not_found", `transaction not found: ${id}`);
+        }
       }),
 
     getSettings: () => answer(() => settings),
@@ -850,6 +1140,19 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       miner = null;
     },
   };
+}
+
+/**
+ * `book::looks_like_address`: an address on any network, or an attempt at one (a SegWit prefix,
+ * or longer than a contact name can be). Such input is never looked up as a contact's name.
+ */
+export function looksLikeAddress(input: string): boolean {
+  const text = input.trim();
+  const lower = text.toLowerCase();
+  if (SEGWIT_PREFIXES.some((prefix) => lower.startsWith(prefix))) return true;
+  if ([...text].length > MAX_NAME_CHARS) return true;
+  if (typeof decodeSegwit(text) !== "string") return true;
+  return /^[1-9A-HJ-NP-Za-km-z]{25,34}$/.test(text) && /^[13mn2]/.test(text);
 }
 
 /** `count` distinct positions in 1..=total, ascending, from the OS RNG without modulo bias. */

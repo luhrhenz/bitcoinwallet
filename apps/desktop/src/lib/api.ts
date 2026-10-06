@@ -12,6 +12,7 @@ import type {
   AddressRow,
   AppInfo,
   BalanceView,
+  Contact,
   PreparedSend,
   Settings,
   SyncProgress,
@@ -41,10 +42,35 @@ export interface WalletApi {
   history(): Promise<TxRow[]>;
   utxos(): Promise<UtxoRow[]>;
 
+  /** `to` is an address or a contact's name; the preview's `to` is always the full address. */
   prepareSend(to: string, amountSat: number, feeRateSatVb: number | null): Promise<PreparedSend>;
+  /** Sends a prepared payment or fee bump (the same single slot). */
   confirmSend(id: string): Promise<{ txid: string }>;
   cancelSend(id: string): Promise<void>;
   txStatus(txid: string): Promise<TxStatus | null>;
+
+  /**
+   * "Speed up": the lowest fee rate (sat/vB, rounded up to the hundredth) that can replace the
+   * wallet's unconfirmed payment `txid`. Rejects with the reason when it can't be replaced.
+   * Watch-only.
+   */
+  minFeeBumpRate(txid: string): Promise<number>;
+  /**
+   * Build the replacement of `txid` and keep it like a prepared payment (same slot, expiry,
+   * `confirmSend` / `cancelSend`); `preview.replaces` is `txid`. Needs the wallet unlocked.
+   * `null` = the node's estimate, raised to the minimum.
+   */
+  prepareFeeBump(txid: string, feeRateSatVb: number | null): Promise<PreparedSend>;
+
+  // Address book and labels: watch-only (no password), and count as user activity.
+  listContacts(): Promise<Contact[]>;
+  addContact(name: string, address: string, note: string | null): Promise<Contact>;
+  /** Returns the contact that was removed. */
+  removeContact(name: string): Promise<Contact>;
+  renameContact(oldName: string, newName: string): Promise<Contact>;
+  /** Returns the label as stored (trimmed). `tx_not_found` for a transaction not in the wallet. */
+  setLabel(txid: string, label: string): Promise<string>;
+  clearLabel(txid: string): Promise<void>;
 
   getSettings(): Promise<Settings>;
   setSettings(s: Settings): Promise<void>;
@@ -87,6 +113,16 @@ export const tauriApi: WalletApi = {
   confirmSend: (id) => invoke("confirm_send", { id }),
   cancelSend: (id) => invoke("cancel_send", { id }),
   txStatus: (txid) => invoke("tx_status", { txid }),
+
+  minFeeBumpRate: (txid) => invoke("min_fee_bump_rate", { txid }),
+  prepareFeeBump: (txid, feeRateSatVb) => invoke("prepare_fee_bump", { txid, feeRateSatVb }),
+
+  listContacts: () => invoke("list_contacts"),
+  addContact: (name, address, note) => invoke("add_contact", { name, address, note }),
+  removeContact: (name) => invoke("remove_contact", { name }),
+  renameContact: (oldName, newName) => invoke("rename_contact", { old: oldName, new: newName }),
+  setLabel: (txid, label) => invoke("set_label", { txid, label }),
+  clearLabel: (txid) => invoke("clear_label", { txid }),
 
   getSettings: () => invoke("get_settings"),
   setSettings: (settings) => invoke("set_settings", { settings }),

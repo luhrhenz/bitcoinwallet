@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use btcw_core::bitcoin::{Network, Psbt};
+use btcw_core::bitcoin::{Network, Psbt, Txid};
 use btcw_core::config::{self, Config};
 use btcw_core::keys::Signer;
 
@@ -220,6 +220,10 @@ pub(crate) struct PendingSend {
     pub network: Network,
     pub psbt: Psbt,
     pub created: Instant,
+    /// A fee bump ("Speed up"): the unconfirmed payment this one replaces. `confirm_send`
+    /// checks a bump with `tx::check_prepared_bump` instead of `tx::check_prepared`, which would
+    /// refuse it (the original already spends the same coins and paid the same change address).
+    pub replaces: Option<Txid>,
 }
 
 impl std::fmt::Debug for Session {

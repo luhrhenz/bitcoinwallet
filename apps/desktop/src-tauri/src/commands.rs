@@ -13,7 +13,11 @@
 //!   are used once and dropped. The PSBT of a prepared payment stays in the session
 //!   (`state.rs`) behind a random id; the UI gets the preview only.
 //! - **Cheap checks first**: an address typo or a dust amount is reported before the wallet is
-//!   opened, the node is contacted or Argon2 runs, as the CLI does.
+//!   opened, the node is contacted or Argon2 runs, as the CLI does. A contact name (which only
+//!   the wallet file can resolve) is looked up right after opening the wallet, still before the
+//!   node.
+//! - **Wallet edits are watch-only**: contacts and labels need no password, and count as user
+//!   activity for the auto-lock. Sending and speeding up a payment need the signer.
 
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex, TryLockError};
@@ -22,12 +26,14 @@ use std::time::Duration;
 use btcw_core::WalletError;
 use btcw_core::api::{self, CreatedWallet, Unlocked};
 use btcw_core::bitcoin::{Amount, FeeRate, Psbt, Txid};
+use btcw_core::book;
 use btcw_core::chain::Node;
 use btcw_core::config::{self, Config};
 use btcw_core::keys::{Mnemonic, WordCount};
 use btcw_core::tx;
 use btcw_core::types::{
-    AddressRow, BalanceView, SendPreview, SyncProgress, SyncReport, TxRow, TxStatus, UtxoRow,
+    AddressRow, BalanceView, Contact, SendPreview, SyncProgress, SyncReport, TxRow, TxStatus,
+    UtxoRow,
 };
 use btcw_core::wallet::WalletService;
 use secrecy::{ExposeSecret as _, SecretString};
@@ -303,6 +309,9 @@ pub fn sync(state: &AppState, on_progress: &mut dyn FnMut(SyncProgress)) -> ApiR
 
 /// "Review": sync, build the unsigned PSBT, keep it here, return its preview and an id.
 /// Needs the wallet unlocked (`locked` otherwise). A new preview replaces any earlier one.
+///
+/// `to` is an address or a contact's name (`WalletService::resolve_recipient`, as in `btcw send`).
+/// The preview's `to` is always the full address; `contact` is the name, if one was typed.
 pub fn prepare_send(
     state: &AppState,
     to: &str,
@@ -314,8 +323,22 @@ pub fn prepare_send(
         return Err(ApiError::locked());
     }
     // The checks `build_psbt` makes, before the wallet lock, the node and the sync.
-    let address = tx::parse_address(to, cfg.network)?;
-    tx::check_amount(&address, Amount::from_sat(amount_sat))?;
+    let amount = Amount::from_sat(amount_sat);
+    let typed_address = match tx::parse_address(to, cfg.network) {
+        Ok(address) => Some(address),
+        // Not an address and doesn't look like one: maybe a contact's name, which needs the
+        // wallet file. Anything address-like keeps its address error (a mistyped address must
+        // never resolve to a contact).
+        Err(WalletError::InvalidAddress(_))
+            if !to.trim().is_empty() && !book::looks_like_address(to) =>
+        {
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(address) = &typed_address {
+        tx::check_amount(address, amount)?;
+    }
     let fee_rate = fee_rate_sat_vb.map(fee_rate_from_sat_vb).transpose()?;
     if let Some(rate) = fee_rate {
         tx::check_fee_rate(rate)?;
@@ -328,6 +351,12 @@ pub fn prepare_send(
             && previous.network == cfg.network
         {
             tx::cancel(wallet, &previous.psbt);
+        }
+        // A name: an unknown one (`contact`) or a dust amount for its address is reported
+        // before the node is contacted, like a typo in an address.
+        if typed_address.is_none() {
+            let recipient = wallet.resolve_recipient(to)?;
+            tx::check_amount(&recipient.address, amount)?;
         }
         let node = Node::connect(&cfg.rpc, cfg.network)?;
         // Coin selection must see the coins as they are now.
@@ -354,6 +383,7 @@ pub fn prepare_send(
         network: cfg.network,
         psbt,
         created: state.now(),
+        replaces: None,
     });
     Ok(PreparedSend { id, preview })
 }
@@ -389,18 +419,30 @@ pub fn confirm_send(state: &AppState, id: &str) -> ApiResult<SentTx> {
     }
 
     let mut psbt = pending.psbt;
+    let replaces = pending.replaces;
     let txid = with_wallet(state, &cfg, |wallet| {
         // The wallet was closed while the preview was on screen: `btcw send` may have spent
         // these coins or used this change address since. Don't sign a stale payment.
-        if let Err(e) = tx::check_prepared(wallet, &psbt) {
-            release(wallet, &psbt);
-            return Err(e.into());
-        }
-        let node = match Node::connect(&cfg.rpc, cfg.network) {
+        let checked = match replaces {
+            None => tx::check_prepared(wallet, &psbt)
+                .map_err(ApiError::from)
+                .and_then(|()| Ok(Node::connect(&cfg.rpc, cfg.network)?)),
+            // A fee bump spends coins the original already spends, by design, so the plain
+            // check would refuse it. Sync first: the original may have confirmed (or been
+            // replaced) since the preview, and then the replacement must not be signed.
+            Some(original) => Node::connect(&cfg.rpc, cfg.network)
+                .and_then(|node| {
+                    node.sync(wallet, &mut |_| {})?;
+                    tx::check_prepared_bump(wallet, &psbt, original)?;
+                    Ok(node)
+                })
+                .map_err(ApiError::from),
+        };
+        let node = match checked {
             Ok(node) => node,
             Err(e) => {
                 release(wallet, &psbt);
-                return Err(e.into());
+                return Err(e);
             }
         };
         // This is `tx::complete_send` in its two halves: sign while holding the session (so a
@@ -448,14 +490,140 @@ pub fn cancel_send(state: &AppState, id: &str) -> ApiResult<()> {
     Ok(())
 }
 
+// ── Speed up (fee bump, RBF) ────────────────────────────────────────────────────────────────
+
+/// The lowest fee rate, in sat/vB, that can replace the unconfirmed payment `txid`, rounded up
+/// to the next hundredth so that the number shown (and typed back) is always enough. Fails, with
+/// the reason, when `txid` can't be sped up at all (`tx_not_found`, `tx_build`). Watch-only; no
+/// node: it answers from the last sync (`tx_status` keeps that fresh on the transaction screen).
+pub fn min_fee_bump_rate(state: &AppState, txid: &str) -> ApiResult<f64> {
+    let cfg = state.begin(Activity::User)?;
+    let txid = parse_txid(txid)?;
+    let rate = with_wallet(state, &cfg, |wallet| {
+        Ok(tx::min_fee_bump_rate(wallet, txid)?)
+    })?;
+    Ok(sat_vb_rounded_up(rate))
+}
+
+/// "Speed up" → review: sync, build the unsigned replacement for `txid`, keep it here like a
+/// prepared payment (same single slot, same 10-minute expiry, same `confirm_send` /
+/// `cancel_send`), and return its preview, whose `replaces` is `txid`. Needs the wallet unlocked.
+/// `fee_rate_sat_vb: None` means the node's estimate, raised to the minimum when it is lower.
+pub fn prepare_fee_bump(
+    state: &AppState,
+    txid: &str,
+    fee_rate_sat_vb: Option<f64>,
+) -> ApiResult<PreparedSend> {
+    let cfg = state.begin(Activity::User)?;
+    if !state.session().is_unlocked_for(cfg.network) {
+        return Err(ApiError::locked());
+    }
+    let original = parse_txid(txid)?;
+    let fee_rate = fee_rate_sat_vb.map(fee_rate_from_sat_vb).transpose()?;
+    if let Some(rate) = fee_rate {
+        tx::check_fee_rate(rate)?;
+    }
+
+    // One prepared payment at a time, bump or not: this one replaces (cancels) the last.
+    let previous = state.session().take_any_pending();
+    let (psbt, preview) = with_wallet(state, &cfg, |wallet| {
+        if let Some(previous) = &previous
+            && previous.network == cfg.network
+        {
+            tx::cancel(wallet, &previous.psbt);
+        }
+        // An unknown, confirmed or incoming transaction is refused before the node is asked.
+        tx::min_fee_bump_rate(wallet, original)?;
+        let node = Node::connect(&cfg.rpc, cfg.network)?;
+        // A payment that confirmed meanwhile can't be replaced; coin selection (if the change
+        // can't cover the extra fee) must see the coins as they are now.
+        node.sync(wallet, &mut |_| {})?;
+        let (psbt, preview) = tx::prepare_fee_bump(wallet, &node, original, fee_rate)?;
+        // Saved for the reopened wallet that signs, as in `prepare_send` (a replacement of a
+        // payment without change gets a fresh change address).
+        if let Err(e) = wallet.persist() {
+            tx::cancel(wallet, &psbt);
+            return Err(e.into());
+        }
+        Ok((psbt, preview))
+    })?;
+    drop(previous);
+
+    let id = random_id()?;
+    let mut session = state.session();
+    if !session.is_unlocked_for(cfg.network) {
+        return Err(ApiError::locked());
+    }
+    session.set_pending(PendingSend {
+        id: id.clone(),
+        network: cfg.network,
+        psbt,
+        created: state.now(),
+        replaces: Some(original),
+    });
+    Ok(PreparedSend { id, preview })
+}
+
+// ── Address book and labels (watch-only) ────────────────────────────────────────────────────
+
+/// Every contact, sorted by name (ignoring case).
+pub fn list_contacts(state: &AppState) -> ApiResult<Vec<Contact>> {
+    let cfg = state.begin(Activity::Background)?;
+    with_wallet(state, &cfg, |wallet| Ok(wallet.contacts()?))
+}
+
+/// Save a contact. The address must be valid for the active network (`invalid_address`,
+/// `network_mismatch`); the name and note follow the core's rules (`contact`).
+pub fn add_contact(
+    state: &AppState,
+    name: &str,
+    address: &str,
+    note: Option<&str>,
+) -> ApiResult<Contact> {
+    let cfg = state.begin(Activity::User)?;
+    // An address typo is reported without opening the wallet.
+    tx::parse_address(address, cfg.network)?;
+    with_wallet(state, &cfg, |wallet| {
+        Ok(wallet.add_contact(name, address, note)?)
+    })
+}
+
+/// Delete a contact (name matched ignoring case); returns what was removed.
+pub fn remove_contact(state: &AppState, name: &str) -> ApiResult<Contact> {
+    let cfg = state.begin(Activity::User)?;
+    with_wallet(state, &cfg, |wallet| Ok(wallet.remove_contact(name)?))
+}
+
+/// Rename a contact (`old` matched ignoring case); returns it under its new name.
+pub fn rename_contact(state: &AppState, old: &str, new: &str) -> ApiResult<Contact> {
+    let cfg = state.begin(Activity::User)?;
+    with_wallet(state, &cfg, |wallet| Ok(wallet.rename_contact(old, new)?))
+}
+
+/// Label one of the wallet's transactions (`tx_not_found` for any other txid), replacing any
+/// earlier label. Returns the label as stored (trimmed).
+pub fn set_label(state: &AppState, txid: &str, label: &str) -> ApiResult<String> {
+    let cfg = state.begin(Activity::User)?;
+    let txid = parse_txid(txid)?;
+    with_wallet(state, &cfg, |wallet| Ok(wallet.set_label(txid, label)?))
+}
+
+/// Remove a transaction's label. Fine if it had none; `tx_not_found` for a txid the wallet
+/// doesn't know.
+pub fn clear_label(state: &AppState, txid: &str) -> ApiResult<()> {
+    let cfg = state.begin(Activity::User)?;
+    let txid = parse_txid(txid)?;
+    with_wallet(state, &cfg, |wallet| {
+        wallet.clear_label(txid)?;
+        Ok(())
+    })
+}
+
 /// Status of one of the wallet's transactions: syncs first when the node answers, otherwise
 /// answers from the last sync. `null` if the wallet doesn't know the transaction.
 pub fn tx_status(state: &AppState, txid: &str) -> ApiResult<Option<TxStatus>> {
     let cfg = state.begin(Activity::Background)?;
-    let txid = Txid::from_str(txid.trim()).map_err(|_| {
-        let shown: String = txid.chars().take(MAX_ECHOED_INPUT).collect();
-        WalletError::TxNotFound(format!("`{shown}` is not a transaction id"))
-    })?;
+    let txid = parse_txid(txid)?;
     with_wallet(state, &cfg, |wallet| {
         let synced =
             Node::connect(&cfg.rpc, cfg.network).and_then(|node| node.sync(wallet, &mut |_| {}));
@@ -594,6 +762,23 @@ fn current_tip(cfg: &Config) -> Option<u32> {
             None
         }
     }
+}
+
+/// A txid as typed or passed by the UI; `tx_not_found` if it isn't one (as `btcw status` says).
+fn parse_txid(txid: &str) -> ApiResult<Txid> {
+    Txid::from_str(txid.trim()).map_err(|_| {
+        let shown: String = txid.chars().take(MAX_ECHOED_INPUT).collect();
+        WalletError::TxNotFound(format!("`{shown}` is not a transaction id")).into()
+    })
+}
+
+/// A fee rate as sat/vB for display, rounded *up* to the hundredth (751 sat/kWU = 3.004 sat/vB
+/// → 3.01), like the core's own messages. [`fee_rate_from_sat_vb`] turns it back into at least
+/// the same rate, so the minimum shown is always accepted.
+fn sat_vb_rounded_up(rate: FeeRate) -> f64 {
+    // 1 sat/vB = 250 sat/kWU, so hundredths of a sat/vB = sat/kWU × 2 / 5, rounded up.
+    let hundredths = rate.to_sat_per_kwu().saturating_mul(2).div_ceil(5);
+    hundredths as f64 / 100.0
 }
 
 /// sat/vB as typed (it may have decimals, e.g. 2.5) → BDK's sat per 1000 weight units, rounded

@@ -10,6 +10,7 @@ import { ErrorNotice } from "./components/ErrorNotice";
 import { Frame } from "./components/Frame";
 import { Icon } from "./components/Icon";
 import { MockPanel } from "./components/MockPanel";
+import { Contacts } from "./screens/Contacts";
 import { CreateWallet } from "./screens/CreateWallet";
 import { Dashboard } from "./screens/Dashboard";
 import { History } from "./screens/History";
@@ -108,11 +109,12 @@ function Onboarding({ onFinished }: { onFinished: () => void }) {
   );
 }
 
-const NAV: { name: "dashboard" | "receive" | "send" | "history" | "settings"; label: string }[] = [
+const NAV: { name: "dashboard" | "receive" | "send" | "history" | "contacts" | "settings"; label: string }[] = [
   { name: "dashboard", label: "Overview" },
   { name: "receive", label: "Receive" },
   { name: "send", label: "Send" },
   { name: "history", label: "History" },
+  { name: "contacts", label: "Contacts" },
   { name: "settings", label: "Settings" },
 ];
 
@@ -162,8 +164,9 @@ function Main() {
       <Notices />
       {route.name === "dashboard" && <Dashboard go={go} />}
       {route.name === "receive" && <Receive />}
-      {route.name === "send" && <Send go={go} />}
+      {route.name === "send" && <Send go={go} initialTo={route.to} />}
       {route.name === "history" && <History go={go} />}
+      {route.name === "contacts" && <Contacts go={go} />}
       {route.name === "settings" && <SettingsScreen />}
       {route.name === "tx" && <TxDetail key={route.txid} txid={route.txid} sent={route.sent} go={go} />}
     </Frame>

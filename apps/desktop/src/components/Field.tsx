@@ -1,6 +1,8 @@
-import { useId, type InputHTMLAttributes, type ReactNode } from "react";
+import { useId, type InputHTMLAttributes, type ReactNode, type Ref } from "react";
 
 interface FieldProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "id"> {
+  /** The input element (React 19 passes `ref` to function components as a prop). */
+  ref?: Ref<HTMLInputElement>;
   label: ReactNode;
   hint?: ReactNode;
   error?: string | null;
@@ -14,7 +16,8 @@ export function Field({ label, hint, error, addon, mono, className, ...input }: 
   const id = useId();
   const hintId = hint ? `${id}-hint` : undefined;
   const errorId = error ? `${id}-error` : undefined;
-  const describedBy = [hintId, errorId].filter(Boolean).join(" ") || undefined;
+  const describedBy =
+    [hintId, errorId, input["aria-describedby"]].filter(Boolean).join(" ") || undefined;
   return (
     <div className={`field ${error ? "field--invalid" : ""} ${className ?? ""}`}>
       <label className="field__label" htmlFor={id}>
@@ -25,8 +28,8 @@ export function Field({ label, hint, error, addon, mono, className, ...input }: 
           id={id}
           className={`input ${mono ? "input--mono" : ""}`}
           aria-invalid={error ? true : undefined}
-          aria-describedby={describedBy}
           {...input}
+          aria-describedby={describedBy}
         />
         {addon}
       </div>

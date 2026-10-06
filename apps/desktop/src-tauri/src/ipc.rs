@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use btcw_core::types::{
-    AddressRow, BalanceView, SyncProgress, SyncReport, TxRow, TxStatus, UtxoRow,
+    AddressRow, BalanceView, Contact, SyncProgress, SyncReport, TxRow, TxStatus, UtxoRow,
 };
 use secrecy::SecretString;
 use tauri::{AppHandle, Emitter as _, State};
@@ -154,6 +154,76 @@ pub async fn confirm_send(state: Shared<'_>, id: String) -> ApiResult<SentTx> {
 pub async fn cancel_send(state: Shared<'_>, id: String) -> ApiResult<()> {
     blocking("cancel_send", &state, move |s| {
         commands::cancel_send(s, &id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn min_fee_bump_rate(state: Shared<'_>, txid: String) -> ApiResult<f64> {
+    blocking("min_fee_bump_rate", &state, move |s| {
+        commands::min_fee_bump_rate(s, &txid)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn prepare_fee_bump(
+    state: Shared<'_>,
+    txid: String,
+    fee_rate_sat_vb: Option<f64>,
+) -> ApiResult<PreparedSend> {
+    blocking("prepare_fee_bump", &state, move |s| {
+        commands::prepare_fee_bump(s, &txid, fee_rate_sat_vb)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_contacts(state: Shared<'_>) -> ApiResult<Vec<Contact>> {
+    blocking("list_contacts", &state, commands::list_contacts).await
+}
+
+#[tauri::command]
+pub async fn add_contact(
+    state: Shared<'_>,
+    name: String,
+    address: String,
+    note: Option<String>,
+) -> ApiResult<Contact> {
+    blocking("add_contact", &state, move |s| {
+        commands::add_contact(s, &name, &address, note.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_contact(state: Shared<'_>, name: String) -> ApiResult<Contact> {
+    blocking("remove_contact", &state, move |s| {
+        commands::remove_contact(s, &name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn rename_contact(state: Shared<'_>, old: String, new: String) -> ApiResult<Contact> {
+    blocking("rename_contact", &state, move |s| {
+        commands::rename_contact(s, &old, &new)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_label(state: Shared<'_>, txid: String, label: String) -> ApiResult<String> {
+    blocking("set_label", &state, move |s| {
+        commands::set_label(s, &txid, &label)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn clear_label(state: Shared<'_>, txid: String) -> ApiResult<()> {
+    blocking("clear_label", &state, move |s| {
+        commands::clear_label(s, &txid)
     })
     .await
 }
