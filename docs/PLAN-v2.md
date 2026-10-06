@@ -45,13 +45,20 @@ one agent at a time in its own worktree, the lead reviews every change before it
 becomes the same preview card the Send screen shows. Only the user can confirm it, with a click
 plus their password (or the unlocked session), exactly like a manual send.
 
-- **Provider:** any OpenAI-compatible `chat/completions` endpoint with tool calling. Settings:
-  `base_url`, `model`, `api_key` (optional; Ollama needs none). The default is
-  **Ollama at `http://127.0.0.1:11434/v1`, model `qwen2.5:3b`**, which is free and local. Groq,
-  Gemini and OpenRouter work by changing the URL and key.
+- **Provider:** any OpenAI-compatible `chat/completions` endpoint with tool calling (owner's
+  choice: free cloud tiers, no local model). Settings: `provider` preset, `base_url`, `model`,
+  `api_key`. Presets:
+  - **Groq** (default): `https://api.groq.com/openai/v1`, a tool-capable model such as
+    `llama-3.3-70b-versatile`; free API key from console.groq.com
+  - **Google Gemini**: `https://generativelanguage.googleapis.com/v1beta/openai`, e.g.
+    `gemini-2.5-flash`; free API key from aistudio.google.com
+  - **Custom**: any other OpenAI-compatible URL
+  - The model name is free text with the preset's value pre-filled, since providers rename models.
   - The API key is stored in `desktop.json` (0600). After saving, it is never sent back to the UI,
-    which only learns whether a key is set.
-- **Off by default.** Enabling it shows exactly what is shared and where, local vs cloud.
+    which only learns whether a key is set, and it never appears in logs or error messages.
+- **Off by default.** Enabling it says plainly that balance, history, addresses and contact names
+  go to the chosen provider's cloud, and asks for consent once. Requests use `https` only (TLS via
+  the same rustls stack as the RPC client).
 - **Runs in Rust** (`src-tauri/src/assistant/`), never in the webview. The UI sends the user's
   text and gets back messages and cards.
 - **Tools** (JSON-schema function definitions), all backed by existing core functions:
@@ -74,7 +81,8 @@ plus their password (or the unlocked session), exactly like a manual send.
   - tool outputs are passed as data, with a system prompt telling the model to treat them so
 - **UI:** an "Assistant" screen with a chat thread. Payment and fee-bump cards show the full
   preview with Confirm / Cancel, reusing the Send screen's flow. There's an error state when the
-  provider is unreachable ("start Ollama: `ollama serve`").
+  provider is unreachable or the key is missing or invalid ("add your Groq/Gemini API key in
+  Settings → Assistant"), and a friendly message on free-tier rate limits (HTTP 429).
 - **Tests:** a scripted fake OpenAI server (local TCP) returns tool calls. They prove:
   - read tools return correct data
   - `prepare_payment` creates a pending send but never broadcasts
