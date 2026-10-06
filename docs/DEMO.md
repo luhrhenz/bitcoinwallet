@@ -72,8 +72,10 @@ btcw balance && btcw history
 ## 5. Desktop app on the same wallet (2 min)
 
 ```bash
-cd apps/desktop && npm run tauri dev          # or the prebuilt target/debug/btcw-desktop
+cd apps/desktop && npm run tauri dev          # builds the latest code; first start takes ~1 min
 ```
+Start it **during section 0** in a second terminal (same `export` lines first), so it's already
+open when you get here.
 (Uses the same `BTCW_*` variables, so it opens **the same wallet** you just used in the terminal.)
 - Dashboard: balances, recent transactions, the network badge.
 - Receive: QR code. Send: unlock dialog → preview → confirm → the transaction screen counts
@@ -90,8 +92,14 @@ BTCW_DATADIR=~/btcw-restore btcw restore      # paste the 12 words: same balance
 
 - PRD coverage: all 11 MVP features, plus encrypted seed, backup check, watch-only mode, desktop
   app and testnet4 support (also via a hosted HTTPS node).
-- Quality: 134 Rust tests + 68 UI tests, run in CI against a real regtest node on two Bitcoin Core
-  versions; reorg handling tested; the BIP84 official test vector passes.
+- Quality: **141 Rust tests + 68 UI tests**, run in CI on every push against a real regtest node,
+  on two Bitcoin Core versions (29 and 31). The BIP84 official test vector passes.
+- End-to-end journeys drive the real `btcw` binary: the full money cycle survives restarts;
+  restoring the phrase gives identical history; two wallets pay each other; reorgs in both
+  directions un-confirm and re-confirm payments; the desktop app and CLI share one wallet.
+- Those journeys **found and fixed two real bugs** (good to mention: it shows the testing works):
+  sync failing when the wallet's birthday block was reorged away, and the desktop app being able
+  to send a stale payment that replaced one just made from the terminal.
 - Built in phases with one agent per module and a review gate before every merge; the whole
   journey is written up in `WALKTHROUGH.md`.
 
@@ -103,4 +111,5 @@ BTCW_DATADIR=~/btcw-restore btcw restore      # paste the 12 words: same balance
 | `rpc … connection refused` | `scripts/regtest.sh start` then `eval "$(scripts/regtest.sh env)"` |
 | `wallet is open in another btcw process` | close the desktop app (it and the CLI take turns on a wallet) |
 | Balance still unconfirmed | `scripts/regtest.sh mine 1 && btcw sync` |
+| Desktop app shows `wallet_in_use` | a CLI command is running on the same wallet; wait a second and retry |
 | Immature balance after `btcw mine` | normal: mined coins need 100 confirmations; use `scripts/regtest.sh fund` for spendable coins |
