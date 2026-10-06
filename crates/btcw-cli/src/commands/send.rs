@@ -1,9 +1,12 @@
-//! `btcw send --to ADDR --amount SAT`: build → preview → confirm → sign → broadcast (PLAN §5.8).
+//! `btcw send --to ADDR|NAME --amount SAT`: build → preview → confirm → sign → broadcast
+//! (PLAN §5.8; contact names: PLAN-v2 §1).
 //!
 //! 1. Checks that need neither the password nor the node: `--json` needs `--yes`, the address
 //!    (format and network), the amount (dust), `--fee-rate`, `--psbt-out`, the wallet exists,
 //!    and a terminal to confirm on (unless `--yes`).
-//! 2. Open the wallet **watch-only**: building and previewing a payment needs no secrets.
+//! 2. Open the wallet **watch-only**: building and previewing a payment needs no secrets. A
+//!    `--to` that isn't an address is looked up in the address book here (and the amount checked
+//!    against the contact's address), still before any sync.
 //! 3. `Node::connect` + sync, so coin selection sees the current coins.
 //! 4. `tx::prepare_send`: fee rate (`--fee-rate`, else the node's 6-block estimate), unsigned
 //!    PSBT, preview. The desktop bridge calls the same function.
@@ -25,6 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use btcw_core::WalletError;
 use btcw_core::api;
 use btcw_core::bitcoin::{Amount, FeeRate, Network, Psbt};
+use btcw_core::book;
 use btcw_core::chain::Node;
 use btcw_core::config::Config;
 use btcw_core::tx;
@@ -66,8 +70,21 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
              payment without --json first"
         );
     }
-    let to = tx::parse_address(req.to, cfg.network)?;
-    tx::check_amount(&to, Amount::from_sat(req.amount_sat))?;
+    let value = Amount::from_sat(req.amount_sat);
+    let address = match tx::parse_address(req.to, cfg.network) {
+        Ok(address) => Some(address),
+        // Not an address and doesn't look like one: maybe a contact's name, which needs the
+        // wallet file (step 2). Anything address-like keeps its address error.
+        Err(WalletError::InvalidAddress(_))
+            if !req.to.trim().is_empty() && !book::looks_like_address(req.to) =>
+        {
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(address) = &address {
+        tx::check_amount(address, value)?;
+    }
     let fee_rate = req.fee_rate_sat_vb.map(fee_rate_from_flag).transpose()?;
     if let Some(rate) = fee_rate {
         tx::check_fee_rate(rate)?;
@@ -86,6 +103,10 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
 
     // 2. Watch-only: no password until the user has approved the payment.
     let mut wallet = api::open_watch_only(cfg)?;
+    if address.is_none() {
+        let recipient = wallet.resolve_recipient(req.to)?;
+        tx::check_amount(&recipient.address, value)?;
+    }
 
     // 3. Spend from fresh state: coins that arrived or were spent since the last sync.
     let node = Node::connect(&cfg.rpc, cfg.network)?;
@@ -140,11 +161,14 @@ pub fn run(cfg: &Config, ui: &Ui, req: &Request<'_>) -> Result<()> {
             preview,
         });
     }
+    let to = match &preview.contact {
+        Some(name) => format!("{name} ({})", preview.to),
+        None => preview.to.clone(),
+    };
     ui.println(&format!(
-        "{} Sent {} to {}\nTxid: {}\nIt is waiting in the mempool now; follow it with `btcw status {txid} --watch`.",
+        "{} Sent {} to {to}\nTxid: {}\nIt is waiting in the mempool now; follow it with `btcw status {txid} --watch`.",
         ui.out.badge(cfg.network),
         amount(preview.amount_sat),
-        preview.to,
         ui.out.bold(txid),
     ))
 }
@@ -184,7 +208,7 @@ fn review(
 
 /// `tx::cancel` + persist, for every way out before the broadcast. The persist only saves the
 /// change address BDK revealed (the next payment reuses it), so a failure is just a warning.
-fn release(ui: &Ui, wallet: &mut WalletService, psbt: &Psbt) {
+pub(crate) fn release(ui: &Ui, wallet: &mut WalletService, psbt: &Psbt) {
     tx::cancel(wallet, psbt);
     if let Err(e) = wallet.persist() {
         ui.warn(format_args!(
@@ -203,6 +227,15 @@ fn release(ui: &Ui, wallet: &mut WalletService, psbt: &Psbt) {
 ///   Total     0.00100705 BTC (100,705 sat), amount + fee
 /// ```
 /// The recipient is shown in full, in groups of four, never shortened (see `output::grouped`).
+/// A contact's name gets a line of its own *below* the address, never instead of it, and a fee
+/// bump starts with the payment it replaces:
+/// ```text
+/// [regtest] Fee bump preview
+///   Replaces  3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6
+///   To        bcrt 1q6r z28m cfax tmd6 v789 l9rr lrus dprr 9pz3 cppk
+///   Contact   Alice
+///   ...
+/// ```
 pub fn describe_preview(network: Network, p: &SendPreview, paint: Painter) -> String {
     let width = [
         p.amount_sat,
@@ -228,9 +261,20 @@ pub fn describe_preview(network: Network, p: &SendPreview, paint: Painter) -> St
             "Change"
         ),
     };
-    [
-        format!("{} Payment preview", paint.badge(network)),
-        format!("  {:<10}{}", "To", paint.bold(grouped(&p.to))),
+    let title = if p.replaces.is_some() {
+        "Fee bump preview"
+    } else {
+        "Payment preview"
+    };
+    let mut lines = vec![format!("{} {title}", paint.badge(network))];
+    if let Some(old) = &p.replaces {
+        lines.push(format!("  {:<10}{old}", "Replaces"));
+    }
+    lines.push(format!("  {:<10}{}", "To", paint.bold(grouped(&p.to))));
+    if let Some(name) = &p.contact {
+        lines.push(format!("  {:<10}{name}", "Contact"));
+    }
+    lines.extend([
         line("Amount", p.amount_sat),
         line("Fee", p.fee_sat),
         format!(
@@ -243,12 +287,12 @@ pub fn describe_preview(network: Network, p: &SendPreview, paint: Painter) -> St
         paint
             .bold(format!("{}, amount + fee", line("Total", p.total_sat)))
             .to_string(),
-    ]
-    .join("\n")
+    ]);
+    lines.join("\n")
 }
 
 /// Fees that are probably a mistake: a large share of the amount, or a very high rate.
-fn fee_warnings(p: &SendPreview) -> Vec<String> {
+pub(crate) fn fee_warnings(p: &SendPreview) -> Vec<String> {
     let mut warnings = Vec::new();
     // `fee / amount ≥ 10%` in integers (u128 so nothing can overflow).
     let (fee, amount) = (u128::from(p.fee_sat), u128::from(p.amount_sat));
@@ -269,7 +313,7 @@ fn fee_warnings(p: &SendPreview) -> Vec<String> {
     warnings
 }
 
-fn fee_rate_from_flag(sat_per_vb: u64) -> Result<FeeRate> {
+pub(crate) fn fee_rate_from_flag(sat_per_vb: u64) -> Result<FeeRate> {
     FeeRate::from_sat_per_vb(sat_per_vb)
         .ok_or_else(|| anyhow!("--fee-rate {sat_per_vb} sat/vB is too large"))
 }
@@ -334,6 +378,8 @@ mod tests {
             vsize,
             change_sat,
             total_sat: amount_sat + fee_sat,
+            contact: None,
+            replaces: None,
         }
     }
 
@@ -369,6 +415,38 @@ mod tests {
             text.contains("  Change    none (anything left over"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_contact_and_a_replaced_payment_are_named_but_the_address_stays() {
+        let txid = "3485a59489e4cd7425887ced25fe63f90d33989339dee25ea0675dc1185312d6";
+        let p = SendPreview {
+            contact: Some("Alice".into()),
+            replaces: Some(txid.into()),
+            ..preview(100_000, 705, 141, Some(899_295))
+        };
+        let text = describe_preview(Network::Regtest, &p, Painter::plain());
+        assert!(
+            text.starts_with(&format!(
+                "[regtest] Fee bump preview\n\
+             \x20 Replaces  {txid}\n\
+             \x20 To        bcrt 1q6r z28m cfax tmd6 v789 l9rr lrus dprr 9pz3 cppk\n\
+             \x20 Contact   Alice\n\
+             \x20 Amount    0.00100000 BTC (100,000 sat)\n"
+            )),
+            "{text}"
+        );
+
+        let only_contact = SendPreview {
+            replaces: None,
+            ..p
+        };
+        let text = describe_preview(Network::Regtest, &only_contact, Painter::plain());
+        assert!(
+            text.starts_with("[regtest] Payment preview\n  To        bcrt 1q6r"),
+            "{text}"
+        );
+        assert!(text.contains("\n  Contact   Alice\n"), "{text}");
     }
 
     #[test]

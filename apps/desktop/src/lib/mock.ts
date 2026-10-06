@@ -488,6 +488,8 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
       vsize,
       change_sat: change ? change.value : null,
       total_sat: amount + fee,
+      contact: null,
+      replaces: null,
     };
     pending.set(id, { network: chain.network, created: Date.now(), preview, inputs, change });
     return { id, preview };
@@ -568,6 +570,7 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         net_sat: received - tx.sentSat,
         fee_sat: tx.feeSat,
         status: statusOf(chain, wallet, tx),
+        label: null,
       };
     });
     // PLAN §5.7: unconfirmed first (latest seen first), then by height, newest first.

@@ -28,6 +28,8 @@ export interface TxRow {
   net_sat: number;
   fee_sat: number | null;
   status: TxStatus;
+  /** The user's own label for this transaction (`btcw label`), if any. */
+  label: string | null;
 }
 
 export interface UtxoRow {
@@ -58,6 +60,10 @@ export interface SendPreview {
   vsize: number;
   change_sat: number | null;
   total_sat: number;
+  /** Address-book name the user typed instead of the address; always shown next to `to`. */
+  contact: string | null;
+  /** Fee bump: the txid of the unconfirmed payment this transaction replaces. */
+  replaces: string | null;
 }
 
 // ---- Desktop-only shapes (defined by the Tauri command layer, apps/desktop/src-tauri) ----

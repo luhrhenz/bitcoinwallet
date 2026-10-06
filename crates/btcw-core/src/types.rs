@@ -60,6 +60,9 @@ pub struct TxRow {
     /// Known only when all inputs are ours or were seen by the wallet.
     pub fee_sat: Option<u64>,
     pub status: TxStatus,
+    /// The user's own note for this transaction (`WalletService::set_label`), if any.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,4 +101,21 @@ pub struct SendPreview {
     pub change_sat: Option<u64>,
     /// `amount + fee`, what leaves the wallet.
     pub total_sat: u64,
+    /// The address-book name the user typed instead of an address, if any. Always shown *next
+    /// to* the full address in `to`, never instead of it.
+    #[serde(default)]
+    pub contact: Option<String>,
+    /// For a fee bump (`tx::prepare_fee_bump`): the txid of the unconfirmed payment this
+    /// transaction replaces. `None` for an ordinary payment.
+    #[serde(default)]
+    pub replaces: Option<String>,
+}
+
+/// One address-book entry (`WalletService::contacts`). Names are unique ignoring case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contact {
+    pub name: String,
+    /// Validated for the wallet's network when it was saved; stored in canonical form.
+    pub address: String,
+    pub note: Option<String>,
 }

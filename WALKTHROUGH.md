@@ -1783,3 +1783,273 @@ kills it on drop.
 
 ## 11. Running the demo (regtest and testnet4) — _pending_
 ## 12. Lessons learned — _pending_
+
+## 13. v2: address book, labels and fee bump (Agent I)
+
+**What we built:** three things people ask for once a wallet works. An **address book**, so a
+payment can go to "Alice" instead of a pasted address. **Labels**, so the history says what a
+payment was for. And **fee bump** ("speed up"): a payment stuck at a low fee is replaced by one
+paying more, the standard way, BIP125 replace-by-fee. Core and CLI only; the desktop screens are
+Agent J's.
+
+```text
+crates/btcw-core/src/book.rs        contacts + labels: tables, rules, resolve_recipient
+crates/btcw-core/src/tx.rs          build_fee_bump · preview_fee_bump · prepare_fee_bump
+                                    · min_fee_bump_rate · check_prepared_bump; record_broadcast
+                                    now handles replacements
+crates/btcw-cli/src/commands/       contacts.rs, label.rs, bump.rs; send --to NAME; history labels
+```
+
+### Two more tables in the wallet file
+Same pattern as `btcw_meta` (§4): our own tables in `wallet.sqlite`, written straight to SQLite
+(not staged with BDK's changes), created on `create` and, for wallets from before v2, on `open`.
+
+```sql
+CREATE TABLE btcw_contacts (name TEXT PRIMARY KEY COLLATE NOCASE, address TEXT NOT NULL, note TEXT);
+CREATE TABLE btcw_labels   (txid TEXT PRIMARY KEY, label TEXT NOT NULL);
+```
+
+Each network has its own `wallet.sqlite`, so contacts are per network by construction: a
+testnet4 contact can't turn up in a regtest wallet. Labels are also kept in memory
+(`WalletService` loads them at `open`), so `history()` stays infallible. That's safe because only
+the process holding the wallet lock can write the file.
+
+| Rule | Why |
+|---|---|
+| Names: trimmed, 1–40 characters, unique **ignoring case** | "alice" and "Alice" must not be two people. `COLLATE NOCASE` only folds ASCII, so names are also compared with Unicode lower-casing before an insert ("Émile" = "émile"). |
+| A name may not look like an address: one that parses as an address on any network, starts with `bc1`/`tb1`/`bcrt1`, or is longer than 40 characters | So `--to X` always means one thing. A mistyped address (`bcrt1qnotanaddress`) stays an `invalid_address` error and can't silently match a contact. |
+| The address is validated for the wallet's network on insert (`tx::parse_address`) and stored canonically (lower-case bech32) | A testnet address in a regtest address book would only fail later, at the worst moment. |
+| Labels: trimmed, 1–100 characters, only for transactions the wallet knows (`tx_not_found` otherwise) | A label for a mistyped txid would be invisible forever. |
+| No control characters in names, notes (≤ 200) or labels | A newline breaks the CLI's tables, and an escape sequence could repaint the terminal. |
+
+Errors are a new `WalletError::Contact` (code `contact`), with messages that say which rule was
+broken ("a contact named `Alice` already exists", "a label can be at most 100 characters (this one
+has 101)"). They never list other contacts.
+
+### A name is a shortcut, never a replacement for the address
+`WalletService::resolve_recipient(input)` decides what the user meant:
+
+1. a valid address for this network is used as is, even if a contact has it;
+2. an address for another network is `network_mismatch`, and anything address-like is
+   `invalid_address`, never looked up as a name;
+3. otherwise it's a contact name, matched ignoring case. An unknown name is `contact`: "no contact
+   is named `Alcie`, and it is not a valid address either".
+
+`tx::prepare_send` now resolves through it, so the desktop app gets names for free, and
+`SendPreview` gains `contact: Option<String>`. The preview still shows **the full address**, in
+groups of four, on the `To` line. The name gets a line of its own *under* it:
+
+```text
+[regtest] Payment preview
+  To        bcrt 1qss n3y0 82vm 8css c4lr wprc mz49 awsh y6r3 k5zk
+  Contact   Alice
+  Amount    0.00100000 BTC (100,000 sat)
+  ...
+```
+
+Clipboard malware swaps addresses, and a poisoned address book would work the same way. Showing
+the address the money really goes to keeps the check the user makes the same, whichever way they
+typed the recipient. `send` resolves a name right after opening the wallet, before the sync, so a
+typo in a name costs no node round trip and no password, just like a typo in an address (§7).
+
+### Speeding up a payment: what a replacement is
+Every btcw payment signals replace-by-fee (`nSequence = 0xFFFFFFFD`, §7). That lets the sender
+publish a second version of it: same coins, same recipient, same amount, a higher fee taken out of
+the change. A node that accepts the replacement drops the original from its mempool. Since both
+spend the same coins, at most one of them can ever confirm, so the recipient is paid exactly once.
+
+`tx::build_fee_bump(wallet, txid, rate)` uses BDK's `build_fee_bump`, which starts from the
+original: its inputs become required inputs, its change output is removed, and coin selection adds
+a new change. We hand BDK the original change script as `drain_to`, so the replacement keeps the
+**same change address**. It was already handed out for this payment, and only one of the two
+transactions can confirm, so nothing is linked that wasn't already. That also means a fee bump
+doesn't burn a fresh change address. If the change can't cover the extra fee, BDK adds a confirmed
+coin. If the original had no change, the replacement gets a fresh change address, and `cancel`
+releases it as for any payment.
+
+Nodes accept a replacement under the **BIP125 rules** (Core's `policy/rbf.cpp`). Here is how each
+one is enforced:
+
+| Rule | What it says | Where |
+|---|---|---|
+| 1 | The original signals RBF (an input with nSequence < 0xFFFFFFFE) | `bump_target`. Core 28+ relays "full RBF" anyway, but other nodes and wallets go by the signal, so we require it. |
+| 2 | No new **unconfirmed** inputs | BDK only offers confirmed coins while bumping; `check_replacement` checks again. |
+| 3 | The replacement's fee ≥ the fees of everything it evicts | We refuse to bump a payment whose change another unconfirmed payment already spends ("replacing it would cancel that payment too"), so only the original is evicted. |
+| 4 | New fee − old fee ≥ incremental relay fee × the replacement's vsize | `check_replacement`, at 1 sat/vB (Core's long-time default; newer versions use 0.1, so ours is the stricter). |
+| 5 | At most 100 transactions evicted | Trivially true: one transaction, no descendants. |
+| (Core) | The new fee *rate* must beat the old one | BDK requires old rate + 1 sat/vB, with the old rate = fee ÷ the signed weight, rounded down. |
+
+Before BDK builds anything, `bump_target` refuses everything else with its own message:
+
+- a txid the wallet has never seen: `tx_not_found`
+- a payment *to* the wallet ("it spends none of this wallet's coins, so only its sender can
+  replace it")
+- a transaction that is only partly ours
+- one that's already confirmed ("block 205")
+- one that was itself replaced
+- anything that isn't a single-recipient payment with at most one change output
+
+### The fee math, and a rounding bug the regtest test caught
+A 1-input, 2-output P2WPKH payment is estimated at 562 WU = 141 vB (§7):
+
+```text
+original at 2 sat/vB    fee = ⌈500 sat/kwu × 562 WU⌉ = 281 sat; signed it weighs 561–562 WU,
+                        so its rate is ⌊281 000 / 561⌋ = 500 sat/kwu (2.00 sat/vB)
+BDK's minimum           500 + 250 = 750 sat/kwu (3 sat/vB)
+BIP125 rule 4           the replacement is the same 141 vB, so it needs ≥ 281 + 141 = 422 sat:
+                        ⌈422 000 / 562⌉ = 751 sat/kwu (3.004 sat/vB)
+min_fee_bump_rate       the larger, 751 sat/kwu; messages round it *up*: "at least 3.01 sat/vB"
+at 5 sat/vB             fee = 703 sat (≥ 422 ✓); the change shrinks by 703 − 281 = 422 sat,
+                        the recipient gets the same 100 000 sat, the balance drops by exactly 422
+```
+
+At first `min_fee_bump_rate` was only BDK's rule. The regtest test bumped a payment twice, and
+the second time, at the "minimum", the replacement paid **843 sat where Core wanted 844**
+(703 + 141). At exactly old rate + 1 sat/vB, rounding can leave the extra fee half a satoshi short
+of rule 4. `check_replacement` refused it before signing, so no transaction ever reached the node.
+The minimum now includes rule 4 for a replacement the size of the original, and the rule-4 check
+stays as the last guard. That guard matters because a replacement that needed an extra coin is
+bigger than the original.
+
+### After the broadcast: only the replacement
+BDK picks between conflicting unconfirmed transactions by their **last-seen** time: the newest
+wins, and a tie goes to the *higher txid*. If a sync saw the original in the same second we
+broadcast the replacement, the original could win, by txid alone. So `record_broadcast` now
+records a transaction strictly *after* the last sighting of anything it conflicts with. The
+original then drops out of `history()`, `balance()` and `tx_status()` at once, before any sync,
+and stays out after one. The replacement also **inherits the original's label** unless it has one
+of its own. It's the same payment, and the history should still say "rent".
+
+### One path for both frontends, again
+```rust
+pub fn prepare_fee_bump(wallet: &mut WalletService, node: &Node, txid: Txid,
+                        fee_rate: Option<FeeRate>) -> Result<(Psbt, SendPreview)>;  // replaces = Some(txid)
+pub fn min_fee_bump_rate(wallet: &WalletService, txid: Txid) -> Result<FeeRate>;     // "Speed up" can say the minimum
+pub fn check_prepared_bump(wallet: &WalletService, psbt: &Psbt, replaces: Txid) -> Result<()>;
+// then the usual complete_send / broadcast_signed / cancel
+```
+
+`fee_rate: None` means the node's 6-block estimate, raised to the minimum when it's lower, so the
+desktop "Speed up" button can offer a rate that works. The preview is the same `preview()` as a
+payment: it pays the original recipient the original amount, and every other output is our
+change, or it's refused.
+
+For the desktop's prepare-now, confirm-later flow there is `check_prepared_bump`. The plain
+`check_prepared` (§10, bug 2) would refuse a bump, because its inputs are *meant* to be spent
+already (by the original) and its change address was paid already (by the original). The bump
+version checks instead that the original is still unconfirmed and replaceable, that the PSBT still
+replaces it under the rules above, and that any extra coin is still unspent.
+
+### CLI
+```console
+$ btcw contacts add Alice bcrt1qssn3y082vm8cssc4lrwprcmz49awshy6r3k5zk --note rent
+[regtest] Saved contact Alice
+  Address   bcrt 1qss n3y0 82vm 8css c4lr wprc mz49 awsh y6r3 k5zk
+  Note      rent
+
+$ btcw send --yes --to alice --amount 100000 --fee-rate 2
+[regtest] Payment preview
+  To        bcrt 1qss n3y0 82vm 8css c4lr wprc mz49 awsh y6r3 k5zk
+  Contact   Alice
+  Amount    0.00100000 BTC (100,000 sat)
+  Fee       0.00000281 BTC (281 sat)
+  Fee rate  1.99 sat/vB for an estimated 141 vB
+  Change    0.00899719 BTC (899,719 sat), back to this wallet
+  Total     0.00100281 BTC (100,281 sat), amount + fee
+[regtest] Sent 0.00100000 BTC (100,000 sat) to Alice (bcrt1qssn3y082vm8cssc4lrwprcmz49awshy6r3k5zk)
+Txid: 797e3484a2785399537037540b6ec09e3fa4e81f82083e543286d628b7fab92f
+
+$ btcw label 797e3484…b92f rent October
+[regtest] Labelled 797e3484a2785399537037540b6ec09e3fa4e81f82083e543286d628b7fab92f: rent October
+
+$ btcw bump 797e3484…b92f --fee-rate 2 --yes
+error: could not build transaction: cannot speed up 797e3484…b92f: a fee rate of 2 sat/vB is too
+low; it pays 2.00 sat/vB now, and a replacement must pay at least 1 sat/vB more (BIP125), so at
+least 3.01 sat/vB
+
+$ btcw bump 797e3484…b92f --fee-rate 5
+[regtest] Fee bump preview
+  Replaces  797e3484a2785399537037540b6ec09e3fa4e81f82083e543286d628b7fab92f
+  To        bcrt 1qss n3y0 82vm 8css c4lr wprc mz49 awsh y6r3 k5zk
+  Amount    0.00100000 BTC (100,000 sat)
+  Fee       0.00000703 BTC (703 sat)
+  Fee rate  4.99 sat/vB for an estimated 141 vB
+  Change    0.00899297 BTC (899,297 sat), back to this wallet
+  Total     0.00100703 BTC (100,703 sat), amount + fee
+The fee rises by 422 sat (from 281 sat); the recipient still gets the same amount.
+Send the replacement? [y/N] y
+Wallet password:
+[regtest] Sent the replacement: bd5ff4e4bbcda8fe9cfa237d85a3cec5383d25a3e43d9124f7203fa01e6fa36e
+It replaces 797e3484…b92f, which nodes drop from their mempools now; follow the new one with
+`btcw status bd5ff4e4… --watch`.
+
+$ bitcoin-cli getrawmempool            → [ "bd5ff4e4…a36e" ]          (fees.base 0.00000703)
+$ btcw history                         → one "sent" row: bd5ff4e4…, 703 sat, label "rent October"
+$ btcw balance                         → 899,297 sat (was 899,719: exactly 422 less)
+$ btcw status 797e3484…b92f            → error: transaction not found (it was replaced)
+```
+(Abridged: the full txids are printed. `--yes` skips the question, as in the run these numbers
+come from.)
+
+`bump` runs in the same order as `send`. First the checks that need nothing: `--json` needs
+`--yes`, the txid, the rate (1–25 000 sat/vB), the wallet exists, a terminal to ask on. Then
+watch-only open, sync, `prepare_fee_bump`, the preview, `Send the replacement? [y/N]`, and only
+then the password, so a declined bump never decrypts anything. `history` gets a `Label` column
+when at least one transaction has a label; without any, the table looks exactly as before.
+
+| Command | JSON (besides `network`) |
+|---|---|
+| `contacts list` | `contacts`: `[{name, address, note}]`, sorted by name |
+| `contacts add NAME ADDRESS [--note]` | `contact` |
+| `contacts remove NAME` | `removed` (the contact) |
+| `contacts rename OLD NEW` | `renamed_from`, `contact` |
+| `label TXID TEXT…` / `label TXID --clear` | `txid`, `label` (`null` after `--clear`) |
+| `bump TXID --fee-rate N --yes` | `txid` (the replacement), `preview` (with `replaces`) |
+| `send`, `history` | as before; `preview.contact` / `preview.replaces`, and each row's `label` |
+
+### Testing
+- **Offline, core** (`tests/book.rs`, `src/book.rs`, `src/tx.rs`):
+  - Contacts: add / list / rename / remove, and the data survives a reopen. Trimming and canonical
+    addresses. Duplicates ignoring case, including non-ASCII ("éMILE" vs "Émile") and a rename
+    onto a taken name. Every name, address and note rule. `resolve_recipient` in each order
+    (name, address, unknown name, address-like input).
+  - Labels: set, replace, the 100-character limit counted in characters, control characters,
+    unknown txids, clear, reopen, inheritance.
+  - Fee bumps on a hand-funded wallet:
+    - the minimum is exactly 751 sat/kwu, and the message at 2 sat/vB
+    - a bump at the minimum passes rule 4
+    - a 5 sat/vB bump keeps the input, recipient, amount and change address, and the extra fee
+      comes out of the change
+    - `check_prepared` refuses it and `check_prepared_bump` accepts it
+    - after `record_broadcast`, only the replacement is in history, with the label, and the
+      balance drops by exactly the extra fee
+    - the replacement wins even when the original was "seen" later
+    - refusals: unknown, incoming, non-RBF, a payment with an unconfirmed child, a partly foreign
+      transaction, a bad rate
+    - `check_prepared_bump` refuses a PSBT that underpays rule 4, one that doesn't spend the
+      original's coin, and one whose original was replaced meanwhile
+- **Regtest, core** (`tests/tx.rs`, `fee_bump_replaces_a_stuck_payment`): send at 2 sat/vB, bump
+  to 5 sat/vB.
+  - Core's mempool holds only the replacement, and its `getmempoolentry` fee equals the preview's.
+  - The wallet shows only the replacement, with the label inherited and the balance exact,
+    before a sync, after one, and after a reopen.
+  - The replacement can be bumped again with no rate given (then cancelled).
+  - Refusals: too low, the replaced original, a stranger's transaction (`tx_not_found`), a payment
+    to the wallet, a confirmed one.
+- **CLI** (`tests/cli.rs`).
+  - Offline: every `contacts` command (human and `--json`) and its errors. `send --to` an unknown
+    name is `contact` before the node, and a known name gets as far as the node. `label` errors and
+    usage errors. Every early refusal of `bump`, including no terminal.
+  - With the node, on the wallet the round trip built: pay a contact by name in human mode (full
+    address on the `To` line, `Contact` under it), label the payment, see it in `history`.
+  - Then `bump`: too low, `--json` without `--yes`, declined at a real prompt in a pseudo-terminal,
+    sent (mempool, history, label, balance exact, the old txid `tx_not_found`), bumped again as
+    JSON (Core's fee = the preview's), then confirmed and refused. No extra node start.
+
+### Open questions for Agent J (desktop)
+- `confirm_send` calls `tx::check_prepared`. For a prepared bump (`preview.replaces` is set) it must
+  call `tx::check_prepared_bump(wallet, &psbt, replaces)` instead, or every bump will be refused as
+  "coin … was spent".
+- The new error code `contact` needs a line in `errors.ts`.
+- A bump's preview has `contact: None` even when the recipient is a saved contact: the field means
+  "the name the user typed". Looking the address up for display would be easy if the UI wants it.

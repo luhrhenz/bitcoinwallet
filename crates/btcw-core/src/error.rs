@@ -56,6 +56,11 @@ pub enum WalletError {
     #[error("transaction not found: {0}")]
     TxNotFound(String),
 
+    /// Address book and labels: an unknown contact name, a duplicate, an invalid name, note or
+    /// label. The message is complete on its own (it names the rule that was broken).
+    #[error("{0}")]
+    Contact(String),
+
     #[error("bitcoin node RPC error: {0}")]
     Rpc(String),
 
@@ -91,6 +96,7 @@ impl WalletError {
             Self::TxBuild(_) => "tx_build",
             Self::Sign(_) => "sign",
             Self::TxNotFound(_) => "tx_not_found",
+            Self::Contact(_) => "contact",
             Self::Rpc(_) => "rpc",
             Self::Persist(_) => "persist",
             Self::Keystore(_) => "keystore",

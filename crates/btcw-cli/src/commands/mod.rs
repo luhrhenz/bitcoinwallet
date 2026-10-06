@@ -9,13 +9,18 @@
 //! | `sync` | watch-only, no password | yes |
 //! | `mine` | watch-only (only without `--to`) | yes, regtest |
 //! | `send` | watch-only, then the password **after** the user confirms (signer dropped right after signing) | yes |
+//! | `bump` | same as `send` | yes |
+//! | `contacts list/add/remove/rename`, `label` | watch-only, no password | no |
 //! | `status` | watch-only, reopened for every poll | yes (falls back to the last sync) |
 //! | `backup verify` | watch-only + password (decrypts the phrase to compare) | no |
 //! | `backup show` | password only (reads the encrypted phrase, not the wallet) | no |
 
 pub mod address;
 pub mod backup;
+pub mod bump;
+pub mod contacts;
 pub mod create;
+pub mod label;
 pub mod mine;
 pub mod restore;
 pub mod send;

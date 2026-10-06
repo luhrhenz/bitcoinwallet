@@ -362,3 +362,146 @@ fn prepare_and_complete_send() -> TestResult {
     );
     Ok(())
 }
+
+/// Agent I: a payment sent at 2 sat/vB is sped up to 5 sat/vB. Core's mempool ends up holding
+/// only the replacement, with the fee the preview showed; the wallet shows only the replacement
+/// (before and after a sync) and the balance drops by exactly the extra fee. Plus what can't be
+/// bumped: a too-low rate, a stranger's transaction, a payment *to* the wallet, a confirmed one.
+#[test]
+fn fee_bump_replaces_a_stuck_payment() -> TestResult {
+    if !bitcoind_available() {
+        eprintln!("skipping: no bitcoind (set BITCOIND_EXE)");
+        return Ok(());
+    }
+    let Setup {
+        test_node,
+        node,
+        cfg,
+        mut wallet,
+        signer,
+        _dir,
+    } = setup()?;
+    let faucet = test_node.faucet_address()?;
+    let recipient = faucet.script_pubkey();
+
+    let (psbt, sent) = tx::prepare_send(
+        &mut wallet,
+        &node,
+        &faucet.to_string(),
+        100_000,
+        Some(rate(2)?),
+    )?;
+    assert_eq!(sent.replaces, None);
+    let original_change = change_scripts(&psbt, &recipient);
+    let original = tx::complete_send(&mut wallet, &signer, &node, psbt)?;
+    wallet.set_label(original, "rent")?;
+    let before = wallet.balance().total_sat;
+    assert_eq!(before, 1_000_000 - sent.total_sat);
+
+    // Too low: BIP125 needs at least 1 sat/vB more than the original pays.
+    let msg = match expect_err(tx::prepare_fee_bump(
+        &mut wallet,
+        &node,
+        original,
+        Some(rate(2)?),
+    ))? {
+        WalletError::TxBuild(msg) => msg,
+        other => return Err(format!("expected TxBuild, got {other:?}").into()),
+    };
+    assert!(
+        msg.contains("too low") && msg.contains("so at least 3.0"),
+        "{msg}"
+    );
+
+    let (psbt, preview) = tx::prepare_fee_bump(&mut wallet, &node, original, Some(rate(5)?))?;
+    assert_eq!(preview.replaces, Some(original.to_string()));
+    assert_eq!(preview.to, faucet.to_string());
+    assert_eq!(preview.amount_sat, 100_000);
+    assert_eq!(preview.total_sat, 100_000 + preview.fee_sat);
+    let extra = preview.fee_sat - sent.fee_sat;
+    assert!(extra >= preview.vsize, "{preview:?} vs {sent:?}");
+    assert_eq!(
+        preview.change_sat,
+        Some(sent.change_sat.ok_or("no change")? - extra)
+    );
+    assert_eq!(change_scripts(&psbt, &recipient), original_change);
+    tx::check_prepared_bump(&wallet, &psbt, original)?;
+
+    let replacement = tx::complete_send(&mut wallet, &signer, &node, psbt)?;
+    assert_ne!(replacement, original);
+
+    // The node: only the replacement, at the fee the preview showed.
+    let mempool = test_node.call("getrawmempool", &[])?;
+    assert_eq!(mempool, json!([replacement.to_string()]));
+    let entry = test_node.call("getmempoolentry", &[json!(replacement.to_string())])?;
+    let core_fee = entry["fees"]["base"]
+        .as_f64()
+        .ok_or("getmempoolentry: no fees.base")?;
+    assert_eq!(Amount::from_btc(core_fee)?.to_sat(), preview.fee_sat);
+
+    // The wallet, straight away and after a sync and a reopen: only the replacement.
+    let check = |wallet: &WalletService| -> TestResult {
+        let history = wallet.history();
+        assert!(
+            history.iter().all(|row| row.txid != original.to_string()),
+            "{history:?}"
+        );
+        let row = history
+            .iter()
+            .find(|row| row.txid == replacement.to_string())
+            .ok_or("the replacement is not in the history")?;
+        assert_eq!(row.fee_sat, Some(preview.fee_sat));
+        assert_eq!(row.net_sat, -i64::try_from(preview.total_sat)?);
+        assert_eq!(row.label.as_deref(), Some("rent"));
+        assert_eq!(wallet.balance().total_sat, before - extra);
+        assert_eq!(tx::tx_status(wallet, original), None);
+        assert!(matches!(
+            tx::tx_status(wallet, replacement),
+            Some(TxStatus::Unconfirmed { .. })
+        ));
+        Ok(())
+    };
+    check(&wallet)?;
+    node.sync(&mut wallet, &mut |_| {})?;
+    check(&wallet)?;
+    drop(wallet);
+    let mut wallet = WalletService::open(&cfg, None)?;
+    check(&wallet)?;
+
+    // The original is gone for good; the replacement could be bumped again (no rate given: the
+    // node's estimate, raised to the minimum), but we cancel.
+    assert!(matches!(
+        expect_err(tx::prepare_fee_bump(&mut wallet, &node, original, Some(rate(10)?)))?,
+        WalletError::TxBuild(msg) if msg.contains("was replaced")
+    ));
+    let minimum = tx::min_fee_bump_rate(&wallet, replacement)?;
+    let (again, again_preview) = tx::prepare_fee_bump(&mut wallet, &node, replacement, None)?;
+    assert!(again_preview.fee_rate_sat_vb * 250.0 >= minimum.to_sat_per_kwu() as f64 - 1.0);
+    tx::cancel(&mut wallet, &again);
+
+    // A stranger's transaction, and a payment *to* the wallet.
+    let stranger = test_node.fund(&faucet, Amount::from_sat(30_000))?;
+    let receive = tx::parse_address(&wallet.new_address()?.address, Network::Regtest)?;
+    let incoming = test_node.fund(&receive, Amount::from_sat(40_000))?;
+    node.sync(&mut wallet, &mut |_| {})?;
+    assert!(matches!(
+        expect_err(tx::prepare_fee_bump(&mut wallet, &node, stranger, Some(rate(5)?)))?,
+        WalletError::TxNotFound(t) if t == stranger.to_string()
+    ));
+    assert!(matches!(
+        expect_err(tx::prepare_fee_bump(&mut wallet, &node, incoming, Some(rate(5)?)))?,
+        WalletError::TxBuild(msg) if msg.contains("not sent by this wallet")
+    ));
+
+    // Confirmed: too late.
+    test_node.mine(1)?;
+    node.sync(&mut wallet, &mut |_| {})?;
+    assert!(matches!(
+        expect_err(tx::prepare_fee_bump(&mut wallet, &node, replacement, Some(rate(9)?)))?,
+        WalletError::TxBuild(msg) if msg.contains("already confirmed")
+    ));
+    let (height, _) = confirmations(tx::tx_status(&wallet, replacement))?;
+    assert_eq!(height, node.tip_height()?);
+    assert_eq!(tx::tx_status(&wallet, original), None);
+    Ok(())
+}

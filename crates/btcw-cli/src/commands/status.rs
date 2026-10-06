@@ -208,7 +208,8 @@ fn not_found(ui: &Ui, txid: Txid) -> anyhow::Error {
     WalletError::TxNotFound(txid.to_string()).into()
 }
 
-fn parse_txid(input: &str) -> Result<Txid> {
+/// A txid from the command line, with an error that says what one looks like.
+pub(crate) fn parse_txid(input: &str) -> Result<Txid> {
     let trimmed = input.trim();
     trimmed.parse().map_err(|e| {
         let shown: String = trimmed.chars().take(MAX_ECHOED_INPUT).collect();

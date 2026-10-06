@@ -1,6 +1,7 @@
 //! `btcw`: terminal interface over `btcw-core`.
 //!
-//! OWNER: Agent D (Phase 1; `send`/`status` by Agent F in Phase 2). Contract: PLAN §4 "CLI surface".
+//! OWNER: Agent D (Phase 1; `send`/`status` by Agent F in Phase 2; `contacts`/`label`/`bump` by
+//! Agent I in v2). Contract: PLAN §4 "CLI surface", PLAN-v2 §1–2.
 //! The clap surface below is the contract; keep flag names stable (the demo script and e2e
 //! tests use them). Human-readable output by default, `--json` prints `btcw_core::types`
 //! values (errors as `{"error": {"code", "message"}}` with a non-zero exit).
@@ -141,7 +142,7 @@ enum Command {
     Utxos,
     /// Build, sign and broadcast a payment (asks for the wallet password)
     Send {
-        /// Destination address (must match --network)
+        /// Destination: an address (must match --network) or a contact's name
         #[arg(long)]
         to: String,
         /// Amount in satoshis
@@ -156,6 +157,30 @@ enum Command {
         /// Also write the unsigned PSBT (base64) to this new file
         #[arg(long)]
         psbt_out: Option<PathBuf>,
+    },
+    /// Speed up an unconfirmed payment: replace it with one paying a higher fee (RBF)
+    Bump {
+        /// The payment to speed up (as printed by `btcw send` and `btcw history`)
+        txid: String,
+        /// New fee rate in sat/vB: at least 1 sat/vB above what the payment pays now
+        #[arg(long)]
+        fee_rate: u64,
+        /// Skip the confirmation prompt (required with --json)
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Address book: names for the addresses you pay (`btcw send --to NAME`)
+    #[command(subcommand)]
+    Contacts(ContactsCmd),
+    /// Label a transaction (shown by `btcw history`), or remove its label with --clear
+    Label {
+        txid: String,
+        /// The label, up to 100 characters (several words are joined with spaces)
+        #[arg(required_unless_present = "clear", conflicts_with = "clear", num_args = 1..)]
+        text: Vec<String>,
+        /// Remove the transaction's label
+        #[arg(long)]
+        clear: bool,
     },
     /// Show a transaction's status; --watch polls until confirmed
     Status {
@@ -189,6 +214,25 @@ enum BackupCmd {
     Verify,
     /// Show the recovery phrase again (asks for the wallet password; never as --json)
     Show,
+}
+
+#[derive(Debug, Subcommand)]
+enum ContactsCmd {
+    /// All contacts, by name
+    List,
+    /// Save an address under a name (1–40 characters, unique ignoring case)
+    Add {
+        name: String,
+        /// Must be an address for --network
+        address: String,
+        /// A note for yourself, up to 200 characters
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Delete a contact
+    Remove { name: String },
+    /// Rename a contact
+    Rename { old: String, new: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -265,6 +309,35 @@ fn run(cli: Cli, ui: &Ui) -> Result<()> {
                 psbt_out: psbt_out.as_deref(),
             },
         ),
+        Command::Bump {
+            txid,
+            fee_rate,
+            yes,
+        } => commands::bump::run(
+            &cfg,
+            ui,
+            &commands::bump::Request {
+                txid: &txid,
+                fee_rate_sat_vb: fee_rate,
+                yes,
+            },
+        ),
+        Command::Contacts(ContactsCmd::List) => commands::contacts::list(&cfg, ui),
+        Command::Contacts(ContactsCmd::Add {
+            name,
+            address,
+            note,
+        }) => commands::contacts::add(&cfg, ui, &name, &address, note.as_deref()),
+        Command::Contacts(ContactsCmd::Remove { name }) => {
+            commands::contacts::remove(&cfg, ui, &name)
+        }
+        Command::Contacts(ContactsCmd::Rename { old, new }) => {
+            commands::contacts::rename(&cfg, ui, &old, &new)
+        }
+        Command::Label { txid, text, clear } => {
+            let text = (!clear).then(|| text.join(" "));
+            commands::label::run(&cfg, ui, &txid, text.as_deref())
+        }
         Command::Status {
             txid,
             watch,

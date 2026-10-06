@@ -13,7 +13,10 @@
 //!   starts scanning there, so a new wallet never rescans the whole chain.
 //! - Confirmation counts come from the wallet's own latest checkpoint (the synced tip),
 //!   so the views work offline.
+//! - The address book and transaction labels (v2, `book.rs`) are two more tables of ours in the
+//!   same file; labels are cached in memory so `history()` stays infallible.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,7 +28,8 @@ use bdk_wallet::{
     PersistedWallet, Wallet,
 };
 
-use crate::bitcoin::{Address, Network, Script};
+use crate::bitcoin::{Address, Network, Script, Txid};
+use crate::book;
 use crate::config::Config;
 use crate::error::{Result, WalletError};
 use crate::keys::Descriptors;
@@ -54,6 +58,9 @@ pub struct WalletService {
     /// Cached copy of the `backup_verified` row; [`WalletService::set_backup_verified`] keeps
     /// both in step.
     backup_verified: bool,
+    /// Copy of the `btcw_labels` table, loaded at open time. Only this process can write the
+    /// file while it holds the lock, and `book.rs` updates both together, so it never goes stale.
+    labels: HashMap<Txid, String>,
     /// Declared last so it is dropped last: the lock is released only after the database
     /// connection has been closed.
     _lock: File,
@@ -88,6 +95,7 @@ impl WalletService {
                 birthday,
                 // No row yet: a new wallet starts unverified (`api` marks restores verified).
                 backup_verified: false,
+                labels: HashMap::new(),
                 _lock: lock,
             }),
             Err(e) => {
@@ -141,6 +149,9 @@ impl WalletService {
         restore_first_seen(&mut wallet, &db)?;
         let birthday = read_birthday(&db)?;
         let backup_verified = read_meta(&db, BACKUP_KEY)?.as_deref() == Some("1");
+        // Wallets created before v2 have no address-book tables yet.
+        book::create_tables(&db)?;
+        let labels = book::load_labels(&db)?;
         Ok(Self {
             wallet,
             db,
@@ -148,6 +159,7 @@ impl WalletService {
             network_dir: cfg.network_dir(),
             birthday,
             backup_verified,
+            labels,
             _lock: lock,
         })
     }
@@ -284,8 +296,9 @@ impl WalletService {
                 let tx = &wtx.tx_node.tx;
                 let (sent, received) = self.wallet.sent_and_received(tx);
                 let (sent_sat, received_sat) = (sent.to_sat(), received.to_sat());
+                let txid = wtx.tx_node.txid;
                 TxRow {
-                    txid: wtx.tx_node.txid.to_string(),
+                    txid: txid.to_string(),
                     received_sat,
                     sent_sat,
                     net_sat: net_sat(received_sat, sent_sat),
@@ -293,6 +306,7 @@ impl WalletService {
                     // normal for incoming payments: the sender's coins aren't ours.
                     fee_sat: self.wallet.calculate_fee(tx).ok().map(|fee| fee.to_sat()),
                     status: tx_status(&wtx.chain_position, tip),
+                    label: self.labels.get(&txid).cloned(),
                 }
             })
             .collect();
@@ -349,6 +363,19 @@ impl WalletService {
 
     pub(crate) fn bdk_mut(&mut self) -> &mut PersistedWallet<Connection> {
         &mut self.wallet
+    }
+
+    /// For `book.rs`: our own tables live in the same SQLite file.
+    pub(crate) fn db(&self) -> &Connection {
+        &self.db
+    }
+
+    pub(crate) fn labels(&self) -> &HashMap<Txid, String> {
+        &self.labels
+    }
+
+    pub(crate) fn labels_mut(&mut self) -> &mut HashMap<Txid, String> {
+        &mut self.labels
     }
 
     fn address_of(&self, spk: &Script) -> Option<String> {
@@ -411,6 +438,7 @@ fn create_db(
     // Written after the wallet on purpose: if we crash between the two, the wallet opens with a
     // missing birthday, which reads as 0 (scan from genesis). Slow, but it can't miss funds.
     write_birthday(&db, birthday)?;
+    book::create_tables(&db)?;
     Ok((wallet, db))
 }
 
@@ -533,7 +561,10 @@ fn load_error(
     }
 }
 
-fn persist_err(context: impl std::fmt::Display, e: impl std::fmt::Display) -> WalletError {
+pub(crate) fn persist_err(
+    context: impl std::fmt::Display,
+    e: impl std::fmt::Display,
+) -> WalletError {
     WalletError::Persist(format!("{context}: {e}"))
 }
 
@@ -663,6 +694,7 @@ mod tests {
             net_sat: 0,
             fee_sat: None,
             status,
+            label: None,
         }
     }
 
@@ -752,6 +784,7 @@ mod tests {
             status: TxStatus::Unconfirmed {
                 first_seen: Some(seen_at),
             },
+            label: None,
         }];
         assert_eq!(wallet.history(), expected_history);
 

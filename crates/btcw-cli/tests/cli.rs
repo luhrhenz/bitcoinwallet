@@ -321,7 +321,7 @@ fn help_lists_the_commands_and_the_password_variable() -> TestResult {
     let help = stdout(&out);
     for command in [
         "create", "restore", "address", "sync", "balance", "history", "utxos", "send", "status",
-        "mine",
+        "mine", "bump", "contacts", "label",
     ] {
         assert!(help.contains(command), "`{command}` missing from:\n{help}");
     }
@@ -762,6 +762,177 @@ fn send_and_status_fail_fast_without_a_node() -> TestResult {
         assert!(err.contains("pass --yes"), "{err}");
     } else {
         eprintln!("skipping the no-terminal check: no `setsid`");
+    }
+    Ok(())
+}
+
+/// Agent I: the address book, labels and `bump`, as far as they go without a node.
+#[test]
+fn contacts_labels_and_bump_without_a_node() -> TestResult {
+    let env = Env::offline()?;
+    let txid = "5e3c1f1d2a6b7c8d9e0f11223344556677889900aabbccddeeff001122334455";
+    let (code, _) = env.json_error(&["contacts", "list"])?;
+    assert_eq!(code, "wallet_not_found");
+    let (code, _) = env.json_error(&["bump", txid, "--fee-rate", "5", "--yes"])?;
+    assert_eq!(code, "wallet_not_found");
+
+    let created = env.json(&["create"])?;
+    let first = created["first_address"]
+        .as_str()
+        .ok_or("no address")?
+        .to_owned();
+
+    let out = env.run(&["contacts", "list"])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        stdout(&out).starts_with("[regtest] No contacts yet"),
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(env.json(&["contacts", "list"])?["contacts"], json!([]));
+
+    let added = env.json(&["contacts", "add", " Alice ", &first, "--note", "landlord"])?;
+    assert_eq!(
+        added,
+        json!({
+            "network": "regtest",
+            "contact": { "name": "Alice", "address": first, "note": "landlord" }
+        })
+    );
+    let out = env.run(&["contacts", "add", "Bob", &first])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        stdout(&out).contains(&format!("  Address   {}", in_groups_of_four(&first))),
+        "{}",
+        describe(&out)
+    );
+    for (args, expected, needle) in [
+        (
+            vec!["contacts", "add", "ALICE", &first],
+            "contact",
+            "a contact named `Alice` already exists",
+        ),
+        (
+            vec!["contacts", "add", "Carol", TESTNET_ADDRESS],
+            "network_mismatch",
+            "expected regtest",
+        ),
+        (
+            vec!["contacts", "add", "bcrt1q carol", &first],
+            "contact",
+            "looks like a Bitcoin address",
+        ),
+        (
+            vec!["contacts", "remove", "Carol"],
+            "contact",
+            "no contact is named `Carol`",
+        ),
+        (
+            vec!["contacts", "rename", "bob", "alice"],
+            "contact",
+            "already exists",
+        ),
+    ] {
+        let (code, message) = env.json_error(&args)?;
+        assert_eq!(code, expected, "{args:?}: {message}");
+        assert!(message.contains(needle), "{args:?}: {message}");
+    }
+    let renamed = env.json(&["contacts", "rename", "bob", "Robert"])?;
+    assert_eq!(renamed["renamed_from"], "Bob");
+    assert_eq!(renamed["contact"]["name"], "Robert");
+    let listed = env.json(&["contacts", "list"])?;
+    let names: Vec<&Value> = listed["contacts"]
+        .as_array()
+        .ok_or("no contacts")?
+        .iter()
+        .map(|c| &c["name"])
+        .collect();
+    assert_eq!(names, ["Alice", "Robert"]);
+    let text = stdout(&env.run(&["contacts", "list"])?);
+    assert!(text.starts_with("[regtest] 2 contacts\n"), "{text}");
+    assert!(text.contains(&first) && text.contains("landlord"), "{text}");
+    let removed = env.json(&["contacts", "remove", "robert"])?;
+    assert_eq!(removed["removed"]["name"], "Robert");
+
+    // `send --to NAME`: an unknown name is refused before the node; a known one gets as far as
+    // the node (there is none), whatever the password.
+    let (code, message) =
+        env.json_error(&["send", "--yes", "--to", "Alcie", "--amount", "10000"])?;
+    assert_eq!(code, "contact");
+    assert_eq!(
+        message,
+        "no contact is named `Alcie`, and it is not a valid address either"
+    );
+    let (code, message) = env.json_error(&["send", "--yes", "--to", "alice", "--amount", "293"])?;
+    assert_eq!(code, "dust_amount", "{message}");
+    let out = env
+        .command_on(
+            "regtest",
+            &[
+                "--json", "send", "--yes", "--to", "alice", "--amount", "10000",
+            ],
+        )
+        .env("BTCW_PASSWORD", "not the password")
+        .output()?;
+    let (code, message) = json_error(&out)?;
+    assert_eq!(code, "rpc", "{message}");
+
+    // Labels need a transaction the wallet knows.
+    let (code, _) = env.json_error(&["label", txid, "rent"])?;
+    assert_eq!(code, "tx_not_found");
+    let (code, _) = env.json_error(&["label", txid, "--clear"])?;
+    assert_eq!(code, "tx_not_found");
+    let (code, message) = env.json_error(&["label", "nope", "rent"])?;
+    assert_eq!(code, "cli");
+    assert!(message.starts_with("invalid transaction id"), "{message}");
+    let out = env.run(&["label", txid])?;
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "text or --clear: {}",
+        describe(&out)
+    );
+    let out = env.run(&["label", txid, "rent", "--clear"])?;
+    assert_eq!(out.status.code(), Some(2), "not both: {}", describe(&out));
+
+    // `bump`: checks first, then the node (which isn't there).
+    for (args, expected, needle) in [
+        (
+            vec!["bump", txid, "--fee-rate", "5"],
+            "cli",
+            "--json needs --yes",
+        ),
+        (
+            vec!["bump", "nope", "--fee-rate", "5", "--yes"],
+            "cli",
+            "invalid transaction id",
+        ),
+        (
+            vec!["bump", txid, "--fee-rate", "0", "--yes"],
+            "tx_build",
+            "below the 1 sat/vB minimum",
+        ),
+        (
+            vec!["bump", txid, "--fee-rate", "30000", "--yes"],
+            "tx_build",
+            "above the 25000 sat/vB safety limit",
+        ),
+        (
+            vec!["bump", txid, "--fee-rate", "5", "--yes"],
+            "rpc",
+            "connection refused",
+        ),
+    ] {
+        let (code, message) = env.json_error(&args)?;
+        assert_eq!(code, expected, "{args:?}: {message}");
+        assert!(message.contains(needle), "{args:?}: {message}");
+    }
+    if has_program("setsid") {
+        let out = env
+            .command_without_terminal(&["bump", txid, "--fee-rate", "5"])
+            .output()?;
+        assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+        assert!(stderr(&out).contains("pass --yes"), "{}", describe(&out));
     }
     Ok(())
 }
@@ -1215,6 +1386,175 @@ fn send_and_follow(node: &TestNode, env: &Env) -> TestResult {
     assert!(err.contains("of the amount being sent"), "{err}");
     assert!(err.contains("unusually high"), "{err}");
     assert_eq!(mempool(node)?.len(), 1);
+
+    contacts_labels_and_bump(node, env)
+}
+
+/// Agent I, on the same wallet and node: pay a contact by name (the preview shows the full
+/// address), label the payment, speed it up with `bump` (declined once at a real prompt, then
+/// sent), bump the replacement again as JSON, and the refusals: too low, `--json` without
+/// `--yes`, already confirmed.
+fn contacts_labels_and_bump(node: &TestNode, env: &Env) -> TestResult {
+    let faucet = node.faucet_address()?.to_string();
+    // Start from confirmed coins only, so the payments below have no unconfirmed parent.
+    node.mine(1)?;
+    env.json(&["sync"])?;
+    assert!(mempool(node)?.is_empty());
+    env.json(&[
+        "contacts",
+        "add",
+        "Faucet",
+        &faucet,
+        "--note",
+        "the node's wallet",
+    ])?;
+
+    // Human mode, by name: the address is still printed in full, the name below it.
+    let out = env.run(&[
+        "send",
+        "--yes",
+        "--to",
+        "faucet",
+        "--amount",
+        "20000",
+        "--fee-rate",
+        "2",
+    ])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!(
+            "  To        {}\n  Contact   Faucet\n",
+            in_groups_of_four(&faucet)
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "[regtest] Sent 0.00020000 BTC (20,000 sat) to Faucet ({faucet})"
+        )),
+        "{text}"
+    );
+    let original = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Txid: "))
+        .ok_or("no txid line")?
+        .to_owned();
+    assert_eq!(mempool(node)?, [json!(original)]);
+
+    // Label it; `history` shows the label (JSON and the table's last column).
+    let labelled = env.json(&["label", &original, "coffee", "beans"])?;
+    assert_eq!(labelled["label"], "coffee beans");
+    let history = env.json(&["history"])?;
+    let row = history["transactions"]
+        .as_array()
+        .ok_or("no transactions")?
+        .iter()
+        .find(|tx| tx["txid"] == original.as_str())
+        .ok_or("the payment is not in the history")?
+        .clone();
+    assert_eq!(row["label"], "coffee beans");
+    let old_fee = as_u64(&row["fee_sat"])?;
+    let text = stdout(&env.run(&["history"])?);
+    assert!(
+        text.contains("Label") && text.contains("coffee beans"),
+        "{text}"
+    );
+    let balance_before = as_u64(&env.json(&["balance"])?["balance"]["total_sat"])?;
+
+    // Refused before anything is built or asked.
+    let (code, message) = env.json_error(&["bump", &original, "--fee-rate", "5"])?;
+    assert_eq!(code, "cli");
+    assert!(message.starts_with("--json needs --yes"), "{message}");
+    let (code, message) = env.json_error(&["bump", &original, "--fee-rate", "2", "--yes"])?;
+    assert_eq!(code, "tx_build", "{message}");
+    assert!(message.contains("too low"), "{message}");
+
+    // Declined at a real prompt: the preview names the payment it replaces; nothing is sent.
+    if has_program("script") {
+        let mut child = env
+            .command_in_pty(&["bump", &original, "--fee-rate", "5"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().ok_or("no stdin")?.write_all(b"n\n")?;
+        let out = child.wait_with_output()?;
+        assert!(out.status.success(), "{}", describe(&out));
+        let text = stdout(&out);
+        assert!(text.contains("[regtest] Fee bump preview"), "{text}");
+        assert!(text.contains(&format!("Replaces  {original}")), "{text}");
+        assert!(text.contains(&in_groups_of_four(&faucet)), "{text}");
+        assert!(text.contains("Send the replacement? [y/N]"), "{text}");
+        assert!(text.contains("Cancelled; nothing was sent"), "{text}");
+        assert_eq!(mempool(node)?, [json!(original)]);
+    } else {
+        eprintln!("skipping the interactive bump prompt: no `script`");
+    }
+
+    // Sent: the node and the wallet hold only the replacement, which keeps the label.
+    let out = env.run(&["bump", &original, "--fee-rate", "5", "--yes"])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("[regtest] Fee bump preview\n"), "{text}");
+    assert!(
+        text.contains(&format!("  Replaces  {original}\n")),
+        "{text}"
+    );
+    assert!(
+        !text.contains("  Contact   Faucet\n"),
+        "a bump names no contact: {text}"
+    );
+    assert!(text.contains(&format!("(from {old_fee} sat)")), "{text}");
+    let replacement = text
+        .lines()
+        .find_map(|line| line.strip_prefix("[regtest] Sent the replacement: "))
+        .ok_or("no replacement line")?
+        .to_owned();
+    assert_eq!(mempool(node)?, [json!(replacement)]);
+    let history = env.json(&["history"])?;
+    let rows = history["transactions"]
+        .as_array()
+        .ok_or("no transactions")?;
+    assert!(rows.iter().all(|tx| tx["txid"] != original.as_str()));
+    let row = rows
+        .iter()
+        .find(|tx| tx["txid"] == replacement.as_str())
+        .ok_or("the replacement is not in the history")?;
+    assert_eq!(row["label"], "coffee beans");
+    let new_fee = as_u64(&row["fee_sat"])?;
+    assert!(new_fee > old_fee);
+    assert_eq!(
+        as_u64(&env.json(&["balance"])?["balance"]["total_sat"])?,
+        balance_before - (new_fee - old_fee)
+    );
+    let (code, _) = env.json_error(&["status", &original])?;
+    assert_eq!(code, "tx_not_found");
+
+    // Again, as JSON: same shape as `send`, plus `preview.replaces`.
+    let bumped = env.json(&["bump", &replacement, "--fee-rate", "9", "--yes"])?;
+    assert_eq!(
+        keys_of(&bumped),
+        BTreeSet::from(["network", "preview", "txid"].map(String::from))
+    );
+    assert_eq!(bumped["preview"]["replaces"], replacement.as_str());
+    assert_eq!(bumped["preview"]["to"], faucet.as_str());
+    assert_eq!(bumped["preview"]["amount_sat"], 20_000);
+    assert_eq!(bumped["preview"]["contact"], Value::Null);
+    let third = bumped["txid"].as_str().ok_or("no txid")?.to_owned();
+    assert_eq!(mempool(node)?, [json!(third)]);
+    let entry = node.call("getmempoolentry", &[json!(third)])?;
+    let core_fee = entry["fees"]["base"].as_f64().ok_or("no fees.base")?;
+    assert_eq!(
+        Amount::from_btc(core_fee)?.to_sat(),
+        as_u64(&bumped["preview"]["fee_sat"])?
+    );
+
+    // Confirmed: too late to bump.
+    node.mine(1)?;
+    let (code, message) = env.json_error(&["bump", &third, "--fee-rate", "20", "--yes"])?;
+    assert_eq!(code, "tx_build", "{message}");
+    assert!(message.contains("already confirmed"), "{message}");
     Ok(())
 }
 

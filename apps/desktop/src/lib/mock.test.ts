@@ -160,6 +160,8 @@ describe("mock wallet", () => {
       vsize: 141,
       change_sat: 1_000_000 - 100_000 - 423,
       total_sat: 100_423,
+      contact: null,
+      replaces: null,
     });
 
     const { txid } = await api.confirmSend(id);

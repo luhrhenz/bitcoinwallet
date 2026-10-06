@@ -1,4 +1,5 @@
-//! `btcw balance`, `btcw history`, `btcw utxos` (PLAN §5.6–5.7).
+//! `btcw balance`, `btcw history`, `btcw utxos` (PLAN §5.6–5.7). `history` shows transaction
+//! labels (`btcw label`) in a last column, when at least one transaction has one.
 //!
 //! All three are watch-only and offline: they read the wallet's SQLite file as of the last
 //! `btcw sync`, which is why each one says which block its numbers are from.
@@ -118,10 +119,13 @@ pub fn history(cfg: &Config, ui: &Ui) -> Result<()> {
             as_of(synced_height)
         ));
     }
-    let mut rows = table(
-        &["Date (UTC)", "Type", "Amount", "Fee", "Status", "Txid"],
-        &[2, 3],
-    );
+    // Without any label, the table looks exactly as it did before labels existed.
+    let labelled = transactions.iter().any(|tx| tx.label.is_some());
+    let mut header = vec!["Date (UTC)", "Type", "Amount", "Fee", "Status", "Txid"];
+    if labelled {
+        header.push("Label");
+    }
+    let mut rows = table(&header, &[2, 3]);
     for tx in &transactions {
         let (date, status) = match tx.status {
             TxStatus::Confirmed {
@@ -138,7 +142,7 @@ pub fn history(cfg: &Config, ui: &Ui) -> Result<()> {
                 "unconfirmed".to_owned(),
             ),
         };
-        rows.add_row(vec![
+        let mut row = vec![
             date,
             direction(tx.net_sat).to_owned(),
             signed_amount(tx.net_sat),
@@ -149,7 +153,11 @@ pub fn history(cfg: &Config, ui: &Ui) -> Result<()> {
             ),
             status,
             tx.txid.clone(),
-        ]);
+        ];
+        if labelled {
+            row.push(tx.label.clone().unwrap_or_default());
+        }
+        rows.add_row(row);
     }
     ui.println(&format!(
         "{net} {} {}\n{rows}",
