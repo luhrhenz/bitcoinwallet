@@ -12,9 +12,6 @@ either your own or a hosted endpoint.
 > needs both a build feature and an explicit opt-in. Testnet coins have no value.
 
 - Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- Presentation demo script: [`docs/DEMO.md`](docs/DEMO.md)
-- Plan, algorithms and pseudocode: [`docs/PLAN.md`](docs/PLAN.md)
-- How it was built, step by step: [`WALKTHROUGH.md`](WALKTHROUGH.md)
 
 ## Features
 
@@ -124,8 +121,7 @@ crates/btcw-core        wallet engine: keys, encrypted keystore, sync, PSBT send
 crates/btcw-cli         `btcw` terminal app
 apps/desktop            React UI (src/) + Tauri 2 Rust bridge (src-tauri/)
 scripts/regtest.sh      local regtest node for demos and tests
-docs/                   PLAN.md, ARCHITECTURE.md
-WALKTHROUGH.md          the build, explained section by section
+docs/                   ARCHITECTURE.md
 ```
 
 ## Tests
