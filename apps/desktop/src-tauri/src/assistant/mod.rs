@@ -118,6 +118,25 @@ pub fn get_settings(state: &AppState) -> ApiResult<AssistantSettings> {
     Ok(with_env_key(state, stored(state).view()))
 }
 
+/// `GROQ_MODEL` from the environment, else the saved model; a retired saved model falls back to
+/// the preset's current one, so old settings keep working after the provider drops a model.
+fn model_for(state: &AppState, settings: &StoredAssistant) -> String {
+    if let Some(model) = state
+        .env_var("GROQ_MODEL")
+        .map(|m| m.trim().to_owned())
+        .filter(|m| !m.is_empty())
+    {
+        return model;
+    }
+    if settings::RETIRED_MODELS.contains(&settings.model.as_str())
+        && let Some(preset) = settings::preset(&settings.provider)
+        && !preset.model.is_empty()
+    {
+        return preset.model.to_owned();
+    }
+    settings.model.clone()
+}
+
 /// A key from `GROQ_API_KEY` counts as set (its value still never reaches the UI).
 fn with_env_key(state: &AppState, mut view: AssistantSettings) -> AssistantSettings {
     view.has_api_key |= state
@@ -207,10 +226,11 @@ pub fn send(state: &AppState, text: &str) -> ApiResult<ChatItem> {
 
     let timeout = *lock(&state.assistant().timeout);
     let price_url = lock(&state.assistant().price_url).clone();
+    let model = model_for(state, &settings);
     let provider = provider::Provider {
         label: settings.provider_label(),
         base_url: &settings.base_url,
-        model: &settings.model,
+        model: &model,
         api_key: &api_key,
         timeout,
     };

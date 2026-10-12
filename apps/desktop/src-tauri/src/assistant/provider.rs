@@ -58,6 +58,16 @@ impl Provider<'_> {
                     ),
                 ));
             }
+            404 if text.contains("model_not_found") || text.contains("does not exist") => {
+                return Err(error(
+                    REPLY,
+                    format!(
+                        "{} no longer offers the model `{}`; set GROQ_MODEL in the project's .env \
+                         file to a current one (e.g. openai/gpt-oss-120b)",
+                        self.label, self.model
+                    ),
+                ));
+            }
             429 => {
                 return Err(error(
                     RATE_LIMIT,

@@ -21,7 +21,7 @@ pub const PRESETS: [Preset; 3] = [
         id: "groq",
         label: "Groq",
         base_url: "https://api.groq.com/openai/v1",
-        model: "llama-3.3-70b-versatile",
+        model: "openai/gpt-oss-120b",
     },
     Preset {
         id: "gemini",
@@ -36,6 +36,9 @@ pub const PRESETS: [Preset; 3] = [
         model: "",
     },
 ];
+
+/// Models the providers have retired; a saved one falls back to the preset's current model.
+pub const RETIRED_MODELS: [&str; 1] = ["llama-3.3-70b-versatile"];
 
 pub fn preset(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)

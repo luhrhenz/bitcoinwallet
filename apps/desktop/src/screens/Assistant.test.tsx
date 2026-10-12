@@ -9,7 +9,7 @@ async function enableAssistant(mock: MockWalletApi, key: string | null = KEY) {
     enabled: true,
     provider: "groq",
     base_url: "https://api.groq.com/openai/v1",
-    model: "llama-3.3-70b-versatile",
+    model: "openai/gpt-oss-120b",
     api_key: key,
     clear_api_key: false,
     live_price: false,

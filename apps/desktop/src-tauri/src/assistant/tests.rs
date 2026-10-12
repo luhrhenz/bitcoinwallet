@@ -3,7 +3,7 @@
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -162,9 +162,17 @@ fn tool_results(body: &Value) -> Vec<Value> {
 struct Fixture {
     _dir: TempDir,
     state: AppState,
+    _serial: MutexGuard<'static, ()>,
 }
 
+/// These tests run one at a time: tracing caches per-call-site interest across threads, so a
+/// test logging without a subscriber could hide the logs another test is capturing.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 fn fixture(vars: Vec<(&'static str, String)>) -> Fixture {
+    let serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let env = move |key: &str| {
         vars.iter()
@@ -172,7 +180,11 @@ fn fixture(vars: Vec<(&'static str, String)>) -> Fixture {
             .map(|(_, value)| value.clone())
     };
     let state = AppState::new(dir.path().to_path_buf(), Box::new(env), ManualClock::new());
-    Fixture { _dir: dir, state }
+    Fixture {
+        _dir: dir,
+        state,
+        _serial: serial,
+    }
 }
 
 /// Regtest with no node (port 9 refuses at once).
@@ -416,16 +428,9 @@ fn a_slow_provider_times_out() {
 
 #[test]
 fn provider_errors_are_friendly_and_never_contain_the_key() {
-    let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let writer = {
-        let logs = Arc::clone(&logs);
-        move || LogWriter(Arc::clone(&logs))
-    };
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(writer)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
+    let logs = captured_logs();
+    logs.lock().unwrap().clear();
+    {
         let fx = offline();
         let echo = json!({ "error": { "message": format!("Invalid API Key {KEY} for model") } });
         let server = FakeServer::start(vec![
@@ -486,10 +491,33 @@ fn provider_errors_are_friendly_and_never_contain_the_key() {
         let view = serde_json::to_string(&get_settings(&fx.state).unwrap()).unwrap();
         assert!(!view.contains(KEY));
         assert!(!format!("{:?}", fx.state.stored_settings()).contains(KEY));
-    });
+    }
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("assistant"), "debug logs were captured");
+    assert!(
+        logs.contains("assistant"),
+        "debug logs were captured: {logs:?}"
+    );
     assert!(!logs.contains(KEY) && !logs.contains(&KEY[..8]));
+}
+
+/// Every log line from this test binary, through one global subscriber. A subscriber scoped to
+/// one thread misses lines: tracing caches per-call-site interest decided by other threads.
+fn captured_logs() -> Arc<Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    Arc::clone(LOGS.get_or_init(|| {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = {
+            let logs = Arc::clone(&logs);
+            move || LogWriter(Arc::clone(&logs))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(writer)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other global subscriber in tests");
+        logs
+    }))
 }
 
 struct LogWriter(Arc<Mutex<Vec<u8>>>);
@@ -681,4 +709,60 @@ fn a_prepared_payment_waits_for_the_user_and_is_never_broadcast_by_the_model() {
             .iter()
             .any(|t| t == sent.txid.as_str())
     );
+}
+
+// ── Model selection ─────────────────────────────────────────────────────────────────────────
+
+fn offline_with(extra: Vec<(&'static str, String)>) -> Fixture {
+    let mut vars = vec![
+        ("BTCW_NETWORK", "regtest".to_owned()),
+        ("BTCW_RPC_URL", "http://127.0.0.1:9".to_owned()),
+        ("BTCW_RPC_COOKIE", "/nonexistent/btcw-cookie".to_owned()),
+    ];
+    vars.extend(extra);
+    let fx = fixture(vars);
+    commands::create_wallet(&fx.state, 12, &SecretString::from(PASSWORD)).unwrap();
+    fx
+}
+
+#[test]
+fn a_retired_saved_model_falls_back_to_the_current_default() {
+    let fx = offline();
+    let server = FakeServer::start(vec![text("ok")]);
+    enable(&fx, &server, false);
+    fx.state.settings_guard().assistant.as_mut().unwrap().model =
+        settings::RETIRED_MODELS[0].into();
+    send(&fx.state, "hi").unwrap();
+    assert_eq!(server.bodies()[0]["model"], settings::PRESETS[0].model);
+}
+
+#[test]
+fn groq_model_from_the_environment_wins() {
+    let fx = offline_with(vec![("GROQ_MODEL", " qwen/qwen3.8-27b ".to_owned())]);
+    let server = FakeServer::start(vec![text("ok")]);
+    enable(&fx, &server, false);
+    send(&fx.state, "hi").unwrap();
+    assert_eq!(server.bodies()[0]["model"], "qwen/qwen3.8-27b");
+}
+
+#[test]
+fn a_model_the_provider_dropped_says_how_to_fix_it() {
+    let fx = offline();
+    let server = FakeServer::start(vec![Reply::Json(
+        404,
+        json!({ "error": {
+            "message": "The model `test-model` does not exist or you do not have access to it.",
+            "code": "model_not_found"
+        } }),
+    )]);
+    enable(&fx, &server, false);
+    let err = send(&fx.state, "hi").unwrap_err();
+    assert_eq!(err.code, provider::REPLY);
+    assert!(
+        err.message
+            .contains("no longer offers the model `test-model`"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("GROQ_MODEL"), "{}", err.message);
 }

@@ -16,7 +16,7 @@ export const PRESETS: Record<AssistantProvider, Preset> = {
     id: "groq",
     label: "Groq",
     baseUrl: "https://api.groq.com/openai/v1",
-    model: "llama-3.3-70b-versatile",
+    model: "openai/gpt-oss-120b",
     keyHint: "Free key from console.groq.com",
   },
   gemini: {
