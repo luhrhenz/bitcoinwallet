@@ -186,11 +186,12 @@ impl Config {
 
         let file_rpc = file.rpc.get(&network.to_string());
         let mut rpc = RpcConfig::local_default(network);
-        if let Some(url) = overrides
+        let explicit_url = overrides
             .rpc_url
             .or_else(|| env("BTCW_RPC_URL"))
-            .or_else(|| file_rpc.and_then(|r| r.url.clone()))
-        {
+            .or_else(|| file_rpc.and_then(|r| r.url.clone()));
+        let explicit = explicit_url.is_some();
+        if let Some(url) = explicit_url {
             rpc.url = url;
         }
         let user = overrides
@@ -209,6 +210,16 @@ impl Config {
             .rpc_cookie
             .or_else(|| env("BTCW_RPC_COOKIE").map(PathBuf::from))
             .or_else(|| file_rpc.and_then(|r| r.cookie.clone()));
+        // Nothing configured on testnet4: use the btcw relay, if this build or the environment
+        // names one (it holds the node's credentials server-side).
+        if !explicit
+            && user.is_none()
+            && cookie.is_none()
+            && network == Network::Testnet4
+            && let Some(proxy) = proxy_url(&env)
+        {
+            rpc.url = format!("{proxy}/api/rpc");
+        }
         match (user, pass, cookie) {
             (Some(user), Some(pass), _) => rpc.auth = RpcAuth::UserPass { user, pass },
             (Some(_), None, _) | (None, Some(_), _) => {
@@ -257,6 +268,19 @@ impl Config {
     pub fn coin_type(&self) -> u32 {
         coin_type(self.network)
     }
+}
+
+/// The btcw relay (`<url>/api/rpc`, `<url>/api/assistant`): `BTCW_PROXY_URL` at run time, else
+/// the one this build was made with (`BTCW_PROXY_URL` at compile time). Public, not a secret.
+pub fn proxy_url(env: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    env("BTCW_PROXY_URL")
+        .or_else(|| option_env!("BTCW_PROXY_URL").map(str::to_owned))
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| {
+            is_https(url)
+                || url.starts_with("http://127.0.0.1")
+                || url.starts_with("http://localhost")
+        })
 }
 
 /// mempool.space's Esplora API for `network`; there is none for regtest.
@@ -401,6 +425,35 @@ mod tests {
             RpcAuth::Cookie(_)
         ));
         assert!(is_https("HTTPS://x") && !is_https("http://x") && !is_https("htt"));
+        Ok(())
+    }
+
+    #[test]
+    fn testnet4_falls_back_to_the_relay_only_when_nothing_is_configured() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let relay = |k: &str| (k == "BTCW_PROXY_URL").then(|| "https://relay.example/".to_owned());
+        let cfg = Config::load_with(overrides_in(dir.path()), relay)?;
+        assert_eq!(cfg.rpc.url, "https://relay.example/api/rpc");
+        assert!(matches!(cfg.rpc.auth, RpcAuth::None));
+
+        // An explicit node wins.
+        let mut o = overrides_in(dir.path());
+        o.rpc_url = Some("http://127.0.0.1:48332".into());
+        assert_eq!(
+            Config::load_with(o, relay)?.rpc.url,
+            "http://127.0.0.1:48332"
+        );
+        // Other networks never use it.
+        let mut o = overrides_in(dir.path());
+        o.network = Some("signet".into());
+        assert_ne!(
+            Config::load_with(o, relay)?.rpc.url,
+            "https://relay.example/api/rpc"
+        );
+        // A plain-http relay is ignored.
+        let insecure = |k: &str| (k == "BTCW_PROXY_URL").then(|| "http://relay.example".to_owned());
+        let cfg = Config::load_with(overrides_in(dir.path()), insecure)?;
+        assert_eq!(cfg.rpc.url, "http://127.0.0.1:48332");
         Ok(())
     }
 

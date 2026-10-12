@@ -766,3 +766,27 @@ fn a_model_the_provider_dropped_says_how_to_fix_it() {
     );
     assert!(err.message.contains("GROQ_MODEL"), "{}", err.message);
 }
+
+#[test]
+fn without_a_key_the_relay_answers_and_gets_no_key() {
+    let server = FakeServer::start(vec![text("relayed")]);
+    let fx = offline_with(vec![("BTCW_PROXY_URL", server.url.clone())]);
+    enable(&fx, &server, false);
+    fx.state
+        .settings_guard()
+        .assistant
+        .as_mut()
+        .unwrap()
+        .api_key = None;
+    assert!(get_settings(&fx.state).unwrap().has_api_key);
+    assert_eq!(send(&fx.state, "hi").unwrap().text, "relayed");
+    let request = &server.requests.lock().unwrap()[0];
+    assert!(
+        request
+            .head
+            .starts_with("POST /api/assistant/chat/completions"),
+        "{}",
+        request.head
+    );
+    assert!(!request.head.contains(KEY));
+}

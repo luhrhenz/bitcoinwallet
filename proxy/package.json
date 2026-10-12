@@ -1,0 +1,19 @@
+{
+  "name": "btcw-proxy",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Serverless relay for the btcw wallet: Bitcoin testnet4 RPC (Alchemy) and the assistant (Groq), keys held server-side",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  }
+}

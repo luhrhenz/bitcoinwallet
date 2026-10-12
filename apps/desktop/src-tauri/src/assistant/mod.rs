@@ -141,8 +141,14 @@ fn model_for(state: &AppState, settings: &StoredAssistant) -> String {
 fn with_env_key(state: &AppState, mut view: AssistantSettings) -> AssistantSettings {
     view.has_api_key |= state
         .env_var("GROQ_API_KEY")
-        .is_some_and(|k| !k.trim().is_empty());
+        .is_some_and(|k| !k.trim().is_empty())
+        || relay_url(state).is_some();
     view
+}
+
+/// The btcw relay's assistant endpoint, when this build or the environment names one.
+fn relay_url(state: &AppState) -> Option<String> {
+    btcw_core::config::proxy_url(&|k: &str| state.env_var(k)).map(|p| format!("{p}/api/assistant"))
 }
 
 /// Validate and save; the key is kept unless a new one is given (or cleared).
@@ -187,16 +193,22 @@ pub fn send(state: &AppState, text: &str) -> ApiResult<ChatItem> {
             message: "the assistant is off; turn it on in Settings → Assistant".into(),
         });
     }
-    // A key saved in settings wins; otherwise `GROQ_API_KEY` from the environment (or `.env`).
-    let Some(api_key) = settings.api_key.clone().or_else(|| {
+    // A key saved in settings wins; then `GROQ_API_KEY` from the environment (or `.env`); then
+    // the btcw relay, which adds its own key server-side.
+    let key = settings.api_key.clone().or_else(|| {
         state
             .env_var("GROQ_API_KEY")
             .filter(|k| !k.trim().is_empty())
-    }) else {
-        return Err(ApiError {
-            code: provider::KEY,
-            message: "no Groq API key: set GROQ_API_KEY in the project's .env file".into(),
-        });
+    });
+    let (api_key, base_url) = match (key, relay_url(state)) {
+        (Some(key), _) => (key, settings.base_url.clone()),
+        (None, Some(relay)) => (String::new(), relay),
+        (None, None) => {
+            return Err(ApiError {
+                code: provider::KEY,
+                message: "no Groq API key: set GROQ_API_KEY in the project's .env file".into(),
+            });
+        }
     };
     let text = text.trim();
     if text.is_empty() || text.chars().count() > MAX_INPUT_CHARS {
@@ -229,7 +241,7 @@ pub fn send(state: &AppState, text: &str) -> ApiResult<ChatItem> {
     let model = model_for(state, &settings);
     let provider = provider::Provider {
         label: settings.provider_label(),
-        base_url: &settings.base_url,
+        base_url: &base_url,
         model: &model,
         api_key: &api_key,
         timeout,
