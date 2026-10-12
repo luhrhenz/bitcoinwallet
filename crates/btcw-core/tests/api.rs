@@ -168,8 +168,16 @@ fn verify_backup_checks_words_and_persists() -> TestResult {
             assert_eq!(e.code(), "backup_mismatch");
             let message = e.to_string();
             assert_eq!(message, "words 5 and 9 do not match your recovery phrase");
-            for word in &words {
-                assert!(!message.split_whitespace().any(|m| m == word));
+            // Only the fixed template's words appear (some, like "word" and "match", are also
+            // BIP39 words, so a plain "no phrase word" check would fail at random).
+            let template = [
+                "words", "and", "do", "not", "match", "your", "recovery", "phrase",
+            ];
+            for token in message.split_whitespace() {
+                assert!(
+                    token.parse::<usize>().is_ok() || template.contains(&token),
+                    "{token}"
+                );
             }
         }
         other => return Err(format!("expected BackupMismatch, got {other:?}").into()),

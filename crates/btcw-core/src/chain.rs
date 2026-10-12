@@ -37,6 +37,15 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 /// Persist sync progress this often, so an interrupted long sync resumes near where it stopped.
 const PERSIST_EVERY_BLOCKS: u32 = 100;
 
+/// Pauses between retries of a failed node request during sync (about 30 s in total).
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+
 /// More blocks than this in one sync gets a warning: it means hours through a hosted node.
 const LONG_SCAN_BLOCKS: u32 = 10_000;
 
@@ -182,9 +191,8 @@ impl Node {
 
         let mut blocks_scanned: u32 = 0;
         while !waiting_for_birthday
-            && let Some(event) = emitter
-                .next_block()
-                .map_err(|e| self.rpc_error("fetching the next block", e))?
+            && let Some(event) =
+                self.retrying("fetching the next block", || emitter.next_block())?
         {
             let height = event.block_height();
             // `connected_to` lets `LocalChain` drop reorged checkpoints, which un-confirms the
@@ -207,9 +215,7 @@ impl Node {
             }
         }
 
-        let mempool = emitter
-            .mempool()
-            .map_err(|e| self.rpc_error("reading the mempool", e))?;
+        let mempool = self.retrying("reading the mempool", || emitter.mempool())?;
         mempool_cache::save(&cache_path, mempool.update.iter().map(|(tx, _)| tx));
         let bdk = wallet.bdk_mut();
         bdk.apply_unconfirmed_txs(mempool.update);
@@ -301,6 +307,34 @@ impl Node {
         self.client
             .call("getblockchaininfo", &[])
             .map_err(|e| self.rpc_error("getblockchaininfo", e))
+    }
+
+    /// Run `call`, retrying network-level failures (timeouts, dropped connections, rate limits,
+    /// 5xx) with growing pauses. Hosted nodes drop the odd request during a long sync; the
+    /// Emitter only moves on after a successful fetch, so asking again is safe.
+    fn retrying<T>(
+        &self,
+        what: &str,
+        mut call: impl FnMut() -> std::result::Result<T, bitcoincore_rpc::Error>,
+    ) -> Result<T> {
+        let mut attempt = 0;
+        loop {
+            match call() {
+                Ok(value) => return Ok(value),
+                Err(e) if is_transient(&e) && attempt < RETRY_DELAYS.len() => {
+                    let pause = RETRY_DELAYS[attempt];
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        pause_secs = pause.as_secs(),
+                        error = %self.rpc_error(what, e),
+                        "node request failed; retrying"
+                    );
+                    std::thread::sleep(pause);
+                }
+                Err(e) => return Err(self.rpc_error(what, e)),
+            }
+        }
     }
 
     fn rpc_error(&self, what: &str, e: bitcoincore_rpc::Error) -> WalletError {
@@ -485,6 +519,32 @@ fn url_error(url: &str, e: simple_http::Error) -> WalletError {
     }
 }
 
+/// Worth retrying: the request never got a proper answer (I/O error, timeout, dropped
+/// connection) or the server asked us to slow down or failed (HTTP 429 / 5xx). A JSON-RPC error
+/// from the node itself, or another HTTP status (e.g. 401), is final.
+fn is_transient(e: &bitcoincore_rpc::Error) -> bool {
+    use bitcoincore_rpc::Error as RpcError;
+    let retry_status = |code: i32| code == 429 || (500..600).contains(&code);
+    let RpcError::JsonRpc(jsonrpc::Error::Transport(transport)) = e else {
+        return false;
+    };
+    if let Some(http) = transport.downcast_ref::<simple_http::Error>() {
+        return match http {
+            simple_http::Error::SocketError(_) => true,
+            simple_http::Error::HttpErrorCode(code) => retry_status(i32::from(*code)),
+            _ => false,
+        };
+    }
+    if let Some(https) = transport.downcast_ref::<minreq_http::Error>() {
+        return match https {
+            minreq_http::Error::Minreq(_) => true,
+            minreq_http::Error::Http(http) => retry_status(http.status_code),
+            _ => false,
+        };
+    }
+    false
+}
+
 /// Turn a `bitcoincore-rpc` error into a message that says what failed and what to check.
 fn rpc_error(url: &str, network: Network, what: &str, e: bitcoincore_rpc::Error) -> WalletError {
     use bitcoincore_rpc::Error as RpcError;
@@ -626,6 +686,39 @@ mod tests {
         assert_eq!(first_needed_height(0, 0), 1); // genesis is never fetched
         assert_eq!(first_needed_height(0, 800), 800); // fresh wallet: the birthday block
         assert_eq!(first_needed_height(900, 800), 901); // resume after the checkpoint
+    }
+
+    #[test]
+    fn only_network_failures_are_retried() {
+        use bitcoincore_rpc::Error as RpcError;
+        let transport = |e: Box<dyn std::error::Error + Send + Sync>| {
+            RpcError::JsonRpc(jsonrpc::Error::Transport(e))
+        };
+        let io = |kind| std::io::Error::new(kind, "x");
+        assert!(is_transient(&transport(Box::new(
+            simple_http::Error::SocketError(io(std::io::ErrorKind::TimedOut))
+        ))));
+        assert!(is_transient(&transport(Box::new(
+            simple_http::Error::HttpErrorCode(503)
+        ))));
+        assert!(is_transient(&transport(Box::new(
+            simple_http::Error::HttpErrorCode(429)
+        ))));
+        assert!(!is_transient(&transport(Box::new(
+            simple_http::Error::HttpErrorCode(401)
+        ))));
+        assert!(is_transient(&transport(Box::new(
+            minreq_http::Error::Minreq(minreq::Error::IoError(io(
+                std::io::ErrorKind::UnexpectedEof
+            )))
+        ))));
+        assert!(!is_transient(&RpcError::JsonRpc(jsonrpc::Error::Rpc(
+            jsonrpc::error::RpcError {
+                code: -8,
+                message: "Block height out of range".into(),
+                data: None,
+            }
+        ))));
     }
 
     #[test]

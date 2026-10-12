@@ -246,6 +246,9 @@ fn concurrent_commands_take_turns_instead_of_failing() {
 
 // ── Backup ──────────────────────────────────────────────────────────────────────────────────
 
+/// Words of the backup-mismatch message template.
+const TEMPLATE: [&str; 7] = ["word", "does", "not", "match", "your", "recovery", "phrase"];
+
 #[test]
 fn backup_challenge_verify_and_reveal() {
     let fx = offline();
@@ -274,7 +277,11 @@ fn backup_challenge_verify_and_reveal() {
         err.message,
         format!("word {} does not match your recovery phrase", positions[1])
     );
-    assert!(!words.iter().any(|w| err.message.contains(w.as_str())));
+    // The exact message above names a position only. (A per-word "not contained" check is wrong:
+    // template words like "word" and "match" are BIP39 words too.)
+    assert!(
+        !err.message.contains(&words[other - 1]) || TEMPLATE.contains(&words[other - 1].as_str())
+    );
     assert_eq!(info(&fx).backup_verified, Some(false));
 
     let right: Vec<(usize, String)> = positions
