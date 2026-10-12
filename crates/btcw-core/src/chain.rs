@@ -37,6 +37,9 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 /// Persist sync progress this often, so an interrupted long sync resumes near where it stopped.
 const PERSIST_EVERY_BLOCKS: u32 = 100;
 
+/// More blocks than this in one sync gets a warning: it means hours through a hosted node.
+const LONG_SCAN_BLOCKS: u32 = 10_000;
+
 /// Blocks per `generatetoaddress` call: ~5 s on Core v31, far below [`RPC_TIMEOUT`].
 const MINE_BATCH: u64 = 25;
 
@@ -137,6 +140,14 @@ impl Node {
         let mut tip_height = json_u32(&info, "blocks", "getblockchaininfo")?;
         let first_needed = first_needed_height(wallet.synced_height(), wallet.birthday_height());
         check_pruned(&info, first_needed, tip_height)?;
+        let to_scan = tip_height.saturating_sub(first_needed).saturating_add(1);
+        if to_scan > LONG_SCAN_BLOCKS {
+            tracing::warn!(
+                blocks = to_scan,
+                "this sync has {to_scan} blocks to scan, one request each; through a hosted node \
+                 that can take many hours (a wallet birthday avoids it)"
+            );
+        }
 
         // The Emitter (bdk_bitcoind_rpc 0.22) walks our latest checkpoint back to the last
         // block still on the node's chain; if that is below `start_height` it jumps to

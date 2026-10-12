@@ -4,6 +4,7 @@ import { describeError, toApiError } from "../lib/errors";
 import { plural } from "../lib/format";
 import { useWallet } from "../state/wallet";
 import { Btc } from "../components/Amount";
+import { Icon } from "../components/Icon";
 import { ErrorNotice } from "../components/ErrorNotice";
 import { Field, NO_ASSIST } from "../components/Field";
 import { PasswordFields, passwordPairErrors, type PasswordPairState } from "../components/PasswordFields";
@@ -30,6 +31,8 @@ export function RestoreWallet({ onBack, onFinished }: { onBack: () => void; onFi
   const [password, setPassword] = useState(EMPTY_PASSWORD);
   const [phraseError, setPhraseError] = useState<string | null>(null);
   const [birthdayError, setBirthdayError] = useState<string | null>(null);
+  const [fullScanOk, setFullScanOk] = useState(false);
+  const [fullScanError, setFullScanError] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const [scanDone, setScanDone] = useState(false);
@@ -59,8 +62,13 @@ export function RestoreWallet({ onBack, onFinished }: { onBack: () => void; onFi
       }
     } else {
       setBirthdayError(null);
+      if (!fullScanOk) {
+        setFullScanError("Enter a birthday, or tick the box to scan the whole blockchain.");
+        ok = false;
+      }
     }
     if (!ok) return;
+    setFullScanError(null);
 
     setBusy(true);
     setError(null);
@@ -134,9 +142,35 @@ export function RestoreWallet({ onBack, onFinished }: { onBack: () => void; onFi
           error={birthdayError}
           disabled={busy}
           placeholder="Scan the whole chain"
-          hint="The block height when this wallet was first used. Scanning starts there, which is much faster. Leave it empty if you're not sure: scanning from the start is slower but never misses coins."
+          hint="A block height from before this wallet was first used. Scanning starts there, which is much faster. Leave it empty if you're not sure: scanning from the start never misses coins."
           {...NO_ASSIST}
         />
+        {birthday.trim() === "" && (
+          <div className="notice notice--warning" role="note" aria-label="Full scan warning">
+            <Icon name="alert" className="notice__icon" />
+            <div className="notice__body">
+              <p className="notice__title">Without a birthday, btcw scans the whole blockchain.</p>
+              <p className="notice__detail">
+                Through a hosted node (such as Alchemy) that is one request per block, which can take many hours, and
+                free plans may stop answering partway. With your own Bitcoin Core node it is faster. If you know roughly
+                when you first used this wallet, enter a block height from before then.
+              </p>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={fullScanOk}
+                  onChange={(e) => {
+                    setFullScanOk(e.target.checked);
+                    setFullScanError(null);
+                  }}
+                  disabled={busy}
+                />
+                <span>Scan the whole blockchain anyway</span>
+              </label>
+              {fullScanError && <p className="field__error">{fullScanError}</p>}
+            </div>
+          </div>
+        )}
         <PasswordFields
           state={password}
           onChange={setPassword}

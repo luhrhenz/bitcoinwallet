@@ -108,6 +108,11 @@ describe("restore", () => {
     expect(screen.getByText("12 words.")).toBeInTheDocument();
     type(screen.getByLabelText("New wallet password"), PASSWORD);
     type(screen.getByLabelText("Repeat the password"), PASSWORD);
+    // No birthday: a full scan must be confirmed first.
+    expect(screen.getByRole("note", { name: "Full scan warning" })).toHaveTextContent("scans the whole blockchain");
+    fireEvent.click(screen.getByRole("button", { name: "Restore wallet" }));
+    expect(screen.getByText("Enter a birthday, or tick the box to scan the whole blockchain.")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Scan the whole blockchain anyway"));
     fireEvent.click(screen.getByRole("button", { name: "Restore wallet" }));
     expect(
       await screen.findByText(
@@ -119,6 +124,8 @@ describe("restore", () => {
     type(screen.getByLabelText("Wallet birthday (optional)"), "12a");
     fireEvent.click(screen.getByRole("button", { name: "Restore wallet" }));
     expect(screen.getByText("A block height is a whole number, like 118000.")).toBeInTheDocument();
+    // With a birthday typed, the full-scan warning goes away.
+    expect(screen.queryByRole("note", { name: "Full scan warning" })).not.toBeInTheDocument();
 
     type(screen.getByLabelText("Wallet birthday (optional)"), "");
     fireEvent.click(screen.getByRole("button", { name: "Restore wallet" }));

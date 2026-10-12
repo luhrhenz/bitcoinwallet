@@ -52,6 +52,14 @@ pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>) -> Result<()> {
         ))?;
     }
 
+    if birthday_height == 0 {
+        ui.warn(
+            "no --birthday given, so the scan starts at the first block; through a hosted node that \
+             can take many hours. If you know roughly when this wallet was first used, stop now \
+             (Ctrl-C), delete the wallet folder above and restore again with --birthday <height>",
+        );
+    }
+
     // A missing node only postpones the scan.
     let sync = Node::connect(&cfg.rpc, cfg.network)
         .and_then(|node| sync_with_progress(ui, &node, &mut wallet))
