@@ -46,6 +46,7 @@ pub fn run() {
             ipc::app_info,
             ipc::create_wallet,
             ipc::restore_wallet,
+            ipc::find_birthday,
             ipc::unlock,
             ipc::lock,
             ipc::keep_alive,

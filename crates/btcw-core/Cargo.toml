@@ -33,6 +33,7 @@ dirs.workspace = true
 base64.workspace = true
 tracing.workspace = true
 tempfile = { workspace = true, optional = true }
+ureq = "3"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -120,8 +120,12 @@ enum Command {
     /// Restore a wallet from a recovery phrase (prompted, hidden; or the first line of stdin)
     Restore {
         /// Block height to start scanning from; omit to scan from genesis
-        #[arg(long)]
+        #[arg(long, conflicts_with = "find_birthday")]
         birthday: Option<u32>,
+        /// Ask a block explorer (mempool.space) when this wallet was first used, and start
+        /// there. Fast, but tells the explorer the wallet's addresses.
+        #[arg(long)]
+        find_birthday: bool,
     },
     /// Receive addresses
     #[command(subcommand)]
@@ -279,7 +283,10 @@ fn run(cli: Cli, ui: &Ui) -> Result<()> {
     );
     let result = match command {
         Command::Create { words } => commands::create::run(&cfg, ui, word_count(&words)?),
-        Command::Restore { birthday } => commands::restore::run(&cfg, ui, birthday),
+        Command::Restore {
+            birthday,
+            find_birthday,
+        } => commands::restore::run(&cfg, ui, birthday, find_birthday),
         Command::Address(AddressCmd::New) => commands::address::new(&cfg, ui),
         Command::Address(AddressCmd::List) => commands::address::list(&cfg, ui),
         Command::Sync => commands::sync::run(&cfg, ui),

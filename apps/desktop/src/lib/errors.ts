@@ -103,6 +103,10 @@ const DESCRIPTIONS: Record<string, Describe> = {
       "Can't reach your Bitcoin node. Check that bitcoind is running and that the node settings are right.",
     detail: message.replace(/^bitcoin node RPC error:\s*/, ""),
   }),
+  explorer: (message) => ({
+    title: "Couldn't look up when this wallet was first used. Enter a birthday, or scan the whole chain.",
+    detail: message.replace(/^block explorer:\s*/, ""),
+  }),
   persist: (message) => ({ title: "The wallet file couldn't be saved.", detail: message }),
   keystore: (message) => ({
     title: "The encrypted recovery phrase file couldn't be read.",

@@ -19,6 +19,7 @@ use btcw_core::bitcoin::{Amount, FeeRate, Psbt, Txid};
 use btcw_core::book;
 use btcw_core::chain::Node;
 use btcw_core::config::{self, Config};
+use btcw_core::discover::BirthdayLookup;
 use btcw_core::keys::{Mnemonic, WordCount};
 use btcw_core::tx;
 use btcw_core::types::{
@@ -220,6 +221,13 @@ pub fn restore_wallet(
     drop(wallet);
     state.session().unlock(cfg.network, signer, state.now());
     Ok(())
+}
+
+/// When the wallet behind `phrase` was first used, from the block explorer, to fill in a
+/// restore's birthday. Public addresses only; the UI asks before calling this.
+pub fn find_birthday(state: &AppState, phrase: &SecretString) -> ApiResult<BirthdayLookup> {
+    let cfg = state.begin(Activity::User)?;
+    Ok(api::find_birthday(&cfg, phrase.expose_secret())?)
 }
 
 /// Password → keep only the [`btcw_core::keys::Signer`], after checking the seed matches the

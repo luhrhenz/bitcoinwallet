@@ -917,6 +917,17 @@ export function createMockApi(options: MockOptions = {}): MockWalletApi {
         return { mnemonic };
       }, latency * 4),
 
+    findBirthday: (phrase) =>
+      answer(() => {
+        const words = phrase.trim().toLowerCase().split(/\s+/).filter(Boolean);
+        const problem = checkMnemonic(words);
+        if (problem) throw fail("invalid_mnemonic", `invalid mnemonic: ${problem}`);
+        const tip = active().tip;
+        // Demo: a restored wallet "was first used" 500 blocks ago.
+        const firstUsed = Math.max(0, tip - 500);
+        return { birthday: Math.max(0, firstUsed - 6), first_used: firstUsed, addresses_checked: 43, explorer: "https://mempool.space" };
+      }, latency * 4),
+
     restoreWallet: (phrase, password, birthday) =>
       answer(() => {
         const chain = active();

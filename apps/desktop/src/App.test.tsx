@@ -138,6 +138,26 @@ describe("restore", () => {
   });
 });
 
+describe("restore: find the birthday", () => {
+  it("looks up when the wallet was first used and fills in the birthday", async () => {
+    await renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: /restore from a recovery phrase/i }));
+    // Without a phrase, it asks for one first.
+    fireEvent.click(screen.getByRole("button", { name: "Find it for me" }));
+    expect(screen.getByText("Type your recovery phrase.")).toBeInTheDocument();
+
+    type(screen.getByLabelText("Recovery phrase"), ABANDON);
+    expect(screen.getByText(/It learns the wallet's addresses/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Find it for me" }));
+    const note = await screen.findByRole("status");
+    expect(note).toHaveTextContent(/First used in block \d+; scanning starts at block \d+/);
+    const birthday = screen.getByLabelText("Wallet birthday (optional)") as HTMLInputElement;
+    expect(Number(birthday.value)).toBeGreaterThan(0);
+    // A birthday is set, so no full-scan warning.
+    expect(screen.queryByRole("note", { name: "Full scan warning" })).not.toBeInTheDocument();
+  });
+});
+
 describe("settings", () => {
   it("explains that each network has its own wallet and switches to it", async () => {
     await renderApp((m) => fundedWallet(m));

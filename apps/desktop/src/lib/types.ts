@@ -46,6 +46,17 @@ export interface SyncProgress {
   tip_height: number;
 }
 
+/** What the block explorer said about a wallet's first use (core `discover::BirthdayLookup`). */
+export interface BirthdayLookup {
+  /** Height to start scanning from. */
+  birthday: number;
+  /** Block of the earliest confirmed transaction; null if the wallet was never used. */
+  first_used: number | null;
+  addresses_checked: number;
+  /** Scheme and host of the explorer that was asked. */
+  explorer: string;
+}
+
 export interface SyncReport {
   tip_height: number;
   blocks_scanned: number;

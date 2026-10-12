@@ -18,7 +18,7 @@ either your own or a hosted endpoint.
 | Requirement | How btcw does it |
 |---|---|
 | Create a wallet | 12 or 24 BIP39 words from the OS random generator, shown once, encrypted at rest |
-| Restore from a mnemonic | Phrase plus optional `--birthday` height; full rescan otherwise |
+| Restore from a mnemonic | Phrase plus a birthday (typed, or found automatically with `--find-birthday`); full rescan otherwise |
 | BIP32/BIP84 derivation | `m/84'/1'/0'/0/*` (receive) and `/1/*` (change); checked against the official BIP84 test vector |
 | New addresses, tracking used ones | Next *unused* address; never reuses one that has received funds |
 | Sync with the chain | Block by block from Bitcoin Core RPC (`bdk_bitcoind_rpc`), reorg-safe, plus mempool |
@@ -99,8 +99,10 @@ btcw --network testnet4 sync
 - Each sync downloads new blocks plus new mempool transactions, cached in
   `<datadir>/<network>/mempool-cache.txt`. Each item is one request, so the first sync after a
   long break is the slow one.
-- When restoring an old wallet through a hosted node, pass `--birthday <height>`. Scanning all of
-  testnet4 one block per request would take days.
+- When restoring through a hosted node, give the scan a starting point: `--find-birthday` asks
+  mempool.space when the wallet was first used (seconds; it learns the wallet's addresses), or
+  pass `--birthday <height>` yourself. Scanning all of testnet4 one block per request takes days.
+  The desktop app has the same as a "Find it for me" button on the restore screen.
 
 Free testnet4 coins: e.g. <https://mempool.space/testnet4/faucet>.
 

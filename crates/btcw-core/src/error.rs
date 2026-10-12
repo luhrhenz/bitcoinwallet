@@ -72,6 +72,10 @@ pub enum WalletError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// The block explorer used to find a wallet's birthday failed or refused.
+    #[error("block explorer: {0}")]
+    Explorer(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -100,6 +104,7 @@ impl WalletError {
             Self::Persist(_) => "persist",
             Self::Keystore(_) => "keystore",
             Self::Config(_) => "config",
+            Self::Explorer(_) => "explorer",
             Self::Io(_) => "io",
         }
     }

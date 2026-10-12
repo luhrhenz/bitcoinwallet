@@ -32,6 +32,9 @@ export function RestoreWallet({ onBack, onFinished }: { onBack: () => void; onFi
   const [phraseError, setPhraseError] = useState<string | null>(null);
   const [birthdayError, setBirthdayError] = useState<string | null>(null);
   const [fullScanOk, setFullScanOk] = useState(false);
+  const [finding, setFinding] = useState(false);
+  const [lookupNote, setLookupNote] = useState<string | null>(null);
+  const [lookupError, setLookupError] = useState<unknown>(null);
   const [fullScanError, setFullScanError] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
@@ -39,6 +42,36 @@ export function RestoreWallet({ onBack, onFinished }: { onBack: () => void; onFi
 
   const words = wordsOf(phrase);
   const hint = wordCountHint(words.length);
+
+  async function findBirthday() {
+    if (!VALID_COUNTS.includes(words.length)) {
+      setPhraseError(words.length === 0 ? "Type your recovery phrase." : hint.text);
+      return;
+    }
+    setPhraseError(null);
+    setFinding(true);
+    setLookupError(null);
+    setLookupNote(null);
+    try {
+      const found = await api.findBirthday(words.join(" "));
+      setBirthday(String(found.birthday));
+      setBirthdayError(null);
+      setLookupNote(
+        found.first_used === null
+          ? `No earlier use found (${found.addresses_checked} addresses checked), so scanning starts at today's block ${found.birthday}.`
+          : `First used in block ${found.first_used}; scanning starts at block ${found.birthday} (${found.addresses_checked} addresses checked).`,
+      );
+    } catch (err) {
+      if (toApiError(err).code === "invalid_mnemonic") {
+        const { title, detail } = describeError(err);
+        setPhraseError(detail ? `${title} ${capitalize(detail)}.` : title);
+      } else {
+        setLookupError(err);
+      }
+    } finally {
+      setFinding(false);
+    }
+  }
 
   async function restore(e: FormEvent) {
     e.preventDefault();
@@ -145,6 +178,24 @@ export function RestoreWallet({ onBack, onFinished }: { onBack: () => void; onFi
           hint="A block height from before this wallet was first used. Scanning starts there, which is much faster. Leave it empty if you're not sure: scanning from the start never misses coins."
           {...NO_ASSIST}
         />
+        {wallet.info.network !== "regtest" && (
+          <div className="stack">
+            <div className="row">
+              <button type="button" className="btn btn--quiet" onClick={() => void findBirthday()} disabled={busy || finding}>
+                {finding ? "Looking it up…" : "Find it for me"}
+              </button>
+              <span className="muted small">
+                Asks mempool.space when this wallet was first used. It learns the wallet&apos;s addresses.
+              </span>
+            </div>
+            {lookupNote && (
+              <p className="field__hint field__hint--ok" role="status">
+                {lookupNote}
+              </p>
+            )}
+            <ErrorNotice error={lookupError} network={wallet.info.network} />
+          </div>
+        )}
         {birthday.trim() === "" && (
           <div className="notice notice--warning" role="note" aria-label="Full scan warning">
             <Icon name="alert" className="notice__icon" />

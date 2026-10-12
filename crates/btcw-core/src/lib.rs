@@ -6,6 +6,7 @@
 //! - [`keystore`] mnemonic encrypted at rest (Argon2id + XChaCha20-Poly1305)
 //! - [`wallet`]   [`wallet::WalletService`]: BDK wallet + SQLite persistence
 //! - [`book`]     the address book (contacts) and transaction labels, stored next to the wallet
+//! - [`discover`] a restored wallet's birthday, from an Esplora block explorer
 //! - [`chain`]    [`chain::Node`]: Bitcoin Core RPC (sync, broadcast, fees, tip)
 //! - [`tx`]       build → sign → extract a PSBT, fee bumps (RBF), and transaction status
 //! - [`api`]      high-level flows (create / restore / unlock) used by both frontends
@@ -20,6 +21,7 @@ pub mod api;
 pub mod book;
 pub mod chain;
 pub mod config;
+pub mod discover;
 pub mod error;
 pub mod keys;
 pub mod keystore;

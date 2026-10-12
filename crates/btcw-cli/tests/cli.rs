@@ -1656,3 +1656,24 @@ fn backup_reminder_verify_and_show() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn find_birthday_flag_rules() -> TestResult {
+    let env = Env::offline()?;
+    // Not together with an explicit birthday.
+    let out = env.run(&["restore", "--find-birthday", "--birthday", "5"])?;
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    // Regtest has no public explorer: a clear error, and nothing is restored.
+    let out = env.run_with_stdin(
+        &["--json", "restore", "--find-birthday"],
+        &format!("{ABANDON}\n"),
+    )?;
+    let (code, message) = json_error(&out)?;
+    assert_eq!(code, "config", "{message}");
+    assert!(
+        message.contains("no block explorer for regtest"),
+        "{message}"
+    );
+    assert!(!env.network_dir().join("wallet.sqlite").exists());
+    Ok(())
+}

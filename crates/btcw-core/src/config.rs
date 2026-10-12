@@ -151,6 +151,9 @@ pub struct Config {
     pub datadir: PathBuf,
     pub rpc: RpcConfig,
     pub mainnet_opt_in: bool,
+    /// Esplora block explorer API used to look up a restored wallet's birthday
+    /// (`BTCW_EXPLORER_URL`, else mempool.space for the network; none on regtest).
+    pub explorer_url: Option<String>,
 }
 
 impl Config {
@@ -219,11 +222,17 @@ impl Config {
             (None, None, None) => {}
         }
 
+        let explorer_url = env("BTCW_EXPLORER_URL")
+            .map(|url| url.trim().trim_end_matches('/').to_owned())
+            .filter(|url| !url.is_empty())
+            .or_else(|| default_explorer(network).map(str::to_owned));
+
         Ok(Self {
             network,
             datadir,
             rpc,
             mainnet_opt_in,
+            explorer_url,
         })
     }
 
@@ -247,6 +256,16 @@ impl Config {
 
     pub fn coin_type(&self) -> u32 {
         coin_type(self.network)
+    }
+}
+
+/// mempool.space's Esplora API for `network`; there is none for regtest.
+pub fn default_explorer(network: Network) -> Option<&'static str> {
+    match network {
+        Network::Bitcoin => Some("https://mempool.space/api"),
+        Network::Testnet4 => Some("https://mempool.space/testnet4/api"),
+        Network::Signet => Some("https://mempool.space/signet/api"),
+        _ => None,
     }
 }
 

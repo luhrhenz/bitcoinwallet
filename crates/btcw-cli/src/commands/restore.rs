@@ -5,6 +5,7 @@ use btcw_core::WalletError;
 use btcw_core::api::{self, Unlocked};
 use btcw_core::chain::Node;
 use btcw_core::config::Config;
+use btcw_core::discover::BirthdayLookup;
 use btcw_core::keys;
 use btcw_core::types::{BalanceView, SyncReport};
 use serde::Serialize;
@@ -23,9 +24,11 @@ struct RestoreJson {
     sync: Option<SyncReport>,
     sync_error: Option<ErrorBody>,
     balance: BalanceView,
+    /// What `--find-birthday` found, if it was used.
+    birthday_lookup: Option<BirthdayLookup>,
 }
 
-pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>) -> Result<()> {
+pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>, find_birthday: bool) -> Result<()> {
     // The core checks again under the lock; this avoids asking for secrets first.
     if api::wallet_exists(cfg) {
         return Err(WalletError::WalletExists(cfg.network_dir()).into());
@@ -33,6 +36,33 @@ pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>) -> Result<()> {
     let phrase = prompt::recovery_phrase()?;
     // Validate before the password prompts. The error never names the words.
     let word_count = keys::parse_mnemonic(&phrase)?.word_count();
+    let lookup = if find_birthday {
+        let host = cfg
+            .explorer_url
+            .as_deref()
+            .map(|url| url.split('/').take(3).collect::<Vec<_>>().join("/"))
+            .unwrap_or_default();
+        ui.note(format_args!(
+            "asking {host} when this wallet was first used (this tells it the wallet's addresses)"
+        ));
+        let found = api::find_birthday(cfg, &phrase)?;
+        if !ui.json() {
+            let what = match found.first_used {
+                Some(height) => format!("first used in block {height}"),
+                None => "never used yet".to_owned(),
+            };
+            ui.println(&format!(
+                "{} This wallet was {what}; scanning will start at block {} ({} addresses checked).",
+                ui.out.badge(cfg.network),
+                found.birthday,
+                found.addresses_checked
+            ))?;
+        }
+        Some(found)
+    } else {
+        None
+    };
+    let birthday = birthday.or(lookup.as_ref().map(|found| found.birthday));
     let password = prompt::new_password(ui)?;
     let Unlocked { mut wallet, signer } = api::restore_wallet(cfg, &phrase, &password, birthday)?;
     drop(phrase);
@@ -55,8 +85,8 @@ pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>) -> Result<()> {
     if birthday_height == 0 {
         ui.warn(
             "no --birthday given, so the scan starts at the first block; through a hosted node that \
-             can take many hours. If you know roughly when this wallet was first used, stop now \
-             (Ctrl-C), delete the wallet folder above and restore again with --birthday <height>",
+             can take many hours. To avoid it, stop now (Ctrl-C), delete the wallet folder above \
+             and restore again with --find-birthday, or --birthday <height>",
         );
     }
 
@@ -86,6 +116,7 @@ pub fn run(cfg: &Config, ui: &Ui, birthday: Option<u32>) -> Result<()> {
             sync,
             sync_error,
             balance,
+            birthday_lookup: lookup,
         });
     }
     match &sync {

@@ -12,6 +12,7 @@ import type {
   AssistantSettings,
   AssistantSettingsUpdate,
   BalanceView,
+  BirthdayLookup,
   ChatItem,
   Contact,
   PreparedSend,
@@ -27,6 +28,8 @@ export interface WalletApi {
   appInfo(): Promise<AppInfo>;
   createWallet(words: 12 | 24, password: string): Promise<{ mnemonic: string[] }>;
   restoreWallet(phrase: string, password: string, birthday: number | null): Promise<void>;
+  /** Ask the block explorer when this phrase's wallet was first used (reveals its addresses). */
+  findBirthday(phrase: string): Promise<BirthdayLookup>;
   unlock(password: string): Promise<void>;
   lock(): Promise<void>;
   /** The user is active while unlocked; Rust's own auto-lock backs up the UI's timer. */
@@ -95,6 +98,7 @@ export const tauriApi: WalletApi = {
   createWallet: (words, password) => invoke("create_wallet", { words, password }),
   restoreWallet: (phrase, password, birthday) =>
     invoke("restore_wallet", { phrase, password, birthday }),
+  findBirthday: (phrase) => invoke("find_birthday", { phrase }),
   unlock: (password) => invoke("unlock", { password }),
   lock: () => invoke("lock"),
   keepAlive: () => invoke("keep_alive"),

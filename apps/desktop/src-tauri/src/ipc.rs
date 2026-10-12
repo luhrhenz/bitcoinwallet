@@ -62,6 +62,17 @@ pub async fn create_wallet(
 }
 
 #[tauri::command]
+pub async fn find_birthday(
+    state: Shared<'_>,
+    phrase: SecretString,
+) -> ApiResult<btcw_core::discover::BirthdayLookup> {
+    blocking("find_birthday", &state, move |s| {
+        commands::find_birthday(s, &phrase)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn restore_wallet(
     state: Shared<'_>,
     phrase: SecretString,

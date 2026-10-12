@@ -1394,3 +1394,32 @@ fn contacts_labels_and_speed_up_against_a_regtest_node() {
         "tx_build"
     );
 }
+
+#[test]
+fn find_birthday_reports_explorer_problems_clearly() {
+    const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    // Regtest has no public explorer.
+    let fx = offline();
+    let err = find_birthday(&fx.state, &secret(PHRASE)).unwrap_err();
+    assert_eq!(err.code, "config");
+    assert!(
+        err.message.contains("no block explorer for regtest"),
+        "{}",
+        err.message
+    );
+
+    // An explorer that can't be reached is an `explorer` error, not a node error.
+    let dir = tempfile::tempdir().unwrap();
+    let fx = with_env(
+        dir,
+        vec![
+            ("BTCW_NETWORK", "testnet4".to_owned()),
+            ("BTCW_EXPLORER_URL", "http://127.0.0.1:9/api".to_owned()),
+        ],
+    );
+    let err = find_birthday(&fx.state, &secret(PHRASE)).unwrap_err();
+    assert_eq!(err.code, "explorer");
+    // A bad phrase is refused before anything is sent.
+    let err = find_birthday(&fx.state, &secret("not a phrase")).unwrap_err();
+    assert_eq!(err.code, "invalid_mnemonic");
+}

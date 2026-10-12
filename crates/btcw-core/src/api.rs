@@ -204,6 +204,22 @@ fn random_below(n: usize) -> Result<usize> {
     }
 }
 
+/// Ask the configured block explorer when the wallet behind `phrase` was first used, for a
+/// restore's birthday. Needs no password (public addresses only), but reveals them to the
+/// explorer, so frontends ask first.
+pub fn find_birthday(cfg: &Config, phrase: &str) -> Result<crate::discover::BirthdayLookup> {
+    let explorer = cfg.explorer_url.as_deref().ok_or_else(|| {
+        WalletError::Config(format!(
+            "there is no block explorer for {}; enter a birthday instead",
+            cfg.network
+        ))
+    })?;
+    let mnemonic = keys::parse_mnemonic(phrase)?;
+    let (descriptors, signer) = keys::derive_account(&mnemonic, "", cfg.network, ACCOUNT)?;
+    drop(signer);
+    crate::discover::find_birthday(&descriptors, cfg.network, explorer)
+}
+
 fn ensure_absent(cfg: &Config) -> Result<()> {
     if wallet_exists(cfg) {
         return Err(WalletError::WalletExists(cfg.network_dir()));
