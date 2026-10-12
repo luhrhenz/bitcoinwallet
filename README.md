@@ -13,6 +13,20 @@ either your own or a hosted endpoint.
 
 - Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
+## Download (Linux)
+
+Get the latest build from [Releases](https://github.com/luhrhenz/bitcoinwallet/releases):
+
+```bash
+sudo apt install ./btcw_0.2.0_amd64.deb            # Debian/Ubuntu: then open "btcw" from the menu
+# or, on any distro:
+chmod +x btcw_0.2.0_amd64.AppImage && ./btcw_0.2.0_amd64.AppImage
+```
+
+The release builds work straight away on testnet4: with no node configured they sync through
+the btcw relay (see below), and the assistant answers through it too. Your keys never leave
+your computer; the relay only sees the same public chain requests any node would.
+
 ## Features
 
 | Requirement | How btcw does it |
@@ -106,6 +120,29 @@ btcw --network testnet4 sync
 
 Free testnet4 coins: e.g. <https://mempool.space/testnet4/faucet>.
 
+## The btcw relay
+
+[`proxy/`](proxy) is a small Vercel app that holds the project's node URL and assistant key so
+users don't need their own:
+
+- `POST /api/rpc` forwards Bitcoin JSON-RPC to the node, but only the eight read/broadcast
+  methods the wallet uses (no wallet, mining or admin RPCs), one call per request, rate limited
+  per IP.
+- `POST /api/assistant/chat/completions` forwards the assistant to Groq with a fixed model and a
+  capped answer length.
+
+When nothing else is configured on testnet4 (no RPC URL, user or cookie), btcw uses the relay in
+`BTCW_PROXY_URL`, or the one built into the binary when it was compiled with `BTCW_PROXY_URL`
+set. Your own node or `.env` always wins. To run your own relay:
+
+```bash
+cd proxy && npm ci && npm test
+vercel env add ALCHEMY_RPC_URL production   # https://bitcoin-testnet4.g.alchemy.com/v2/<key>
+vercel env add GROQ_API_KEY production
+vercel deploy --prod
+BTCW_PROXY_URL=https://<your-project>.vercel.app npm run tauri build   # in apps/desktop
+```
+
 ## Local settings: `.env`
 
 Copy `.env.example` to `.env` in the project folder and fill in your values. Both the CLI and the
@@ -126,6 +163,8 @@ Precedence: command-line flag › environment variable › `<datadir>/btcw.toml`
 | Data directory | `--datadir` | `BTCW_DATADIR` |
 | Node RPC URL | `--rpc-url` | `BTCW_RPC_URL` |
 | Cookie file / user + password | `--rpc-cookie`, `--rpc-user`, `--rpc-pass` | `BTCW_RPC_COOKIE`, `BTCW_RPC_USER`, `BTCW_RPC_PASS` |
+| Relay (testnet4, used when no node is set) | | `BTCW_PROXY_URL` |
+| Block explorer for `--find-birthday` | | `BTCW_EXPLORER_URL` |
 | Wallet password (**scripts and tests only**) | prompt | `BTCW_PASSWORD` |
 
 ## Layout
@@ -134,6 +173,7 @@ Precedence: command-line flag › environment variable › `<datadir>/btcw.toml`
 crates/btcw-core        wallet engine: keys, encrypted keystore, sync, PSBT send, SQLite persistence
 crates/btcw-cli         `btcw` terminal app
 apps/desktop            React UI (src/) + Tauri 2 Rust bridge (src-tauri/)
+proxy/                  btcw relay (Vercel functions): node RPC + assistant
 scripts/regtest.sh      local regtest node for demos and tests
 docs/                   ARCHITECTURE.md
 ```
