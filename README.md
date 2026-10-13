@@ -18,9 +18,9 @@ either your own or a hosted endpoint.
 Get the latest build from [Releases](https://github.com/luhrhenz/bitcoinwallet/releases):
 
 ```bash
-sudo apt install ./btcw_0.2.0_amd64.deb            # Debian/Ubuntu: then open "btcw" from the menu
+sudo apt install ./btcw_0.2.1_amd64.deb            # Debian/Ubuntu: then open "btcw" from the menu
 # or, on any distro:
-chmod +x btcw_0.2.0_amd64.AppImage && ./btcw_0.2.0_amd64.AppImage
+chmod +x btcw_0.2.1_amd64.AppImage && ./btcw_0.2.1_amd64.AppImage
 ```
 
 The release builds work straight away on testnet4: with no node configured they sync through

@@ -1,4 +1,4 @@
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { banner, fundedWallet, nav, PASSWORD, renderApp, type, waitForDashboard } from "./test/helpers";
 
 const ABANDON = `${"abandon ".repeat(11)}about`;
@@ -50,6 +50,24 @@ describe("dashboard", () => {
     expect(balance).toHaveTextContent("Unconfirmed0.00025000 BTC");
     expect(balance).toHaveTextContent(`As of block ${mock.tipHeight()}`);
     expect(screen.getByRole("list", { name: "Recent transactions" })).toHaveTextContent("Unconfirmed");
+  });
+
+  it("syncs again on its own every 10 seconds", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { mock } = await renderApp((m) => fundedWallet(m));
+      await waitForDashboard();
+      const balance = screen.getByRole("region", { name: /balance/i });
+      expect(balance).toHaveTextContent("0.01000000 BTC");
+
+      mock.simulateIncoming(25_000);
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(balance).not.toHaveTextContent("Unconfirmed0.00025000 BTC");
+      await vi.advanceTimersByTimeAsync(1_000);
+      await waitFor(() => expect(balance).toHaveTextContent("Unconfirmed0.00025000 BTC"));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("says when the node can't be reached and keeps the last numbers", async () => {

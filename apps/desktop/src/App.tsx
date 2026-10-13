@@ -119,6 +119,9 @@ const NAV: { name: "dashboard" | "receive" | "send" | "history" | "contacts" | "
   { name: "settings", label: "Settings" },
 ];
 
+/** How often the open app syncs with the node on its own. */
+const AUTO_SYNC_MS = 10_000;
+
 function Main() {
   const wallet = useWallet();
   const { info } = wallet;
@@ -129,6 +132,14 @@ function Main() {
   useEffect(() => {
     void refreshWallet().then(() => runSync());
   }, [refreshWallet, runSync]);
+
+  // Then keep up with new blocks and payments while the window is visible.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (!document.hidden) void runSync();
+    }, AUTO_SYNC_MS);
+    return () => clearInterval(timer);
+  }, [runSync]);
 
   const { dismissNotice } = wallet;
   const go = useCallback(
